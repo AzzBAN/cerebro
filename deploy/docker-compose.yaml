@@ -1,0 +1,85 @@
+version: "3.9"
+
+# =============================================================================
+# Project Cerebro — Docker Compose (Development & Paper Trading)
+# For production: use Kubernetes manifests in deploy/k8s/ (Phase 9+).
+# =============================================================================
+
+networks:
+  cerebro:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [cerebro]
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Postgres ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [cerebro]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: cerebro
+      POSTGRES_PASSWORD: cerebro
+      POSTGRES_DB: cerebro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cerebro"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Cerebro ───────────────────────────────────────────────────────────────────
+  cerebro:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    networks: [cerebro]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount config directory (secrets.env is gitignored; provide externally).
+      - ../configs:/configs:ro
+    environment:
+      # Override Redis/Postgres URLs to point to container service names.
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://cerebro:cerebro@postgres:5432/cerebro?sslmode=disable
+    ports:
+      # Prometheus metrics endpoint (only active with -tags metrics build).
+      - "9090:9090"
+    command: ["run", "--paper", "--config-dir", "/configs"]
+
+  # ── Goose migrations (one-shot) ───────────────────────────────────────────────
+  migrate:
+    image: ghcr.io/pressly/goose:latest
+    networks: [cerebro]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../scripts/migrations:/migrations:ro
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: "postgres://cerebro:cerebro@postgres:5432/cerebro?sslmode=disable"
+    command: ["-dir", "/migrations", "up"]
+    profiles: ["migrate"]

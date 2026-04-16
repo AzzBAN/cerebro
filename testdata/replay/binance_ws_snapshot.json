@@ -1,0 +1,9 @@
+{
+  "description": "Synthetic Binance WebSocket kline snapshot for BTCUSDT 1m replay testing",
+  "symbol": "BTCUSDT",
+  "timeframe": "1m",
+  "start_time": "2024-01-01T00:00:00Z",
+  "candle_count": 500,
+  "data_file": "testdata/fixtures/btc_1m.csv",
+  "notes": "Use backtest.LoadCSV to load this data into the replay feed"
+}

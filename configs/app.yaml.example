@@ -1,0 +1,281 @@
+# =============================================================================
+# Project Cerebro — Application Configuration Example
+# =============================================================================
+# Copy this file to configs/app.yaml and adjust for your environment.
+# Secrets (API keys, tokens) belong in secrets.env — not here.
+# =============================================================================
+
+# --- Environment -----------------------------------------------------------
+# paper | demo | live
+#   paper  → offline, synthetic prices, no broker API keys required
+#   demo   → demo.binance.com: real live prices via mainnet WS, virtual execution
+#   live   → Binance mainnet: real funds
+# Must match the CLI flag (--paper / --demo / --live) and ENVIRONMENT in secrets.env.
+# Any mismatch is a fatal error at startup — no silent overrides.
+environment: paper
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+log:
+  level: info               # debug | info | warn | error
+  format: json              # json | text (json recommended for production)
+
+# =============================================================================
+# TRADING ENGINE
+# =============================================================================
+engine:
+  # How often the engine evaluates each strategy against latest candles.
+  # Lower = more responsive; higher = lower CPU usage.
+  evaluation_interval_ms: 100
+
+  # Global kill switch. Set to true to immediately halt all new orders
+  # without requiring a ChatOps command. Useful for maintenance.
+  kill_switch: false
+
+# =============================================================================
+# GLOBAL RISK LIMITS
+# These are hard limits enforced in pure Go — they cannot be overridden by
+# any LLM agent. Per-strategy risk limits in strategies.yaml are additional
+# constraints layered on top.
+# =============================================================================
+risk:
+  # Stop all new orders when session drawdown reaches this threshold.
+  max_drawdown_pct: 2.0
+
+  # Stop all new orders when cumulative daily loss reaches this threshold.
+  # Resets at midnight UTC.
+  max_daily_loss_pct: 3.0
+
+  # Total notional exposure across all open positions as a % of account equity.
+  max_exposure_pct: 20.0
+
+  # Maximum number of open positions across all venues simultaneously.
+  max_open_positions: 5
+
+  # Maximum open positions per single venue.
+  max_open_positions_per_venue: 3
+
+  # Maximum open positions per single symbol.
+  max_open_positions_per_symbol: 1
+
+  # Action taken when max_drawdown_pct is breached.
+  # pause            — cancel pending orders; keep existing positions open.
+  # pause_and_notify — pause + send ChatOps alert.
+  # flatten          — close all positions immediately.
+  halt_mode_on_drawdown: pause_and_notify
+
+  # Require operator confirmation (/resume command) before trading resumes
+  # after a halt. If false, trading auto-resumes when drawdown recovers.
+  resume_requires_confirmation: true
+
+  # Minimum account equity (in account base currency) required to allow
+  # live trading. Safety net against running on a near-zero balance.
+  min_equity_to_trade: 100.0
+
+# =============================================================================
+# AGENT RUNTIME (LLM / AI)
+# =============================================================================
+agent:
+  # --- Screening Agent schedule ---
+  # How often the Screening Agent runs and pushes a new bias score to Redis.
+  # Recommended: 60–240 min depending on market volatility.
+  screening_interval_minutes: 120
+
+  # Redis TTL for the cached bias score.
+  # Must be >= screening_interval_minutes to avoid stale-key gaps.
+  # If the key expires before the next run, Risk Gate defaults to Neutral.
+  bias_ttl_minutes: 180
+
+  # --- LLM tool-loop limits ---
+  # Maximum number of tool-call / response turns per agent invocation.
+  # Prevents runaway loops. Recommended: 4–8.
+  max_turns: 6
+
+  # Context deadline per single LLM completion call (seconds).
+  # On timeout → fail closed (no new risk).
+  timeout_per_turn_seconds: 30
+
+  # Total wall-clock deadline for one full agent invocation (all turns).
+  timeout_total_seconds: 120
+
+  # --- LLM providers ---
+  llm:
+    # Ordered list of provider IDs to try. Cerebro falls back to the next
+    # provider on timeout, rate-limit, or budget exhaustion.
+    providers: [gemini, anthropic, openai_compatible]
+
+    # Conditions that trigger fallback to the next provider.
+    fallback_on: [timeout, rate_limit, budget_exceeded]
+
+    # If ALL providers fail, fall back to "technical-only" mode:
+    # strategies still run but no LLM bias or risk-agent veto is applied.
+    # Risk Gate will use Neutral bias and apply stricter numeric limits.
+    technical_only_fallback: true
+
+    # Reduce position size by this factor when running in technical-only mode.
+    technical_only_size_multiplier: 0.5
+
+    # Per-model configuration. API keys are loaded from secrets.env.
+    models:
+      gemini:
+        model_id: gemini-1.5-flash
+        temperature: 0.2          # lower = more deterministic
+        max_output_tokens: 2048
+
+      anthropic:
+        model_id: claude-3-haiku-20240307
+        temperature: 0.2
+        max_output_tokens: 2048
+
+      openai_compatible:
+        model_id: llama3.1
+        # base_url is loaded from OPENAI_BASE_URL in secrets.env
+        temperature: 0.2
+        max_output_tokens: 2048
+
+    # --- Token / cost budgets ---
+    # Counters are stored in Redis and reset daily at midnight UTC.
+    daily_token_budget: 500000      # total tokens across all providers
+    daily_cost_budget_usd: 5.00     # total estimated USD spend
+
+    # Send a ChatOps alert when budget consumption reaches this percentage.
+    alert_at_budget_pct: 80
+
+    # Circuit breaker: stop all LLM calls for a provider when its
+    # error rate (over the last error_window_minutes) exceeds this threshold.
+    circuit_breaker_error_rate_pct: 50
+    circuit_breaker_error_window_minutes: 5
+    circuit_breaker_cooldown_minutes: 10
+
+  # --- Tool policy ---
+  # Which tool skills each agent is DENIED from calling.
+  # This is enforced by the tool registry in code, not by prompt engineering.
+  tool_policy:
+    screening:
+      denied:
+        - approve_and_route_order
+        - reject_signal
+        - force_halt_trading
+        - calculate_position_size
+    copilot:
+      denied:
+        - approve_and_route_order
+        - reject_signal
+        - force_halt_trading
+    reviewer:
+      denied:
+        - approve_and_route_order
+        - reject_signal
+        - force_halt_trading
+        - calculate_position_size
+
+# =============================================================================
+# REVIEWER AGENT (weekly self-reflection)
+# =============================================================================
+reviewer:
+  enabled: true
+
+  # Cron expression (UTC). Default: Sunday midnight.
+  schedule_cron: "0 0 * * 0"
+
+  # Minimum number of completed trades required before the Reviewer runs.
+  # Avoids running on an empty dataset.
+  min_trades_required: 10
+
+  # Look-back window for trade analysis (days).
+  lookback_days: 7
+
+# =============================================================================
+# WEBSOCKET — RECONNECT & KEEPALIVE
+# =============================================================================
+websocket:
+  # Initial delay before first reconnect attempt (milliseconds).
+  reconnect_base_delay_ms: 500
+
+  # Maximum delay between reconnect attempts (milliseconds).
+  reconnect_max_delay_ms: 30000
+
+  # Maximum reconnect attempts. 0 = unlimited.
+  reconnect_max_attempts: 0
+
+  # Random jitter added to each backoff to avoid thundering herd (milliseconds).
+  reconnect_jitter_max_ms: 500
+
+  # How often to send a WebSocket ping frame (seconds).
+  ping_interval_seconds: 20
+
+  # Time to wait for a pong before declaring the connection dead (seconds).
+  pong_timeout_seconds: 10
+
+  # Number of consecutive reconnect failures before a ChatOps alert is sent.
+  alert_after_failures: 5
+
+# =============================================================================
+# CHATOPS — COMMAND DISPATCHER
+# =============================================================================
+chatops:
+  # /flatten requires the operator to re-confirm within this window (seconds).
+  flatten_confirmation_timeout_seconds: 30
+
+  # Maximum query length accepted by the /ask command (characters).
+  max_ask_query_length: 500
+
+  # Rate-limit: maximum commands per operator per minute.
+  max_commands_per_minute: 20
+
+# =============================================================================
+# TERMINAL UI
+# =============================================================================
+tui:
+  # How often the TUI redraws (milliseconds). Lower = smoother; higher = less CPU.
+  refresh_rate_ms: 100
+
+  # Maximum number of lines kept in the Agent Log panel.
+  max_agent_log_lines: 200
+
+  # Maximum number of rows in the Active Positions panel.
+  max_position_rows: 20
+
+# =============================================================================
+# INGEST — SCRAPERS & NEWS FEEDS
+# =============================================================================
+ingest:
+  # FinancialJuice headless scraper
+  financialjuice:
+    enabled: true
+    interval_minutes: 5
+    timeout_seconds: 30
+
+  # Myfxbook economic calendar RSS
+  myfxbook_calendar:
+    enabled: true
+    interval_minutes: 60
+
+  # CryptoPanic sentiment API
+  cryptopanic:
+    enabled: true
+    interval_minutes: 15
+    # Filter: hot | rising | bullish | bearish | important | saved | lol
+    filter: hot
+
+  # Marketaux / FMP stock news
+  marketaux:
+    enabled: true
+    interval_minutes: 30
+
+# =============================================================================
+# BACKTEST ENGINE
+# =============================================================================
+backtest:
+  # Default output format when --output flag is not specified.
+  default_report_format: json   # json | text
+
+  # Use next-candle-open price for fills (prevents lookahead bias).
+  fill_model: next_open         # next_open | current_close | midpoint
+
+  # Simulated commission per trade (percentage of notional, e.g. 0.04 = 0.04%).
+  commission_pct: 0.04
+
+  # Simulated slippage per side (percentage of price, e.g. 0.01 = 0.01%).
+  slippage_pct: 0.01

@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS trades;
+DROP TABLE IF EXISTS order_intents;

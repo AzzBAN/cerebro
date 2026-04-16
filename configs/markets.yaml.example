@@ -1,0 +1,212 @@
+# =============================================================================
+# Project Cerebro — Markets Configuration Example
+# =============================================================================
+# Copy this file to configs/markets.yaml and adjust to your trading universe.
+# This file controls WHICH assets to track and HOW to connect to each venue.
+# Trading parameters (indicators, SL/TP, etc.) belong in strategies.yaml.
+# =============================================================================
+
+# =============================================================================
+# GLOBAL MARKET DEFAULTS
+# Applied to all symbols unless overridden at the venue or symbol level.
+# =============================================================================
+defaults:
+  # Candle timeframes to subscribe to / build in-memory.
+  # At least the primary_timeframe and trend_timeframe of each strategy
+  # must be included here.
+  timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
+
+  # In-memory candle history per timeframe (number of candles to keep).
+  # Must be large enough for the slowest indicator (e.g. EMA 200 needs ≥200).
+  candle_history_per_timeframe: 250
+
+  # WebSocket stream type.
+  # kline  = OHLCV candles  (Binance terminology; adapted per venue)
+  # trade  = individual trade ticks (higher granularity, more bandwidth)
+  stream_type: kline
+
+  # Paper/sim slippage model (used by execution/paper/matcher.go).
+  slippage_model: fixed_pct   # fixed_pct | spread_based | none
+  slippage_pct: 0.01          # 0.01 = 0.01% per side
+
+# =============================================================================
+# VENUE: BINANCE — Crypto Spot + USDT-M Futures (includes Gold XAUUSDT)
+# Single-broker architecture: all trading runs through Binance.
+# Spot symbols use Spot endpoints; futures_perpetual symbols use fapi endpoints.
+# =============================================================================
+venues:
+  binance:
+    enabled: true
+    type: crypto              # covers both Spot and Futures asset classes
+
+    # testnet: true  → use Spot testnet (testnet.binance.vision)
+    #                  and Futures testnet (testnet.binancefuture.com)
+    # testnet: false → live Binance endpoints
+    testnet: true
+
+    # Connection endpoints (auto-selected based on testnet flag).
+    # Spot
+    rest_url: https://api.binance.com
+    rest_testnet_url: https://testnet.binance.vision
+    ws_url: wss://stream.binance.com:9443/ws
+    ws_testnet_url: wss://testnet.binance.vision/ws
+
+    # USDT-M Futures (used for futures_perpetual symbols including XAUUSDT)
+    futures_rest_url: https://fapi.binance.com
+    futures_rest_testnet_url: https://testnet.binancefuture.com
+    futures_ws_url: wss://fstream.binance.com/ws
+    futures_ws_testnet_url: wss://stream.binancefuture.com/ws
+
+    # Rate limits — tracked per IP by adapter/binance/rate_limiter.go.
+    # Values match Binance published limits; queried live via exchangeInfo.
+    # Cerebro alerts at 80% and halts on 429/418 responses (PRD §6.1).
+    rate_limit:
+      weight_per_minute: 6000       # REQUEST_WEIGHT; each WS open costs 2 weight
+      orders_per_10_seconds: 50     # per account
+      orders_per_day: 160000        # per account; resets 00:00 UTC
+      ws_connections_per_5_min: 300 # per IP; pool and reuse connections
+
+    # ------------------------------------------------------------------
+    # SYMBOLS
+    # ------------------------------------------------------------------
+    symbols:
+
+      # --- BTC/USDT — Primary scalping pair ---
+      - symbol: BTC/USDT
+        base: BTC
+        quote: USDT
+
+        # Contract type
+        # spot              — no leverage, no funding rate
+        # futures_perpetual — leverage, funding rate, no expiry
+        # futures_delivery  — leverage, quarterly expiry
+        contract_type: spot
+
+        # Leverage (1 = no leverage / spot).
+        # Futures supported range: 1–125x (Binance). Start low.
+        leverage: 1
+
+        # Margin type (futures only).
+        # isolated — loss limited to position margin
+        # cross    — entire account margin used as collateral
+        margin_type: isolated
+
+        # Tick size: minimum price increment.
+        tick_size: 0.01           # BTC/USDT minimum price move = $0.01
+
+        # Lot size: minimum quantity increment.
+        lot_size: 0.00001         # minimum 0.00001 BTC per order
+
+        # Minimum order notional value (quote currency).
+        min_notional: 5.0         # minimum $5 per order
+
+        # Maximum notional value per single order (quote currency).
+        max_order_notional: 100000.0
+
+        # Maximum open position size as % of account equity.
+        max_position_size_pct: 5.0
+
+        # Candle timeframes to subscribe for this symbol.
+        timeframes: [1m, 5m, 15m, 1h]
+
+        # Primary candle timeframe for signal generation.
+        primary_timeframe: 5m
+
+        # Trend confirmation timeframe (must be higher than primary).
+        trend_timeframe: 1h
+
+        # Maximum spread (bid-ask) as % of price. Skip entry if exceeded.
+        max_spread_pct: 0.05
+
+      # --- ETH/USDT ---
+      - symbol: ETH/USDT
+        base: ETH
+        quote: USDT
+        contract_type: spot
+        leverage: 1
+        margin_type: isolated
+        tick_size: 0.01
+        lot_size: 0.0001
+        min_notional: 5.0
+        max_order_notional: 50000.0
+        max_position_size_pct: 5.0
+        timeframes: [1m, 5m, 15m, 1h]
+        primary_timeframe: 5m
+        trend_timeframe: 1h
+        max_spread_pct: 0.05
+
+      # --- SOL/USDT ---
+      - symbol: SOL/USDT
+        base: SOL
+        quote: USDT
+        contract_type: spot
+        leverage: 1
+        margin_type: isolated
+        tick_size: 0.01
+        lot_size: 0.01
+        min_notional: 5.0
+        max_order_notional: 20000.0
+        max_position_size_pct: 3.0
+        timeframes: [1m, 5m, 15m, 1h]
+        primary_timeframe: 5m
+        trend_timeframe: 1h
+        max_spread_pct: 0.1
+
+      # --- BTC/USDT FUTURES PERPETUAL (disabled by default — enable when ready for leverage) ---
+      - symbol: BTC/USDT-PERP
+        base: BTC
+        quote: USDT
+        contract_type: futures_perpetual
+        leverage: 5             # start conservative; max 125x on Binance, never exceed 10x
+        margin_type: isolated
+        tick_size: 0.10
+        lot_size: 0.001
+        min_notional: 5.0
+        max_order_notional: 50000.0
+        max_position_size_pct: 3.0
+        timeframes: [1m, 5m, 15m, 1h]
+        primary_timeframe: 5m
+        trend_timeframe: 1h
+        max_spread_pct: 0.05
+        enabled: false
+
+      # --- XAUUSDT — Gold Futures Perpetual (Binance USDT-M Futures) ---
+      # Gold is traded as a perpetual futures contract on Binance Futures.
+      # Endpoint: fapi.binance.com (live) / testnet.binancefuture.com (testnet)
+      # Symbol string used by Binance API: "XAUUSDT"
+      # Funding rate paid every 8 hours — monitor during high-rate environments.
+      - symbol: XAU/USDT
+        base: XAU
+        quote: USDT
+        contract_type: futures_perpetual
+
+        # Leverage:
+        # Binance XAUUSDT max: 20x retail / up to 20x on most account tiers.
+        # Conservative recommendation: 3–5x until strategy is validated live.
+        leverage: 5
+        margin_type: isolated     # isolated: loss capped at position margin
+
+        # Tick size: $0.01 (Binance XAUUSDT minimum price move).
+        tick_size: 0.01
+
+        # Lot size: 0.1 oz minimum per order on Binance Futures.
+        lot_size: 0.1
+
+        # At ~$3300/oz: 0.1 oz = ~$330 minimum position value.
+        min_notional: 5.0
+        max_order_notional: 50000.0
+
+        # Max position size as % of account equity.
+        # Gold is volatile (ATR ~$30-60/day) — keep exposure lower than crypto.
+        max_position_size_pct: 3.0
+
+        # Candle timeframes for Gold — skip 1m (too noisy for gold).
+        timeframes: [5m, 15m, 1h, 4h]
+        primary_timeframe: 15m
+        trend_timeframe: 4h
+
+        # Gold spread on Binance Futures is very tight (~$0.01-0.05).
+        # 0.01% = $0.33 on a $3300 gold position — reject if wider.
+        max_spread_pct: 0.02
+
+        enabled: true             # Gold is production-ready on Binance Futures

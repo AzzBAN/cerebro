@@ -1,0 +1,635 @@
+# =============================================================================
+# Project Cerebro — Strategies Configuration Example
+# =============================================================================
+# Copy this file to configs/strategies.yaml and adjust per your style.
+#
+# Preset guide:
+#   SCALPING      — 1m/5m charts, very tight SL/TP, high frequency
+#   SWING         — 4H/1D charts, wider SL/TP, fewer but larger moves
+#   MEAN_REVERSION— range-bound markets, RSI + Bollinger extremes
+#   TREND_FOLLOWING — multi-timeframe EMA cross, momentum confirmation
+#   VOLATILITY_BREAKOUT — ATR-based breakout at NY/Asian session opens
+#
+# Risk arithmetic (all strategies):
+#   Position size = (Account Equity × risk_pct_per_trade) ÷ (Entry − Stop Loss)
+#   All sizes are validated against markets.yaml min/max_position_size_pct.
+# =============================================================================
+
+# =============================================================================
+# GLOBAL STRATEGY DEFAULTS
+# Values here are inherited by every strategy unless overridden at strategy
+# or market level. Explicit overrides always win.
+# =============================================================================
+defaults:
+  enabled: false                    # strategies are OFF by default; opt-in explicitly
+
+  # --- Execution ---
+  # market  — fill immediately at best available price (best for scalping)
+  # limit   — post a limit order at current_price ± limit_offset_pips
+  # stop_limit — stop price triggers a limit order (good for breakouts)
+  order_type: market
+
+  # Only used when order_type = limit or stop_limit.
+  limit_offset_pips: 1.0
+
+  # GTC (good-till-cancelled) | IOC (immediate-or-cancel) | FOK (fill-or-kill)
+  time_in_force: gtc
+
+  # Cancel an unfilled limit/stop order after this many seconds.
+  order_cancel_after_seconds: 60
+
+  # Number of closed candles that must confirm a signal before entry.
+  # 0 = enter on current candle close. 1+ = wait N more candles.
+  confirmation_candles: 0
+
+  # --- Signal deduplication ---
+  # Reject a second signal for the same symbol within this window (seconds).
+  # Prevents two strategies from doubling up on the same move.
+  signal_dedup_window_seconds: 300
+
+  # --- Risk per trade ---
+  # Percentage of account equity risked on a single trade.
+  # Recommended: 0.25–0.5% scalping; 0.5–1% swing; 1–2% position trading.
+  risk_pct_per_trade: 0.5
+
+  # Absolute cap on position size as % of account equity (regardless of SL math).
+  max_position_size_pct: 5.0
+
+  # --- Stop Loss ---
+  # atr       — stop = entry ± (ATR × stop_loss_atr_multiplier)
+  # fixed_pips— stop = entry ± stop_loss_fixed_pips
+  # fixed_pct — stop = entry ± (entry × stop_loss_fixed_pct / 100)
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 1.0    # tight for scalping
+  stop_loss_fixed_pips: 10.0       # used when stop_loss_type = fixed_pips
+  stop_loss_fixed_pct: 0.5         # used when stop_loss_type = fixed_pct
+
+  # Minimum stop distance (pips). Prevents entering with an unrealistically
+  # tight stop that gets clipped by spread.
+  min_stop_distance_pips: 2.0
+
+  # --- Take Profit ---
+  # Multiple TP levels allow scaling out of positions.
+  # All multipliers are relative to the stop_loss distance (Risk:Reward).
+  take_profit_levels:
+    - rr_ratio: 1.5               # TP1 at 1.5× the stop distance
+      scale_out_pct: 70           # close 70% of the position at TP1
+      move_sl_to_breakeven: true  # move SL to entry after TP1 hit
+    - rr_ratio: 3.0               # TP2 at 3× the stop distance (let rest run)
+      scale_out_pct: 30           # close remaining 30% at TP2
+
+  # --- Trailing Stop ---
+  # Activate trailing stop once unrealised PnL reaches this % of entry price.
+  trail_trigger_pct: 1.0
+
+  # Trail step: move the SL by this % each time price moves favourably.
+  trail_step_pct: 0.3
+
+  # --- Indicators (shared defaults) ---
+  indicators:
+    rsi:
+      period: 14
+      oversold: 30
+      overbought: 70
+    ema:
+      fast: 9
+      slow: 21
+      trend: 50
+      long_trend: 200
+    bollinger:
+      period: 20
+      std_dev: 2.0
+    atr:
+      period: 14
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+    volume:
+      # Skip entry if volume is below this multiple of the N-bar average.
+      min_volume_multiplier: 1.0
+      volume_avg_period: 20
+
+  # --- Session / timing filters ---
+  # Restrict entries to specific market sessions (UTC times).
+  # all      — no session restriction
+# ny_open    — 12:00–14:00 UTC (NY open; gold + crypto peak volatility)
+# asian_open — 00:00–02:00 UTC (Asian session open)
+  # tokyo    — 23:00–08:00 UTC (next day)
+# overlap    — 12:00–16:00 UTC (peak crypto + gold liquidity)
+  session_filter: all
+
+  # Block new entries N minutes before and after high-impact economic events
+  # (sourced from the Myfxbook calendar feed).
+  news_blackout_before_minutes: 15
+  news_blackout_after_minutes: 15
+
+  # Minimum number of candles in history before strategy starts firing signals.
+  # Ensures indicators have enough data to be reliable.
+  warmup_candles: 200
+
+  # ---------------------------------------------------------------------------
+  # DERIVATIVES FILTERS (sourced from CoinGlass API v4 — see §3.3 of PRD)
+  # Polled every 5 minutes; results cached in Redis (TTL: 6 min).
+  # Applies to perpetual/futures symbols only; ignored for spot-only pairs.
+  # Set a value to 0.0 (or false) to disable that specific filter.
+  # ---------------------------------------------------------------------------
+
+  # Funding Rate filter — OI-weighted rate per 8-hour interval.
+  # skip LONG  entry when current funding rate > this % (market too long; longs overpaying)
+  # skip SHORT entry when current funding rate < this % (market too short; shorts overpaying)
+  funding_rate_long_max_pct: 0.0    # 0 = disabled (override per-strategy below)
+  funding_rate_short_min_pct: 0.0   # 0 = disabled
+
+  # Open Interest divergence filter.
+  # true → reject trend-following LONG signal when price is rising but OI is flat/falling.
+  # This is a leading indicator that the trend lacks institutional participation.
+  oi_divergence_filter: false
+
+  # Long/Short Ratio filter (global account ratio from CoinGlass).
+  # Ratio > 1.0 means more accounts are long.  Typical range: 0.8 – 2.0.
+  # skip LONG  entry when ratio > long_short_ratio_max_long  (crowd too long → fade risk)
+  # skip SHORT entry when ratio < long_short_ratio_min_short (crowd too short → fade risk)
+  long_short_ratio_max_long: 0.0    # 0 = disabled
+  long_short_ratio_min_short: 0.0   # 0 = disabled
+
+  # Taker Buy/Sell delta filter.
+  # true → only allow LONG entry when net taker buy volume > sell volume over last 1h.
+  # Prevents longing into smart-money distribution.
+  require_positive_taker_delta: false
+
+  # Liquidation zone proximity filter (CoinGlass heatmap model1).
+  # A liquidation cluster within N% of the entry price acts as a price magnet — stop
+  # hunts commonly target these zones. Set > 0 to avoid entering too close.
+  # Example: 0.5 → skip entry if a cluster exists within 0.5% of current price.
+  avoid_liquidation_zone_pct: 0.0   # 0 = disabled
+
+  # Fear & Greed Index filter (0 = Extreme Fear … 100 = Extreme Greed).
+  # skip LONG  entry when index < fear_greed_long_min  (extreme fear = wait for confirmation)
+  # skip SHORT entry when index > fear_greed_short_max (extreme greed = crowded; higher risk)
+  # Note: these are soft guardrails. The Screening Agent also receives the index as context.
+  fear_greed_long_min: 0            # 0 = disabled
+  fear_greed_short_max: 100         # 100 = disabled
+
+# =============================================================================
+# PRESET 1 — SCALPING
+# Target: 5–15 pip targets; high-frequency; tight SL; requires fast execution.
+# Target: 0.2–0.5% moves; high-frequency; tight SL; requires fast execution.
+# Best markets: BTC/USDT, ETH/USDT, SOL/USDT during NY open / Asian overlap.
+# Gold (XAU/USDT) excluded — spread is too wide relative to scalp targets.
+scalping:
+  enabled: true
+
+  markets:
+    - EUR/USD
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+
+  # Override the primary and trend timeframes for scalping.
+  primary_timeframe: 1m
+  trend_timeframe: 5m
+
+  # --- Execution ---
+  order_type: market              # speed is critical for scalping
+  time_in_force: ioc              # immediate-or-cancel; no partial fills sitting open
+  confirmation_candles: 0         # enter on signal candle close
+
+  signal_dedup_window_seconds: 60 # 1-minute dedup (1 candle period)
+
+  # --- Risk per trade (small; high frequency) ---
+  risk_pct_per_trade: 0.25        # 0.25% per scalp; many trades per session
+  max_position_size_pct: 2.0
+
+  # --- Stop Loss (very tight) ---
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 0.7   # tight stop = must have precise entry
+  min_stop_distance_pips: 1.5
+
+  # --- Take Profit ---
+  take_profit_levels:
+    - rr_ratio: 1.5               # TP1 at 1.5× risk
+      scale_out_pct: 100          # scalping: take full profit at TP1 (no runner)
+      move_sl_to_breakeven: false
+
+  # Scalping: no trailing stop (too slow for 1m moves).
+  trail_trigger_pct: 0.0          # 0 = disabled
+
+  # --- Indicators (optimised for fast markets) ---
+  indicators:
+    rsi:
+      period: 7                   # shorter period = more sensitive
+      oversold: 30
+      overbought: 70
+    ema:
+      fast: 8                     # 8/21 crossover is faster than 50/200
+      slow: 21
+      trend: 50                   # 50 EMA on trend timeframe (5m)
+      long_trend: 200
+    bollinger:
+      period: 14                  # faster Bollinger for scalping
+      std_dev: 2.0
+    atr:
+      period: 7                   # shorter ATR for recent volatility
+    volume:
+      min_volume_multiplier: 1.2  # require above-average volume to enter
+      volume_avg_period: 20
+
+  # --- Filters ---
+session_filter: overlap         # NY+Asian overlap; peak crypto + gold liquidity
+  news_blackout_before_minutes: 30
+  news_blackout_after_minutes: 15
+
+  # Spread filter: crucial for scalping (spread is a larger % of target).
+  # Markets.yaml max_spread_pips takes priority if lower.
+  max_spread_pct: 0.05  # 0.05% of price; crypto typically 0.01-0.1%
+
+  # Require Screening Agent bias to be Bullish for longs / Bearish for shorts.
+  # If bias is Neutral, skip the signal.
+  require_bias_alignment: true
+
+  warmup_candles: 50              # shorter warmup for faster indicators
+
+  # --- Derivatives Filters (CoinGlass) ---
+  # Scalping requires clean market microstructure. High funding = crowded trend;
+  # avoid entering in the same direction as the crowd on ultra-short timeframes.
+  funding_rate_long_max_pct: 0.03   # skip crypto longs if funding > 0.03%/8h
+  funding_rate_short_min_pct: -0.03 # skip crypto shorts if funding < -0.03%/8h
+  oi_divergence_filter: false        # not used at 1m/5m timeframes
+  long_short_ratio_max_long: 0.0
+  long_short_ratio_min_short: 0.0
+  require_positive_taker_delta: true # confirm momentum with taker buying before long entry
+  avoid_liquidation_zone_pct: 0.3   # tight — avoid areas within 0.3% of liq cluster
+  fear_greed_long_min: 0
+  fear_greed_short_max: 100
+
+# =============================================================================
+# PRESET 2 — SWING TRADING
+# Target: 50–200 pip / 2–5% moves; hold hours to days; fewer, larger positions.
+# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT (4H).
+# Timeframe: 4H signal, 1D trend.
+# =============================================================================
+swing:
+  enabled: false                  # enable when ready
+
+  markets:
+    - BTC/USDT
+    - BTC/USDT
+    - ETH/USDT
+    - XAU/USDT
+  primary_timeframe: 4h
+  trend_timeframe: 1d
+
+  order_type: limit               # use limit orders for better fill prices
+  limit_offset_pips: 3.0          # place limit slightly above/below market
+  time_in_force: gtc              # stay open until filled
+  order_cancel_after_seconds: 3600
+  confirmation_candles: 1         # wait 1 candle to confirm close
+
+  signal_dedup_window_seconds: 14400  # 4-hour dedup
+
+  # --- Risk per trade (larger; fewer trades) ---
+  risk_pct_per_trade: 1.0
+  max_position_size_pct: 5.0
+
+  # --- Stop Loss ---
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 1.5   # wider stop; room for 4H candle noise
+  min_stop_distance_pips: 15.0
+
+  # --- Take Profit ---
+  take_profit_levels:
+    - rr_ratio: 2.0               # TP1 at 2× risk; decent R:R
+      scale_out_pct: 50           # take half off the table
+      move_sl_to_breakeven: true
+    - rr_ratio: 4.0               # TP2 at 4× risk (let runner run)
+      scale_out_pct: 50
+
+  trail_trigger_pct: 3.0          # activate trailing after 3% profit
+  trail_step_pct: 0.5
+
+  # --- Indicators ---
+  indicators:
+    rsi:
+      period: 14
+      oversold: 30
+      overbought: 70
+    ema:
+      fast: 21
+      slow: 55
+      trend: 200
+      long_trend: 200
+    bollinger:
+      period: 20
+      std_dev: 2.0
+    atr:
+      period: 14
+    volume:
+      min_volume_multiplier: 1.0
+      volume_avg_period: 20
+
+  session_filter: all
+  news_blackout_before_minutes: 30
+  news_blackout_after_minutes: 30
+  max_spread_pct: 5.0
+  require_bias_alignment: true
+  warmup_candles: 200
+
+  # --- Derivatives Filters (CoinGlass) ---
+  # Swing trading benefits from OI divergence filter — if OI is not confirming
+  # a new high, the trend is weakening and a swing long becomes risky.
+  funding_rate_long_max_pct: 0.05   # avoid longs when funding > 0.05%/8h (e.g. BTC bull run crowding)
+  funding_rate_short_min_pct: -0.05
+  oi_divergence_filter: true        # key signal: price breakout without OI = weak; skip entry
+  long_short_ratio_max_long: 1.8    # skip long when 80% of accounts already long (contrarian risk)
+  long_short_ratio_min_short: 0.6   # skip short when 60% accounts already short
+  require_positive_taker_delta: false
+  avoid_liquidation_zone_pct: 0.5   # swing entries should not be near large liq clusters
+  fear_greed_long_min: 15           # skip longs in extreme fear (broken downtrends)
+  fear_greed_short_max: 90          # skip shorts in extreme greed (blow-off momentum risk)
+
+# =============================================================================
+# PRESET 3 — MEAN REVERSION
+# Logic: RSI extreme + Bollinger Band breach → fade the move.
+# Best markets: XAU/USDT (range-bound hours), BTC/USDT, ETH/USDT (range-bound).
+# Timeframe: 15m signal, 1H trend filter.
+# =============================================================================
+mean_reversion:
+  enabled: true
+
+  markets:
+    - EUR/USD
+    - XAU/USDT
+    - BTC/USDT
+    - ETH/USDT
+  primary_timeframe: 15m
+  trend_timeframe: 1h
+
+  order_type: limit               # wait for a better entry price
+  limit_offset_pips: 0.5
+  time_in_force: gtc
+  order_cancel_after_seconds: 900 # 15 minutes
+  confirmation_candles: 1
+
+  signal_dedup_window_seconds: 900
+
+  risk_pct_per_trade: 0.5
+  max_position_size_pct: 4.0
+
+  # --- Stop Loss ---
+  # Place stop beyond the Bollinger Band breach level.
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 1.2
+  min_stop_distance_pips: 5.0
+
+  # --- Take Profit ---
+  # Target: return to the Bollinger midline (20-period SMA).
+  take_profit_levels:
+    - rr_ratio: 1.5               # conservative; range trades rarely run far
+      scale_out_pct: 80
+      move_sl_to_breakeven: true
+    - rr_ratio: 2.5
+      scale_out_pct: 20
+
+  trail_trigger_pct: 1.0
+  trail_step_pct: 0.3
+
+  # --- Indicators ---
+  indicators:
+    rsi:
+      period: 14
+      # Tighter thresholds for stronger mean-reversion signals.
+      oversold: 28
+      overbought: 72
+      # Additional: require RSI to cross back above oversold AFTER being below it.
+      require_cross_confirmation: true
+    bollinger:
+      period: 20
+      std_dev: 2.0
+      # Only enter if price breached the band by at least this multiple of ATR.
+      min_band_breach_atr: 0.5
+    atr:
+      period: 14
+    ema:
+      trend: 200                  # only trade in direction of long-term trend
+      long_trend: 200
+
+  # Mean reversion works poorly during trending/news-driven markets.
+  # Restrict to lower-volatility sessions.
+  session_filter: all
+  news_blackout_before_minutes: 45
+  news_blackout_after_minutes: 30
+
+  # Skip entry if spread is too wide (spreads widen in volatile conditions).
+  max_spread_pct: 2.0
+
+  # Do NOT require bias alignment — mean reversion often fades the bias.
+  require_bias_alignment: false
+
+  # Require price to be below/above the 200 EMA to trade in that direction only.
+  require_trend_alignment: true
+
+  warmup_candles: 200
+
+  # --- Derivatives Filters (CoinGlass) ---
+  # Mean reversion USES extreme derivatives readings as entry confirmation signals,
+  # not just guards. Extreme funding = over-extended crowd = reversion opportunity.
+  # Long entries: wait for extreme negative funding (shorts are overpaying = squeeze setup)
+  # Short entries: wait for extreme positive funding (longs are overpaying = dump setup)
+  funding_rate_long_max_pct: 0.0    # disabled — high funding can be entry trigger for SHORTS
+  funding_rate_short_min_pct: 0.0   # disabled — low funding can be entry trigger for LONGS
+  oi_divergence_filter: false        # not relevant for mean reversion (range-bound expected)
+  long_short_ratio_max_long: 1.9    # very crowded longs (>1.9) = strong mean-reversion short signal
+  long_short_ratio_min_short: 0.55  # very crowded shorts (<0.55) = strong mean-reversion long signal
+  require_positive_taker_delta: false
+  avoid_liquidation_zone_pct: 0.0   # mean reversion targets liquidation zones (they ARE the target)
+  fear_greed_long_min: 0
+  fear_greed_short_max: 100
+
+# =============================================================================
+# PRESET 4 — TREND FOLLOWING (EMA Cross)
+# Logic: EMA 50/200 golden/death cross on trend TF → entry on 5m pullback.
+# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT (4H — strong USD trends).
+# Timeframe: 1H trend signal, 4H confirmation.
+# =============================================================================
+trend_following:
+  enabled: true
+
+  markets:
+    - BTC/USDT
+    - BTC/USDT
+    - ETH/USDT
+    - XAU/USDT
+  primary_timeframe: 1h           # cross detected on 1H
+  trend_timeframe: 4h             # direction confirmed on 4H
+
+  order_type: limit
+  limit_offset_pips: 2.0
+  time_in_force: gtc
+  order_cancel_after_seconds: 7200
+  confirmation_candles: 2         # 2-candle close confirmation above cross
+
+  signal_dedup_window_seconds: 3600
+
+  risk_pct_per_trade: 1.0
+  max_position_size_pct: 5.0
+
+  # --- Stop Loss ---
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 1.5
+  min_stop_distance_pips: 10.0
+
+  # --- Take Profit ---
+  take_profit_levels:
+    - rr_ratio: 2.5
+      scale_out_pct: 50
+      move_sl_to_breakeven: true
+    - rr_ratio: 5.0               # big runner target for strong trends
+      scale_out_pct: 50
+
+  trail_trigger_pct: 2.0
+  trail_step_pct: 0.5
+
+  # --- Indicators ---
+  indicators:
+    ema:
+      fast: 50
+      slow: 200
+      # Number of candles EMA fast must stay above/below EMA slow to confirm.
+      cross_confirmation_candles: 2
+    rsi:
+      period: 14
+      # Filter: only take longs when RSI > 50 (momentum confirmation).
+      min_rsi_for_long: 50
+      max_rsi_for_short: 50
+    atr:
+      period: 14
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+      # Require MACD histogram to be positive for longs.
+      require_histogram_alignment: true
+    volume:
+      min_volume_multiplier: 1.1
+      volume_avg_period: 20
+
+  session_filter: all
+  news_blackout_before_minutes: 30
+  news_blackout_after_minutes: 15
+  max_spread_pct: 3.0
+  require_bias_alignment: true
+  warmup_candles: 200
+
+  # --- Derivatives Filters (CoinGlass) ---
+  # Trend following requires institutional participation. OI must confirm the trend.
+  # Taker delta confirms smart money is aggressively buying into trend continuation.
+  funding_rate_long_max_pct: 0.07   # allow higher funding in trending markets (trend can persist longer)
+  funding_rate_short_min_pct: -0.07
+  oi_divergence_filter: true        # CRITICAL: skip trend signals when OI is diverging (smart money exiting)
+  long_short_ratio_max_long: 0.0    # disabled — trending markets are naturally crowded
+  long_short_ratio_min_short: 0.0
+  require_positive_taker_delta: true # taker aggression must confirm direction
+  avoid_liquidation_zone_pct: 1.0   # wider avoidance — cascades can end trends abruptly
+  fear_greed_long_min: 25           # avoid trend-following longs in extreme fear (broken structure)
+  fear_greed_short_max: 100
+
+# =============================================================================
+# PRESET 5 — VOLATILITY BREAKOUT
+# Logic: ATR-based pending orders above/below consolidation at session opens.
+# Best markets: XAU/USDT, BTC/USDT at NY open and Asian session opens.
+# Timeframe: 15m consolidation, 5m entry.
+# =============================================================================
+volatility_breakout:
+  enabled: true
+
+  markets:
+    - EUR/USD
+    - XAU/USDT
+    - BTC/USDT
+    - ETH/USDT
+  primary_timeframe: 15m          # breakout detected on 15m
+  trend_timeframe: 1h
+
+  # Use stop_limit: price must break the level AND confirm.
+  order_type: stop_limit
+  time_in_force: gtc
+
+  # Cancel unfilled breakout orders after the session window closes.
+  order_cancel_after_seconds: 3600
+
+  confirmation_candles: 0         # enter immediately on breakout candle
+
+  signal_dedup_window_seconds: 3600
+
+  risk_pct_per_trade: 0.75
+  max_position_size_pct: 4.0
+
+  # --- Stop Loss ---
+  stop_loss_type: atr
+  stop_loss_atr_multiplier: 1.0
+  min_stop_distance_pips: 5.0
+
+  # --- Take Profit ---
+  take_profit_levels:
+    - rr_ratio: 2.0
+      scale_out_pct: 60
+      move_sl_to_breakeven: true
+    - rr_ratio: 4.0
+      scale_out_pct: 40
+
+  trail_trigger_pct: 1.5
+  trail_step_pct: 0.4
+
+  # --- Indicators ---
+  indicators:
+    atr:
+      period: 14
+      # Breakout level = High/Low of consolidation window ± (ATR × breakout_multiplier)
+      breakout_atr_multiplier: 1.0
+    bollinger:
+      period: 20
+      std_dev: 2.0
+      # Require price to break outside the Bollinger Band for confirmation.
+      require_band_breach: true
+    volume:
+      # Volume must spike on breakout candle.
+      min_volume_multiplier: 1.5
+      volume_avg_period: 10
+    rsi:
+      period: 14
+      # Breakout should have RSI momentum (not overbought immediately).
+      max_rsi_for_long_entry: 75
+      min_rsi_for_short_entry: 25
+
+  # Consolidation window: look back this many candles before the session open
+  # to find the High/Low range.
+  consolidation_lookback_candles: 12  # 12 × 15m = 3-hour consolidation
+
+  # --- Session restriction (critical for this strategy) ---
+  # Only fire breakout signals at session opens.
+# asian_open  : 00:00–02:00 UTC (Asian session opens; gold physical demand)
+# ny_open      : 12:00–14:00 UTC (NY open; USD macro events move gold)
+session_filter: ny_open
+additional_sessions: [asian_open]
+
+  news_blackout_before_minutes: 15
+  news_blackout_after_minutes: 0  # breakouts often ARE the news reaction
+
+  max_spread_pct: 2.0
+  require_bias_alignment: false   # breakout strategy is direction-agnostic
+  warmup_candles: 100
+
+  # --- Derivatives Filters (CoinGlass) ---
+  # Breakouts are often caused by liquidation cascades. The strategy deliberately
+  # targets liquidation zones as profit targets, not as areas to avoid.
+  # Taker volume confirmation is critical — fake breakouts lack taker aggression.
+  funding_rate_long_max_pct: 0.08   # allow elevated funding — breakout environments are heated
+  funding_rate_short_min_pct: -0.08
+  oi_divergence_filter: false        # OI often spikes ON the breakout, not before
+  long_short_ratio_max_long: 0.0    # disabled — direction is confirmed by breakout, not crowd
+  long_short_ratio_min_short: 0.0
+  require_positive_taker_delta: true # taker aggression is the single most important breakout confirmation
+  avoid_liquidation_zone_pct: 0.0   # DISABLED: breakout strategy targets liq zones as price magnets
+  fear_greed_long_min: 0
+  fear_greed_short_max: 100

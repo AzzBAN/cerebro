@@ -1,0 +1,28 @@
+# Secrets - NEVER commit
+configs/secrets.env
+configs/app.yaml
+configs/markets.yaml
+configs/strategies.yaml
+
+# Binaries
+cerebro
+/dist/
+
+# Test data - real market data
+testdata/real/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Logs
+*.log
