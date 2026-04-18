@@ -60,15 +60,16 @@ func (c *Client) get(ctx context.Context, path string, params map[string]string,
 			delay *= 2
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("coinglass: rate limited (429)")
 			time.Sleep(60 * time.Second)
 			continue
 		}
 		if resp.StatusCode >= 500 {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			lastErr = fmt.Errorf("coinglass: server error %d: %s", resp.StatusCode, string(body))
 			time.Sleep(delay)
 			delay *= 2
@@ -76,10 +77,13 @@ func (c *Client) get(ctx context.Context, path string, params map[string]string,
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return fmt.Errorf("coinglass: unexpected status %d: %s", resp.StatusCode, string(body))
 		}
 
-		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		err = json.NewDecoder(resp.Body).Decode(v)
+		resp.Body.Close()
+		if err != nil {
 			return fmt.Errorf("coinglass: decode %s: %w", path, err)
 		}
 		return nil

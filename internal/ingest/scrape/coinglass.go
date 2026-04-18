@@ -11,10 +11,14 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/shopspring/decimal"
 )
+
+// stealthUserAgent mimics a normal Chrome browser to avoid headless detection.
+const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 const coinglassBaseURL = "https://www.coinglass.com"
 
@@ -36,6 +40,7 @@ func NewCoinglassScraper(timeout time.Duration) (*CoinglassScraper, error) {
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.WindowSize(1920, 1080),
 	)
 
@@ -67,9 +72,9 @@ func (s *CoinglassScraper) Close() {
 
 func (s *CoinglassScraper) FundingRate(ctx context.Context, symbol domain.Symbol) (*domain.FundingRate, error) {
 	coin := coinGlassSymbol(symbol)
-	url := coinglassBaseURL + "/FundingRate"
+	url := coinglassBaseURL + "/FundingRate/" + coin
 
-	body, err := s.interceptAPI(ctx, url, "/api/futures/funding-rate")
+	body, err := s.interceptAPI(ctx, url, matchKeywords("funding", "rate"))
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: funding rate %s: %w", coin, err)
 	}
@@ -79,9 +84,9 @@ func (s *CoinglassScraper) FundingRate(ctx context.Context, symbol domain.Symbol
 
 func (s *CoinglassScraper) OpenInterest(ctx context.Context, symbol domain.Symbol) (*domain.OpenInterest, error) {
 	coin := coinGlassSymbol(symbol)
-	url := coinglassBaseURL + "/OpenInterest"
+	url := coinglassBaseURL + "/OpenInterest/" + coin
 
-	body, err := s.interceptAPI(ctx, url, "/api/futures/open-interest")
+	body, err := s.interceptAPI(ctx, url, matchKeywords("open", "interest"))
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: open interest %s: %w", coin, err)
 	}
@@ -91,9 +96,9 @@ func (s *CoinglassScraper) OpenInterest(ctx context.Context, symbol domain.Symbo
 
 func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.Symbol, refPrice decimal.Decimal, pricePct float64) ([]domain.LiquidationZone, error) {
 	coin := coinGlassSymbol(symbol)
-	url := coinglassBaseURL + "/LiquidationData"
+	url := coinglassBaseURL + "/LiquidationData/" + coin
 
-	body, err := s.interceptAPI(ctx, url, "/api/futures/liquidation")
+	body, err := s.interceptAPI(ctx, url, matchKeywords("liquidation"))
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: liquidations %s: %w", coin, err)
 	}
@@ -104,7 +109,7 @@ func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.S
 func (s *CoinglassScraper) FearGreed(ctx context.Context) (*domain.FearGreedIndex, error) {
 	url := coinglassBaseURL + "/FearAndGreedIndex"
 
-	body, err := s.interceptAPI(ctx, url, "/api/index/fear-greed")
+	body, err := s.interceptAPI(ctx, url, matchKeywords("fear", "greed"))
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: fear greed: %w", err)
 	}
@@ -154,9 +159,9 @@ func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (
 
 func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domain.Symbol) (*domain.LongShortRatio, error) {
 	coin := coinGlassSymbol(symbol)
-	url := coinglassBaseURL + "/LongShortRatio"
+	url := coinglassBaseURL + "/LongShortRatio/" + coin
 
-	body, err := s.interceptAPI(ctx, url, "/api/futures/long-short")
+	body, err := s.interceptAPI(ctx, url, matchKeywords("long", "short"))
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: long/short %s: %w", coin, err)
 	}
@@ -164,9 +169,27 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 	return parseLongShortResponse(body, symbol), nil
 }
 
-// interceptAPI navigates to url and listens for XHR/fetch responses whose URL
-// contains apiPathPrefix. It returns the first matching response body as raw JSON.
-func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL, apiPathPrefix string) (json.RawMessage, error) {
+// urlMatcher determines whether an intercepted XHR/fetch URL is relevant.
+type urlMatcher func(url string) bool
+
+// matchKeywords returns a matcher that checks all keywords appear in the URL
+// (case-insensitive). This is more resilient than exact path matching because
+// coinglass.com's internal API paths can change without notice.
+func matchKeywords(keywords ...string) urlMatcher {
+	return func(url string) bool {
+		lower := strings.ToLower(url)
+		for _, kw := range keywords {
+			if !strings.Contains(lower, strings.ToLower(kw)) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// interceptAPI navigates to url and listens for XHR/fetch responses that match
+// the given urlMatcher. It returns the first matching response body as raw JSON.
+func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL string, matcher urlMatcher) (json.RawMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -191,7 +214,7 @@ func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL, apiPathPre
 		}
 
 		respURL := respEvt.Response.URL
-		if !strings.Contains(respURL, apiPathPrefix) {
+		if !matcher(respURL) {
 			return
 		}
 
@@ -216,9 +239,10 @@ func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL, apiPathPre
 
 	if err := chromedp.Run(tabCtx,
 		network.Enable(),
+		emulation.SetUserAgentOverride(stealthUserAgent),
 		chromedp.Navigate(pageURL),
 		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Sleep(5*time.Second),
+		chromedp.Sleep(2*time.Second),
 	); err != nil {
 		return nil, fmt.Errorf("navigate %s: %w", pageURL, err)
 	}
@@ -226,11 +250,11 @@ func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL, apiPathPre
 	select {
 	case body := <-bodyCh:
 		if len(body) == 0 {
-			return nil, fmt.Errorf("empty response from %s", apiPathPrefix)
+			return nil, fmt.Errorf("empty response from %s", pageURL)
 		}
 		return body, nil
 	case <-tabCtx.Done():
-		return nil, fmt.Errorf("timeout waiting for %s API response: %w", apiPathPrefix, tabCtx.Err())
+		return nil, fmt.Errorf("timeout waiting for API response from %s: %w", pageURL, tabCtx.Err())
 	}
 }
 
