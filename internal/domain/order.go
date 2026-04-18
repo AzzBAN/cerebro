@@ -11,6 +11,7 @@ type OrderIntent struct {
 	ID            string // client-generated UUID; used for idempotency
 	CorrelationID string // traces back to Signal.CorrelationID
 	Symbol        Symbol
+	Venue         Venue
 	Side          Side
 	Quantity      decimal.Decimal
 	StopLoss      decimal.Decimal

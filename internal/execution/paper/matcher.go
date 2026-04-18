@@ -73,6 +73,17 @@ func (m *Matcher) Positions(_ context.Context) ([]domain.Position, error) {
 	return m.book.Positions(), nil
 }
 
+// Balance returns the paper account balance.
+func (m *Matcher) Balance(_ context.Context) (port.AccountBalance, error) {
+	equity := decimal.NewFromFloat(10_000)
+	return port.AccountBalance{
+		Venue:      domain.VenueBinanceSpot,
+		TotalUSDT:  equity,
+		FreeUSDT:   equity,
+		LockedUSDT: decimal.Zero,
+	}, nil
+}
+
 // OnCandle drives fills for open paper orders using the next-candle open price.
 // Call this from the strategy engine's candle loop.
 func (m *Matcher) OnCandle(ctx context.Context, c domain.Candle) {

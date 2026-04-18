@@ -16,6 +16,11 @@ type Strategy interface {
 	// Returns (signal, true) when a signal fires, (zero, false) otherwise.
 	OnCandle(ctx context.Context, c domain.Candle) (domain.Signal, bool)
 
+	// Warmup feeds historical candles to prime internal indicators (RSI, EMA, etc.)
+	// so the strategy can emit signals immediately once live data arrives.
+	// Signals produced during warmup are discarded.
+	Warmup(ctx context.Context, candles []domain.Candle)
+
 	// Symbols returns the list of symbols this strategy monitors.
 	Symbols() []domain.Symbol
 

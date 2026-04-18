@@ -2,100 +2,110 @@ package calendar
 
 import (
 	"context"
-	"encoding/xml"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
 )
 
-const myfxbookRSSURL = "https://www.myfxbook.com/rss/forex-economic-calendar-rss.xml"
+const finnhubBaseURL = "https://finnhub.io/api/v1/calendar/economic"
 
-// MyfxbookCalendar implements port.CalendarFeed using the Myfxbook RSS feed.
-type MyfxbookCalendar struct {
+// FinnhubCalendar implements port.CalendarFeed using the Finnhub economic calendar API.
+// Free tier: 60 calls/minute. Requires FINNHUB_API_KEY.
+type FinnhubCalendar struct {
+	apiKey string
 	client *http.Client
 }
 
-// New creates a MyfxbookCalendar.
-func New() *MyfxbookCalendar {
-	return &MyfxbookCalendar{
+// New creates a FinnhubCalendar.
+func New(apiKey string) *FinnhubCalendar {
+	return &FinnhubCalendar{
+		apiKey: apiKey,
 		client: &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
-type rssItem struct {
-	Title   string `xml:"title"`
-	PubDate string `xml:"pubDate"`
+type finnhubResponse struct {
+	EconomicCalendar []finnhubEvent `json:"economicCalendar"`
 }
 
-type rssFeed struct {
-	Items []rssItem `xml:"channel>item"`
+type finnhubEvent struct {
+	Country string `json:"country"`
+	Event   string `json:"event"`
+	Impact  string `json:"impact"`
+	Time    string `json:"time"`
 }
 
-// UpcomingEvents returns high-impact economic events within the next hours hours.
-func (m *MyfxbookCalendar) UpcomingEvents(ctx context.Context, hours int) ([]domain.EconomicEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, myfxbookRSSURL, nil)
+// UpcomingEvents returns economic events within the next hours hours.
+func (f *FinnhubCalendar) UpcomingEvents(ctx context.Context, hours int) ([]domain.EconomicEvent, error) {
+	now := time.Now().UTC()
+	to := now.Add(time.Duration(hours) * time.Hour)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finnhubBaseURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("myfxbook: build request: %w", err)
+		return nil, fmt.Errorf("finnhub calendar: build request: %w", err)
 	}
+	q := req.URL.Query()
+	q.Set("token", f.apiKey)
+	q.Set("from", now.Format("2006-01-02"))
+	q.Set("to", to.Format("2006-01-02"))
+	req.URL.RawQuery = q.Encode()
 
-	resp, err := m.client.Do(req)
+	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("myfxbook: http: %w", err)
+		return nil, fmt.Errorf("finnhub calendar: http: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var feed rssFeed
-	if err := xml.NewDecoder(resp.Body).Decode(&feed); err != nil {
-		return nil, fmt.Errorf("myfxbook: parse RSS: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("finnhub calendar: status %d", resp.StatusCode)
 	}
 
-	now := time.Now().UTC()
-	window := now.Add(time.Duration(hours) * time.Hour)
-	var events []domain.EconomicEvent
+	var apiResp finnhubResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("finnhub calendar: decode: %w", err)
+	}
 
-	for _, item := range feed.Items {
-		t, err := time.Parse(time.RFC1123, item.PubDate)
+	var events []domain.EconomicEvent
+	for _, e := range apiResp.EconomicCalendar {
+		t, err := time.Parse("2006-01-02T15:04:05", e.Time)
 		if err != nil {
-			t, err = time.Parse(time.RFC1123Z, item.PubDate)
+			// Try UTC suffix.
+			t, err = time.Parse("2006-01-02T15:04:05Z", e.Time)
 			if err != nil {
 				continue
 			}
 		}
-		if t.After(now) && t.Before(window) {
-			impact := classifyImpact(item.Title)
-			events = append(events, domain.EconomicEvent{
-				Title:       item.Title,
-				Impact:      impact,
-				ScheduledAt: t,
-			})
+		if t.Before(now) || t.After(to) {
+			continue
 		}
+		impact := e.Impact
+		if impact == "" {
+			impact = classifyImpact(e.Event)
+		}
+		events = append(events, domain.EconomicEvent{
+			Title:       e.Event,
+			Impact:      impact,
+			ScheduledAt: t,
+		})
 	}
+
+	slog.Debug("finnhub calendar: parsed events", "total", len(apiResp.EconomicCalendar), "upcoming", len(events))
 	return events, nil
 }
 
-// classifyImpact assigns a rough impact level based on common high-impact event names.
 func classifyImpact(title string) string {
-	highImpact := []string{"NFP", "CPI", "FOMC", "Fed", "GDP", "PMI", "ECB", "BOE", "BOJ"}
+	highImpact := []string{"NFP", "CPI", "FOMC", "Fed", "GDP", "PMI", "ECB", "BOE", "BOJ", "Non Farm", "Interest Rate", "Unemployment"}
+	lower := strings.ToLower(title)
 	for _, keyword := range highImpact {
-		if contains(title, keyword) {
+		if strings.Contains(strings.ToLower(title), strings.ToLower(keyword)) {
 			return "high"
 		}
 	}
+	_ = lower
 	return "medium"
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr ||
-		len(s) > 0 && containsLoop(s, substr))
-}
-
-func containsLoop(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

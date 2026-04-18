@@ -16,6 +16,12 @@ type ToolDefinition struct {
 	InputSchema map[string]any
 }
 
+// Tool binds a handler with its schema definition so the LLM knows how to call it.
+type Tool struct {
+	Handler    ToolHandler
+	Definition ToolDefinition
+}
+
 // LLM abstracts a single model provider (Gemini, Claude, OpenAI-compatible).
 type LLM interface {
 	// Complete runs a tool-calling loop until the model stops calling tools
@@ -24,7 +30,7 @@ type LLM interface {
 		ctx context.Context,
 		systemPrompt string,
 		userMessage string,
-		tools map[string]ToolHandler,
+		tools map[string]Tool,
 	) (string, error)
 
 	// Provider returns a short identifier for the LLM provider (e.g. "gemini", "anthropic").

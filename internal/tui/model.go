@@ -1,200 +1,332 @@
 package tui
 
 import (
-	"fmt"
-	"strings"
+	"context"
 	"time"
 
-	"github.com/azhar/cerebro/internal/marketdata"
-	"github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/azhar/cerebro/internal/domain"
+	tea "github.com/charmbracelet/bubbletea"
 )
-
-// ─── Message types sent to the TUI model ─────────────────────────────────────
-
-// QuoteMsg carries a market data quote update.
-type QuoteMsg marketdata.QuoteEvent
-
-// CandleMsg carries a new closed candle.
-type CandleMsg marketdata.CandleEvent
-
-// AgentLogMsg is a line of agent reasoning to display.
-type AgentLogMsg struct{ Line string }
-
-// SysLogMsg is a system log line (from slog) forwarded to the TUI panel.
-type SysLogMsg struct {
-	Level string // "ERROR", "WARN", "INFO", "DEBUG"
-	Line  string
-	At    time.Time
-}
-
-// HeartbeatMsg carries the latest heartbeat summary for the status bar.
-type HeartbeatMsg struct {
-	Line string
-	At   time.Time
-}
-
-// OrderMsg is an order lifecycle event (placed, filled, cancelled).
-type OrderMsg struct{ Line string }
-
-// ─── Lipgloss styles ─────────────────────────────────────────────────────────
-
-var (
-	// Panels
-	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	borderStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	inputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-
-	// Log level badges
-	errStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))
-	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	infoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
-	debugStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	agentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13")) // magenta
-
-	// Ticker
-	priceStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	symStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-
-	// Status bar (heartbeat)
-	heartbeatStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("235")).
-			Foreground(lipgloss.Color("7")).
-			Padding(0, 1)
-	heartbeatTsStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("235")).
-				Foreground(lipgloss.Color("8")).
-				Padding(0, 1)
-)
-
-// ─── logEntry: a single line in the combined log panel ───────────────────────
-
-type logEntry struct {
-	ts    time.Time
-	level string // "ERROR"|"WARN"|"INFO"|"DEBUG"|"AGENT"|"ORDER"
-	text  string
-}
-
-func (e logEntry) render() string {
-	ts := dimStyle.Render(e.ts.Format("15:04:05"))
-	var badge string
-	switch e.level {
-	case "ERROR":
-		badge = errStyle.Render("ERR")
-	case "WARN":
-		badge = warnStyle.Render("WRN")
-	case "INFO":
-		badge = infoStyle.Render("INF")
-	case "DEBUG":
-		badge = debugStyle.Render("DBG")
-	case "AGENT":
-		badge = agentStyle.Render("AGT")
-	case "ORDER":
-		badge = priceStyle.Render("ORD")
-	default:
-		badge = dimStyle.Render("   ")
-	}
-	return fmt.Sprintf("%s %s %s", ts, badge, e.text)
-}
-
-// ─── Model ────────────────────────────────────────────────────────────────────
 
 // Model is the root Bubble Tea model.
 type Model struct {
 	width  int
 	height int
 
-	// Ticker tape: latest quote per symbol.
-	quotes map[string]quoteState
+	// Live clock
+	now time.Time
 
-	// Combined log (system + agent + orders), bounded.
+	// Market watch
+	quotes            map[string]quoteState
+	watchScrollOffset int
+	watchPageSize     int
+
+	// Positions
+	positionRows []domain.Position
+
+	// Scrollable log
 	logs        []logEntry
 	maxLogLines int
+	logScrollY  int // 0 = bottom (latest), increases = scroll up
+
+	// Agent panel
+	agentRuns     map[string]*agentRunState
+	agentRunOrder []string
+	spinnerFrame  int
 
 	// Latest heartbeat for the status bar.
-	heartbeat    string
-	heartbeatAt  time.Time
+	heartbeat   string
+	heartbeatAt time.Time
 
 	// Input field for /ask.
 	input        string
 	inputActive  bool
 	lastResponse string
+
+	// Copilot /ask integration
+	copilotFn   func(ctx context.Context, query string) (string, error)
+	askLoading  bool
+	askResponse string
+	askQuery    string
 }
 
 type quoteState struct {
-	symbol string
-	mid    float64
-	bid    float64
-	ask    float64
-	prevMid float64 // to show up/down colour
+	symbol             string
+	last               float64
+	bid                float64
+	ask                float64
+	priceChange        float64
+	priceChangePercent float64
+	volume24h          float64
 }
 
 // New creates a fresh TUI model.
 func New(maxLogLines int) Model {
 	if maxLogLines <= 0 {
-		maxLogLines = 100
+		maxLogLines = 500
 	}
 	return Model{
 		quotes:      make(map[string]quoteState),
+		agentRuns:   make(map[string]*agentRunState),
 		maxLogLines: maxLogLines,
+		logScrollY:  0,
+		now:         time.Now(),
 	}
 }
 
+// SetCopilotFn injects the copilot function for /ask queries.
+func (m *Model) SetCopilotFn(fn func(ctx context.Context, query string) (string, error)) {
+	m.copilotFn = fn
+}
+
 // Init satisfies the tea.Model interface.
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(clockTick(), watchTick())
+}
 
 // Update processes messages and updates the model.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.recalculateLayout()
+
+	case clockTickMsg:
+		m.now = time.Now()
+		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		return m, clockTick()
+
+	case watchTickMsg:
+		symCount := len(m.quotes)
+		if symCount > m.watchPageSize && m.watchPageSize > 0 {
+			m.watchScrollOffset = (m.watchScrollOffset + m.watchPageSize) % symCount
+		}
+		return m, watchTick()
 
 	case QuoteMsg:
 		sym := string(msg.Quote.Symbol)
-		prev := m.quotes[sym]
-		m.quotes[sym] = quoteState{
-			symbol:  sym,
-			mid:     msg.Quote.Mid.InexactFloat64(),
-			bid:     msg.Quote.Bid.InexactFloat64(),
-			ask:     msg.Quote.Ask.InexactFloat64(),
-			prevMid: prev.mid,
+		existing := m.quotes[sym]
+		qs := quoteState{
+			symbol:             sym,
+			last:               existing.last,
+			bid:                existing.bid,
+			ask:                existing.ask,
+			priceChange:        existing.priceChange,
+			priceChangePercent: existing.priceChangePercent,
+			volume24h:          existing.volume24h,
 		}
+		if msg.Quote.Last.IsPositive() {
+			qs.last = msg.Quote.Last.InexactFloat64()
+		}
+		if msg.Quote.Bid.IsPositive() {
+			qs.bid = msg.Quote.Bid.InexactFloat64()
+		}
+		if msg.Quote.Ask.IsPositive() {
+			qs.ask = msg.Quote.Ask.InexactFloat64()
+		}
+		if !msg.Quote.PriceChange.IsZero() {
+			qs.priceChange = msg.Quote.PriceChange.InexactFloat64()
+		}
+		if !msg.Quote.PriceChangePercent.IsZero() {
+			qs.priceChangePercent = msg.Quote.PriceChangePercent.InexactFloat64()
+		}
+		if !msg.Quote.Volume24h.IsZero() {
+			qs.volume24h = msg.Quote.Volume24h.InexactFloat64()
+		}
+		m.quotes[sym] = qs
+		m.recalculateLayout()
 
 	case SysLogMsg:
 		m.appendLog(logEntry{ts: msg.At, level: msg.Level, text: msg.Line})
+		m.logScrollY = 0
 
 	case AgentLogMsg:
 		m.appendLog(logEntry{ts: time.Now(), level: "AGENT", text: msg.Line})
+		m.logScrollY = 0
 
 	case OrderMsg:
 		m.appendLog(logEntry{ts: time.Now(), level: "ORDER", text: msg.Line})
+		m.logScrollY = 0
+
+	case PositionsMsg:
+		m.positionRows = append([]domain.Position(nil), msg.Positions...)
+
+	case AgentStateMsg:
+		run, exists := m.agentRuns[msg.RunID]
+		if !exists {
+			run = &agentRunState{
+				agent:    msg.Agent,
+				runID:    msg.RunID,
+				provider: msg.Provider,
+				model:    msg.Model,
+				symbol:   msg.Symbol,
+				maxSteps: msg.MaxSteps,
+				started:  msg.At,
+			}
+			m.agentRuns[msg.RunID] = run
+			m.agentRunOrder = append(m.agentRunOrder, msg.RunID)
+		}
+		run.step = msg.Step
+		run.toolName = msg.ToolName
+		run.stepNum = msg.StepNum
+		run.maxSteps = msg.MaxSteps
+		if msg.Step == StepComplete || msg.Step == StepError {
+			run.content = msg.Content
+			run.finished = msg.At
+			if msg.Step == StepError {
+				run.err = msg.Content
+			}
+		}
 
 	case HeartbeatMsg:
 		m.heartbeat = msg.Line
 		m.heartbeatAt = msg.At
 
+	case AskResponseMsg:
+		m.askLoading = false
+		if msg.Err != nil {
+			m.askResponse = "Error: " + msg.Err.Error()
+		} else {
+			m.askResponse = msg.Response
+		}
+
 	case tea.KeyMsg:
 		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEsc:
+			if m.askResponse != "" {
+				m.askResponse = ""
+				m.askQuery = ""
+				return m, nil
+			}
 			return m, tea.Quit
 		case tea.KeyEnter:
 			if m.inputActive && m.input != "" {
-				m.lastResponse = "(Copilot not yet wired — Phase 6)"
+				query := m.input
+				if m.copilotFn != nil {
+					m.askLoading = true
+					m.askResponse = ""
+					m.askQuery = query
+					m.input = ""
+					m.inputActive = false
+					return m, newAskCmd(query, m.copilotFn)
+				}
+				m.lastResponse = "(Copilot not available — no LLM configured)"
 				m.input = ""
 				m.inputActive = false
 			}
 		case tea.KeyBackspace:
-			if len(m.input) > 0 {
+			if m.inputActive && len(m.input) > 0 {
 				m.input = m.input[:len(m.input)-1]
 			}
+		case tea.KeyUp:
+			if !m.inputActive {
+				m.scrollLogUp(1)
+			}
+		case tea.KeyDown:
+			if !m.inputActive {
+				m.scrollLogDown(1)
+			}
+		case tea.KeyPgUp:
+			if !m.inputActive {
+				m.scrollLogUp(m.visibleLogLines())
+			}
+		case tea.KeyPgDown:
+			if !m.inputActive {
+				m.scrollLogDown(m.visibleLogLines())
+			}
 		default:
-			m.input += msg.String()
-			m.inputActive = true
+			if !m.inputActive && len(msg.String()) == 1 {
+				m.inputActive = true
+			}
+			if m.inputActive {
+				m.input += msg.String()
+			}
 		}
 	}
 	return m, nil
+}
+
+// ─── Tick commands ───────────────────────────────────────────────────────────
+
+func clockTick() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return clockTickMsg(t)
+	})
+}
+
+func watchTick() tea.Cmd {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+		return watchTickMsg(t)
+	})
+}
+
+// ─── Layout calculations ─────────────────────────────────────────────────────
+
+// recalculateLayout computes derived sizes from the current terminal dimensions.
+func (m *Model) recalculateLayout() {
+	if m.height == 0 || m.width == 0 {
+		return
+	}
+
+	symCount := len(m.quotes)
+	watchRows := symCount + 1 // +1 for header row
+	if watchRows == 1 {
+		watchRows = 2 // minimum: header + 1 empty row
+	}
+	if watchRows > maxWatchLines+1 {
+		watchRows = maxWatchLines + 1
+	}
+	m.watchPageSize = watchRows - 1 // symbols per page (excluding header)
+
+	m.clampLogScroll()
+}
+
+// visibleLogLines returns how many log lines fit in the log viewport.
+func (m *Model) visibleLogLines() int {
+	h := m.logContentHeight()
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// logContentHeight returns the number of log lines that fit inside the bordered log panel.
+func (m *Model) logContentHeight() int {
+	middleH := m.middleHeight()
+	h := middleH - 2 - 1
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+func (m *Model) clampLogScroll() {
+	max := len(m.logs)
+	visible := m.visibleLogLines()
+	if max <= visible {
+		m.logScrollY = 0
+		return
+	}
+	maxScroll := max - visible
+	if m.logScrollY > maxScroll {
+		m.logScrollY = maxScroll
+	}
+	if m.logScrollY < 0 {
+		m.logScrollY = 0
+	}
+}
+
+func (m *Model) scrollLogUp(n int) {
+	m.logScrollY += n
+	m.clampLogScroll()
+}
+
+func (m *Model) scrollLogDown(n int) {
+	m.logScrollY -= n
+	m.clampLogScroll()
 }
 
 func (m *Model) appendLog(e logEntry) {
@@ -204,122 +336,46 @@ func (m *Model) appendLog(e logEntry) {
 	}
 }
 
-// View renders the full TUI layout.
-//
-// ┌─────────────────────────────────────────────────────┐
-// │ BTCUSDT: 84,000.12  bid=...  ask=...  |  ETHUSDT:... │  ← ticker tape
-// ├──────────────────────┬──────────────────────────────┤
-// │ Active Positions     │  System & Agent Log          │  ← split panel
-// │  ...                 │  15:04:05 ERR message...     │
-// │                      │  15:04:08 AGT reasoning...   │
-// ├──────────────────────┴──────────────────────────────┤
-// │ ♥ 15:04:05  state=running  positions=2  candles=12  │  ← heartbeat bar
-// │ /ask > _                                             │  ← input
-// └─────────────────────────────────────────────────────┘
-func (m Model) View() string {
-	if m.width == 0 {
-		return "Loading..."
+// computedWatchH returns the outer height of the watch panel.
+func (m *Model) computedWatchH() int {
+	symCount := len(m.quotes)
+	rows := symCount + 1
+	if rows < 2 {
+		rows = 2
 	}
-
-	ticker    := m.renderTicker()
-	middle    := m.renderMiddle()
-	statusBar := m.renderStatusBar()
-	inputBar  := m.renderInput()
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		ticker, middle, statusBar, inputBar)
+	if rows > maxWatchLines+1 {
+		rows = maxWatchLines + 1
+	}
+	return 2 + 1 + rows // border(2) + panel header(1) + content rows
 }
 
-// ─── Panel renderers ─────────────────────────────────────────────────────────
-
-func (m Model) renderTicker() string {
-	if len(m.quotes) == 0 {
-		return dimStyle.Render("  Waiting for market data…")
-	}
-	parts := make([]string, 0, len(m.quotes))
-	for _, q := range m.quotes {
-		mid := q.mid
-		midStr := fmt.Sprintf("%.4f", mid)
-		var midStyled string
-		if q.prevMid > 0 && mid > q.prevMid {
-			midStyled = priceStyle.Render("▲ " + midStr)
-		} else if q.prevMid > 0 && mid < q.prevMid {
-			midStyled = errStyle.Render("▼ " + midStr)
+// computedAgentPanelH returns the dynamic outer height of the agent panel.
+func (m *Model) computedAgentPanelH() int {
+	activeCount := 0
+	hasCompleted := false
+	for _, id := range m.agentRunOrder {
+		run := m.agentRuns[id]
+		if run.step == StepComplete || run.step == StepError {
+			hasCompleted = true
 		} else {
-			midStyled = midStr
+			activeCount++
 		}
-		parts = append(parts, fmt.Sprintf("%s %s  %s  %s",
-			symStyle.Render(q.symbol),
-			midStyled,
-			dimStyle.Render(fmt.Sprintf("bid=%.4f", q.bid)),
-			dimStyle.Render(fmt.Sprintf("ask=%.4f", q.ask)),
-		))
-	}
-	return "  " + strings.Join(parts, "   │   ")
-}
-
-func (m Model) renderMiddle() string {
-	posW := m.width / 3
-	logW := m.width - posW - 2
-
-	positions := borderStyle.Width(posW - 2).Render(m.renderPositions())
-	logPanel  := borderStyle.Width(logW - 2).Render(m.renderLogPanel())
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, positions, logPanel)
-}
-
-func (m Model) renderPositions() string {
-	header := headerStyle.Render("Active Positions")
-	// TODO Phase 4: populate from broker.Positions()
-	return header + "\n" + dimStyle.Render("  No open positions")
-}
-
-func (m Model) renderLogPanel() string {
-	header := headerStyle.Render("System & Agent Log")
-	if len(m.logs) == 0 {
-		return header + "\n" + dimStyle.Render("  Waiting for activity…")
 	}
 
-	// Determine how many lines fit inside the border panel.
-	// Leave 3 lines: header + border top/bottom.
-	maxLines := m.height - 8
-	if maxLines < 5 {
-		maxLines = 5
+	contentLines := activeCount
+	if hasCompleted {
+		contentLines += 2 // summary line + at least 1 result line
 	}
-	if maxLines > 40 {
-		maxLines = 40
+	if contentLines == 0 {
+		contentLines = 1 // "No agent activity"
 	}
 
-	visible := m.logs
-	if len(visible) > maxLines {
-		visible = visible[len(visible)-maxLines:]
+	h := 2 + 1 + contentLines // border(2) + header(1) + content
+	if h < minAgentPanelH {
+		h = minAgentPanelH
 	}
-
-	rendered := make([]string, len(visible))
-	for i, e := range visible {
-		rendered[i] = e.render()
+	if h > maxAgentPanelH {
+		h = maxAgentPanelH
 	}
-	return header + "\n" + strings.Join(rendered, "\n")
-}
-
-func (m Model) renderStatusBar() string {
-	if m.heartbeat == "" {
-		return heartbeatStyle.Render("  ♥ waiting for first heartbeat…")
-	}
-	ts := heartbeatTsStyle.Render(m.heartbeatAt.Format("15:04:05"))
-	body := heartbeatStyle.Render("  ♥  " + m.heartbeat)
-	return lipgloss.JoinHorizontal(lipgloss.Left, ts, body)
-}
-
-func (m Model) renderInput() string {
-	prompt := inputStyle.Render("/ask > ")
-	cursor := "▌"
-	if !m.inputActive {
-		cursor = dimStyle.Render("▌")
-	}
-	line := prompt + m.input + cursor
-	if m.lastResponse != "" {
-		line += "\n" + dimStyle.Render("  → "+m.lastResponse)
-	}
-	return line
+	return h
 }

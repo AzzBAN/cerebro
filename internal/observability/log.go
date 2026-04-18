@@ -196,14 +196,18 @@ func (h *prettyHandler) Handle(_ context.Context, r slog.Record) error {
 	)
 
 	h.mu.Lock()
-	_, err := io.WriteString(h.w, line)
-	h.mu.Unlock()
-
+	// When a sink (TUI) is attached, skip stderr output — the TUI panel
+	// already displays these logs. Writing to stderr while in alt-screen
+	// mode causes text to bleed through below the TUI.
+	if h.sink == nil {
+		_, _ = io.WriteString(h.w, line)
+	}
 	if h.sink != nil {
 		levelStr := r.Level.String()
 		h.sink.SendSysLog(levelStr, plainLine)
 	}
-	return err
+	h.mu.Unlock()
+	return nil
 }
 
 func (h *prettyHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

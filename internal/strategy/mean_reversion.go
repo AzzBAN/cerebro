@@ -128,6 +128,14 @@ func (m *MeanReversion) newSignal(c domain.Candle, side domain.Side, reason stri
 	}
 }
 
+// Warmup feeds historical candles through OnCandle to prime indicators.
+// Signals produced during warmup are discarded.
+func (m *MeanReversion) Warmup(_ context.Context, candles []domain.Candle) {
+	for _, c := range candles {
+		m.OnCandle(context.Background(), c)
+	}
+}
+
 func (m *MeanReversion) isTargetSymbol(s domain.Symbol) bool {
 	for _, sym := range m.symbols {
 		if sym == s {

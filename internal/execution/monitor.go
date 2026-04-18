@@ -17,16 +17,18 @@ import (
 type Monitor struct {
 	router    *Router
 	venue     domain.Venue
+	env       domain.Environment
 	store     port.TradeStore
 	positions func() []domain.Position // live position source
 }
 
 // NewMonitor creates a Monitor.
 // positionsFn is called each tick to get the current open positions list.
-func NewMonitor(router *Router, venue domain.Venue, store port.TradeStore, positionsFn func() []domain.Position) *Monitor {
+func NewMonitor(router *Router, venue domain.Venue, store port.TradeStore, env domain.Environment, positionsFn func() []domain.Position) *Monitor {
 	return &Monitor{
 		router:    router,
 		venue:     venue,
+		env:       env,
 		store:     store,
 		positions: positionsFn,
 	}
@@ -123,10 +125,11 @@ func (m *Monitor) submitClose(ctx context.Context, pos domain.Position, price de
 		ID:            newUUID(),
 		CorrelationID: pos.CorrelationID,
 		Symbol:        pos.Symbol,
+		Venue:         m.venue,
 		Side:          closeSide,
 		Quantity:      pos.Quantity,
 		Strategy:      pos.Strategy,
-		Environment:   domain.EnvironmentPaper, // Monitor always runs in position's env
+		Environment:   m.env,
 		CreatedAt:     time.Now().UTC(),
 	}
 

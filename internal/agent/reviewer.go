@@ -21,12 +21,13 @@ var reviewerPromptTmpl string
 // It runs asynchronously (off the trading path) and sends recommendations
 // to the operators via the notifier.
 type ReviewerAgent struct {
-	runtime     *Runtime
-	tradeStore  port.TradeStore
-	agentStore  port.AgentLogStore
-	notifiers   []port.Notifier
+	runtime      *Runtime
+	tradeStore   port.TradeStore
+	agentStore   port.AgentLogStore
+	notifiers    []port.Notifier
+	tools        map[string]port.Tool
 	lookbackDays int
-	minTrades   int
+	minTrades    int
 }
 
 // NewReviewerAgent creates a ReviewerAgent.
@@ -36,12 +37,14 @@ func NewReviewerAgent(
 	agentStore port.AgentLogStore,
 	notifiers []port.Notifier,
 	lookbackDays, minTrades int,
+	agentTools map[string]port.Tool,
 ) *ReviewerAgent {
 	return &ReviewerAgent{
 		runtime:      runtime,
 		tradeStore:   tradeStore,
 		agentStore:   agentStore,
 		notifiers:    notifiers,
+		tools:        agentTools,
 		lookbackDays: lookbackDays,
 		minTrades:    minTrades,
 	}
@@ -94,7 +97,7 @@ func (r *ReviewerAgent) runReview(ctx context.Context) {
 		return
 	}
 
-	result := r.runtime.Invoke(ctx, domain.AgentReviewer, systemPrompt, userMsg, nil, "reviewer_recommendation")
+	result := r.runtime.Invoke(ctx, domain.AgentReviewer, systemPrompt, userMsg, r.tools, "reviewer_recommendation")
 	if result.Err != nil {
 		slog.Error("reviewer: LLM failed", "error", result.Err)
 		return

@@ -19,8 +19,8 @@ type PaperOrder struct {
 // Book is an in-memory paper order book.
 // It holds open orders and simulates fills when new candle data arrives.
 type Book struct {
-	mu       sync.Mutex
-	orders   map[string]*PaperOrder   // keyed by Intent.ID
+	mu        sync.Mutex
+	orders    map[string]*PaperOrder // keyed by Intent.ID
 	positions map[domain.Symbol]*domain.Position
 }
 
@@ -80,7 +80,7 @@ func (b *Book) Fill(orderID string, fillPrice decimal.Decimal, fillTime time.Tim
 	intent := order.Intent
 	pos := &domain.Position{
 		Symbol:        intent.Symbol,
-		Venue:         domain.VenueBinanceSpot,
+		Venue:         intent.Venue,
 		Side:          intent.Side,
 		Quantity:      intent.Quantity,
 		EntryPrice:    fillPrice,
@@ -102,7 +102,7 @@ func (b *Book) Fill(orderID string, fillPrice decimal.Decimal, fillTime time.Tim
 		Quantity:      intent.Quantity,
 		FillPrice:     fillPrice,
 		Strategy:      intent.Strategy,
-		Venue:         domain.VenueBinanceSpot,
+		Venue:         intent.Venue,
 		CreatedAt:     fillTime,
 	}
 }

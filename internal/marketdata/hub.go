@@ -33,14 +33,20 @@ type subscriber struct {
 // the TUI read from their own buffered subscriber channels.
 // A slow subscriber never blocks the WS reader — its channel drops the oldest
 // item when full (drop-oldest backpressure).
+//
+// Quotes arrive from multiple WS streams (bookTicker, 24hr ticker). The Hub
+// merges partial updates into a per-symbol accumulated state before fanning
+// out so subscribers always see the full picture.
 type Hub struct {
-	mu          sync.RWMutex
-	subscribers []*subscriber
+	mu            sync.RWMutex
+	subscribers   []*subscriber
+	latestQuotes  map[string]domain.Quote
+	quotesMu      sync.Mutex
 }
 
 // NewHub creates an empty Hub.
 func NewHub() *Hub {
-	return &Hub{}
+	return &Hub{latestQuotes: make(map[string]domain.Quote)}
 }
 
 // Subscribe registers a consumer and returns read-only channels for quotes and candles.
@@ -56,10 +62,18 @@ func (h *Hub) Subscribe() (<-chan QuoteEvent, <-chan CandleEvent) {
 	return s.quotes, s.candles
 }
 
-// PublishQuote fans out a QuoteEvent to all subscribers.
+// PublishQuote merges the incoming quote into the per-symbol accumulated state,
+// then fans out the merged QuoteEvent to all subscribers.
 // Non-blocking: if a subscriber's buffer is full, the oldest item is dropped.
 func (h *Hub) PublishQuote(q domain.Quote) {
-	evt := QuoteEvent{Quote: q}
+	key := string(q.Symbol)
+	h.quotesMu.Lock()
+	existing := h.latestQuotes[key]
+	merged := mergeQuote(existing, q)
+	h.latestQuotes[key] = merged
+	h.quotesMu.Unlock()
+
+	evt := QuoteEvent{Quote: merged}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, s := range h.subscribers {
@@ -77,6 +91,36 @@ func (h *Hub) PublishQuote(q domain.Quote) {
 			}
 		}
 	}
+}
+
+// mergeQuote overlays non-zero fields from incoming onto base.
+func mergeQuote(base, inc domain.Quote) domain.Quote {
+	if !inc.Bid.IsZero() {
+		base.Bid = inc.Bid
+	}
+	if !inc.Ask.IsZero() {
+		base.Ask = inc.Ask
+	}
+	if !inc.Mid.IsZero() {
+		base.Mid = inc.Mid
+	}
+	if !inc.Last.IsZero() {
+		base.Last = inc.Last
+	}
+	if !inc.PriceChange.IsZero() {
+		base.PriceChange = inc.PriceChange
+	}
+	if !inc.PriceChangePercent.IsZero() {
+		base.PriceChangePercent = inc.PriceChangePercent
+	}
+	if !inc.Volume24h.IsZero() {
+		base.Volume24h = inc.Volume24h
+	}
+	if !inc.Timestamp.IsZero() {
+		base.Timestamp = inc.Timestamp
+	}
+	base.Symbol = inc.Symbol
+	return base
 }
 
 // PublishCandle fans out a CandleEvent to all subscribers.
@@ -99,6 +143,15 @@ func (h *Hub) PublishCandle(c domain.Candle) {
 			}
 		}
 	}
+}
+
+// LatestQuote returns the most recent merged quote for a symbol.
+// Returns false if no quote has been received for that symbol.
+func (h *Hub) LatestQuote(symbol domain.Symbol) (domain.Quote, bool) {
+	h.quotesMu.Lock()
+	q, ok := h.latestQuotes[string(symbol)]
+	h.quotesMu.Unlock()
+	return q, ok
 }
 
 // Close closes all subscriber channels, signalling consumers to stop.

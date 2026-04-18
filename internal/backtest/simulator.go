@@ -14,7 +14,8 @@ import (
 )
 
 // Simulator drives the full backtest pipeline:
-//   candles → hub → strategies → paper execution → report
+//
+//	candles → hub → strategies → paper execution → report
 type Simulator struct {
 	candles    []domain.Candle
 	hub        *marketdata.Hub
@@ -72,6 +73,7 @@ func (s *Simulator) Run(ctx context.Context) ([]domain.Trade, error) {
 				ID:            fmt.Sprintf("bt-%d-%s", i, sig.ID),
 				CorrelationID: sig.CorrelationID,
 				Symbol:        sig.Symbol,
+				Venue:         domain.VenueBinanceSpot,
 				Side:          sig.Side,
 				Quantity:      decimal.NewFromFloat(0.001), // Phase 8 wires strategy-specific sizing
 				Strategy:      sig.Strategy,

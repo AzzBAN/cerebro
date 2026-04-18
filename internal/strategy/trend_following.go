@@ -137,6 +137,14 @@ func (t *TrendFollowing) newSignal(c domain.Candle, side domain.Side, reason str
 	}
 }
 
+// Warmup feeds historical candles through OnCandle to prime indicators.
+// Signals produced during warmup are discarded.
+func (t *TrendFollowing) Warmup(_ context.Context, candles []domain.Candle) {
+	for _, c := range candles {
+		t.OnCandle(context.Background(), c)
+	}
+}
+
 func (t *TrendFollowing) isTargetSymbol(s domain.Symbol) bool {
 	for _, sym := range t.symbols {
 		if sym == s {

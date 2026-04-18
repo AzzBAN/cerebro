@@ -13,3 +13,5 @@ func parseDecimal(s string) (decimal.Decimal, error) {
 	}
 	return d, nil
 }
+
+var decimalTwo = decimal.NewFromInt(2)

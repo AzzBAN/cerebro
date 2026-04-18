@@ -18,11 +18,11 @@ var copilotPrompt string
 // Fail-closed: any LLM error returns a safe "unable to process" message.
 type Copilot struct {
 	runtime *Runtime
-	tools   map[string]port.ToolHandler
+	tools   map[string]port.Tool
 }
 
 // NewCopilot creates a Copilot agent.
-func NewCopilot(runtime *Runtime, tools map[string]port.ToolHandler) *Copilot {
+func NewCopilot(runtime *Runtime, tools map[string]port.Tool) *Copilot {
 	return &Copilot{runtime: runtime, tools: tools}
 }
 

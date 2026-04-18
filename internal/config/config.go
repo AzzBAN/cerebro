@@ -3,13 +3,11 @@ package config
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/joho/godotenv"
-	"github.com/shopspring/decimal"
 	"gopkg.in/yaml.v3"
 )
 
@@ -46,38 +44,39 @@ type EngineConfig struct {
 }
 
 type RiskConfig struct {
-	MaxDrawdownPct             float64          `yaml:"max_drawdown_pct"`
-	MaxDailyLossPct            float64          `yaml:"max_daily_loss_pct"`
-	MaxExposurePct             float64          `yaml:"max_exposure_pct"`
-	MaxOpenPositions           int              `yaml:"max_open_positions"`
-	MaxOpenPositionsPerVenue   int              `yaml:"max_open_positions_per_venue"`
-	MaxOpenPositionsPerSymbol  int              `yaml:"max_open_positions_per_symbol"`
-	HaltModeOnDrawdown         domain.HaltMode  `yaml:"halt_mode_on_drawdown"`
-	ResumeRequiresConfirmation bool             `yaml:"resume_requires_confirmation"`
-	MinEquityToTrade           float64          `yaml:"min_equity_to_trade"`
+	MaxDrawdownPct             float64         `yaml:"max_drawdown_pct"`
+	MaxDailyLossPct            float64         `yaml:"max_daily_loss_pct"`
+	MaxExposurePct             float64         `yaml:"max_exposure_pct"`
+	MaxOpenPositions           int             `yaml:"max_open_positions"`
+	MaxOpenPositionsPerVenue   int             `yaml:"max_open_positions_per_venue"`
+	MaxOpenPositionsPerSymbol  int             `yaml:"max_open_positions_per_symbol"`
+	HaltModeOnDrawdown         domain.HaltMode `yaml:"halt_mode_on_drawdown"`
+	ResumeRequiresConfirmation bool            `yaml:"resume_requires_confirmation"`
+	MinEquityToTrade           float64         `yaml:"min_equity_to_trade"`
 }
 
 type AgentConfig struct {
-	ScreeningIntervalMinutes int       `yaml:"screening_interval_minutes"`
-	BiasTTLMinutes           int       `yaml:"bias_ttl_minutes"`
-	MaxTurns                 int       `yaml:"max_turns"`
-	TimeoutPerTurnSeconds    int       `yaml:"timeout_per_turn_seconds"`
-	TimeoutTotalSeconds      int       `yaml:"timeout_total_seconds"`
-	LLM                      LLMConfig `yaml:"llm"`
-	ToolPolicy               ToolPolicyConfig `yaml:"tool_policy"`
+	ScreeningIntervalMinutes  int              `yaml:"screening_interval_minutes"`
+	BiasTTLMinutes            int              `yaml:"bias_ttl_minutes"`
+	ScreeningMaxOpportunities int              `yaml:"screening_max_opportunities"`
+	MaxTurns                  int              `yaml:"max_turns"`
+	TimeoutPerTurnSeconds     int              `yaml:"timeout_per_turn_seconds"`
+	TimeoutTotalSeconds       int              `yaml:"timeout_total_seconds"`
+	LLM                       LLMConfig        `yaml:"llm"`
+	ToolPolicy                ToolPolicyConfig `yaml:"tool_policy"`
 }
 
 type LLMConfig struct {
-	Providers               []string                    `yaml:"providers"`
-	FallbackOn              []string                    `yaml:"fallback_on"`
-	TechnicalOnlyFallback   bool                        `yaml:"technical_only_fallback"`
-	TechnicalOnlySizeMultiplier float64                 `yaml:"technical_only_size_multiplier"`
-	Models                  map[string]LLMModelConfig   `yaml:"models"`
-	DailyTokenBudget        int                         `yaml:"daily_token_budget"`
-	DailyCostBudgetUSD      float64                     `yaml:"daily_cost_budget_usd"`
-	AlertAtBudgetPct        float64                     `yaml:"alert_at_budget_pct"`
-	CircuitBreakerErrorRate float64                     `yaml:"circuit_breaker_error_rate"`
-	CircuitBreakerWindowS   int                         `yaml:"circuit_breaker_window_seconds"`
+	Providers                   []string                  `yaml:"providers"`
+	FallbackOn                  []string                  `yaml:"fallback_on"`
+	TechnicalOnlyFallback       bool                      `yaml:"technical_only_fallback"`
+	TechnicalOnlySizeMultiplier float64                   `yaml:"technical_only_size_multiplier"`
+	Models                      map[string]LLMModelConfig `yaml:"models"`
+	DailyTokenBudget            int                       `yaml:"daily_token_budget"`
+	DailyCostBudgetUSD          float64                   `yaml:"daily_cost_budget_usd"`
+	AlertAtBudgetPct            float64                   `yaml:"alert_at_budget_pct"`
+	CircuitBreakerErrorRate     float64                   `yaml:"circuit_breaker_error_rate"`
+	CircuitBreakerWindowS       int                       `yaml:"circuit_breaker_window_seconds"`
 }
 
 type LLMModelConfig struct {
@@ -89,6 +88,8 @@ type LLMModelConfig struct {
 type ToolPolicyConfig struct {
 	Copilot   ToolPolicy `yaml:"copilot"`
 	Screening ToolPolicy `yaml:"screening"`
+	Risk      ToolPolicy `yaml:"risk"`
+	Reviewer  ToolPolicy `yaml:"reviewer"`
 }
 
 type ToolPolicy struct {
@@ -96,18 +97,18 @@ type ToolPolicy struct {
 }
 
 type ReviewerConfig struct {
-	Enabled          bool   `yaml:"enabled"`
-	ScheduleCron     string `yaml:"schedule_cron"`
-	MinTradesRequired int   `yaml:"min_trades_required"`
-	LookbackDays     int    `yaml:"lookback_days"`
+	Enabled           bool   `yaml:"enabled"`
+	ScheduleCron      string `yaml:"schedule_cron"`
+	MinTradesRequired int    `yaml:"min_trades_required"`
+	LookbackDays      int    `yaml:"lookback_days"`
 }
 
 type WSConfig struct {
-	ReconnectBaseDelayMS  int `yaml:"reconnect_base_delay_ms"`
-	ReconnectMaxDelayMS   int `yaml:"reconnect_max_delay_ms"`
-	PingIntervalSeconds   int `yaml:"ping_interval_seconds"`
-	PongTimeoutSeconds    int `yaml:"pong_timeout_seconds"`
-	AlertAfterFailures    int `yaml:"alert_after_failures"`
+	ReconnectBaseDelayMS int `yaml:"reconnect_base_delay_ms"`
+	ReconnectMaxDelayMS  int `yaml:"reconnect_max_delay_ms"`
+	PingIntervalSeconds  int `yaml:"ping_interval_seconds"`
+	PongTimeoutSeconds   int `yaml:"pong_timeout_seconds"`
+	AlertAfterFailures   int `yaml:"alert_after_failures"`
 }
 
 type ChatOpsConfig struct {
@@ -120,10 +121,11 @@ type TUIConfig struct {
 }
 
 type IngestConfig struct {
-	CoinGlass  IngestSourceConfig `yaml:"coinglass"`
-	CryptoPanic IngestSourceConfig `yaml:"cryptopanic"`
-	Myfxbook   IngestSourceConfig `yaml:"myfxbook"`
-	FinancialJuice IngestSourceConfig `yaml:"financialjuice"`
+	CoinGlass        IngestSourceConfig `yaml:"coinglass"`
+	CoinGlassScraper IngestSourceConfig `yaml:"coinglass_scraper"`
+	CryptoPanic      IngestSourceConfig `yaml:"cryptopanic"`
+	Finnhub          IngestSourceConfig `yaml:"finnhub"`
+	FinancialJuice   IngestSourceConfig `yaml:"financialjuice"`
 }
 
 type IngestSourceConfig struct {
@@ -136,132 +138,6 @@ type BacktestConfig struct {
 	FillModel     string  `yaml:"fill_model"`
 	CommissionPct float64 `yaml:"commission_pct"`
 	SlippagePct   float64 `yaml:"slippage_pct"`
-}
-
-// VenueConfig holds all symbol configs for a single broker venue.
-type VenueConfig struct {
-	Venue   domain.Venue   `yaml:"venue"`
-	Symbols []SymbolConfig `yaml:"symbols"`
-}
-
-// SymbolConfig is the full per-symbol market configuration.
-type SymbolConfig struct {
-	Symbol             string             `yaml:"symbol"`
-	ContractType       domain.ContractType `yaml:"contract_type"`
-	Leverage           int                `yaml:"leverage"`
-	MarginType         domain.MarginType  `yaml:"margin_type"`
-	TickSize           decimal.Decimal    `yaml:"tick_size"`
-	LotSize            decimal.Decimal    `yaml:"lot_size"`
-	MinLotUnits        decimal.Decimal    `yaml:"min_lot_units"`
-	MaxLotUnits        decimal.Decimal    `yaml:"max_lot_units"`
-	MinNotional        decimal.Decimal    `yaml:"min_notional"`
-	MaxOrderNotional   decimal.Decimal    `yaml:"max_order_notional"`
-	MaxPositionSizePct float64            `yaml:"max_position_size_pct"`
-	MaxSpreadPct       float64            `yaml:"max_spread_pct"`
-	Timeframes         []domain.Timeframe `yaml:"timeframes"`
-	PrimaryTimeframe   domain.Timeframe   `yaml:"primary_timeframe"`
-	TrendTimeframe     domain.Timeframe   `yaml:"trend_timeframe"`
-	Enabled            bool               `yaml:"enabled"`
-}
-
-// StrategiesConfig wraps all named strategy presets.
-type StrategiesConfig struct {
-	Strategies []StrategyConfig `yaml:"strategies"`
-}
-
-// StrategyConfig holds all parameters for a single strategy preset.
-type StrategyConfig struct {
-	Name                    domain.StrategyName   `yaml:"name"`
-	Enabled                 bool                  `yaml:"enabled"`
-	Markets                 []string              `yaml:"markets"`
-	PrimaryTimeframe        domain.Timeframe      `yaml:"primary_timeframe"`
-	TrendTimeframe          domain.Timeframe      `yaml:"trend_timeframe"`
-	WarmupCandles           int                   `yaml:"warmup_candles"`
-	OrderType               domain.OrderType      `yaml:"order_type"`
-	LimitOffsetPips         float64               `yaml:"limit_offset_pips"`
-	TimeInForce             domain.TimeInForce    `yaml:"time_in_force"`
-	OrderCancelAfterSeconds int                   `yaml:"order_cancel_after_seconds"`
-	ConfirmationCandles     int                   `yaml:"confirmation_candles"`
-	SignalDedupWindowSeconds int                  `yaml:"signal_dedup_window_seconds"`
-	RiskPctPerTrade         float64               `yaml:"risk_pct_per_trade"`
-	MaxPositionSizePct      float64               `yaml:"max_position_size_pct"`
-	StopLoss                StopLossConfig        `yaml:"stop_loss"`
-	TakeProfitLevels        []TPLevel             `yaml:"take_profit_levels"`
-	TrailTriggerPct         float64               `yaml:"trail_trigger_pct"`
-	TrailStepPct            float64               `yaml:"trail_step_pct"`
-	Indicators              IndicatorConfig       `yaml:"indicators"`
-	SessionFilter           domain.SessionFilter  `yaml:"session_filter"`
-	NewsBlackoutBeforeMin   int                   `yaml:"news_blackout_before_minutes"`
-	NewsBlackoutAfterMin    int                   `yaml:"news_blackout_after_minutes"`
-	MaxSpreadPct            float64               `yaml:"max_spread_pct"`
-	RequireBiasAlignment    bool                  `yaml:"require_bias_alignment"`
-	RequireTrendAlignment   bool                  `yaml:"require_trend_alignment"`
-	// Derivatives filters
-	FundingRateLongMaxPct     float64 `yaml:"funding_rate_long_max_pct"`
-	FundingRateShortMinPct    float64 `yaml:"funding_rate_short_min_pct"`
-	OIDivergenceFilter        bool    `yaml:"oi_divergence_filter"`
-	LongShortRatioMaxLong     float64 `yaml:"long_short_ratio_max_long"`
-	LongShortRatioMinShort    float64 `yaml:"long_short_ratio_min_short"`
-	RequirePositiveTakerDelta bool    `yaml:"require_positive_taker_delta"`
-	AvoidLiquidationZonePct   float64 `yaml:"avoid_liquidation_zone_pct"`
-	FearGreedLongMin          int     `yaml:"fear_greed_long_min"`
-	FearGreedShortMax         int     `yaml:"fear_greed_short_max"`
-}
-
-type StopLossConfig struct {
-	Type           domain.StopLossType `yaml:"type"`
-	ATRMultiplier  float64             `yaml:"atr_multiplier"`
-	FixedPips      float64             `yaml:"fixed_pips"`
-	FixedPct       float64             `yaml:"fixed_pct"`
-	MinDistancePips float64            `yaml:"min_distance_pips"`
-}
-
-type TPLevel struct {
-	RRRatio           float64 `yaml:"rr_ratio"`
-	ScaleOutPct       float64 `yaml:"scale_out_pct"`
-	MoveSLToBreakeven bool    `yaml:"move_sl_to_breakeven"`
-}
-
-type IndicatorConfig struct {
-	RSI       RSIConfig       `yaml:"rsi"`
-	EMA       EMAConfig       `yaml:"ema"`
-	Bollinger BollingerConfig `yaml:"bollinger"`
-	ATR       ATRConfig       `yaml:"atr"`
-	MACD      MACDConfig      `yaml:"macd"`
-	Volume    VolumeConfig    `yaml:"volume"`
-}
-
-type RSIConfig struct {
-	Period    int `yaml:"period"`
-	Oversold  int `yaml:"oversold"`
-	Overbought int `yaml:"overbought"`
-}
-
-type EMAConfig struct {
-	Fast      int `yaml:"fast"`
-	Slow      int `yaml:"slow"`
-	Trend     int `yaml:"trend"`
-	LongTrend int `yaml:"long_trend"`
-}
-
-type BollingerConfig struct {
-	Period int     `yaml:"period"`
-	StdDev float64 `yaml:"std_dev"`
-}
-
-type ATRConfig struct {
-	Period int `yaml:"period"`
-}
-
-type MACDConfig struct {
-	Fast   int `yaml:"fast"`
-	Slow   int `yaml:"slow"`
-	Signal int `yaml:"signal"`
-}
-
-type VolumeConfig struct {
-	MinVolumeMultiplier float64 `yaml:"min_volume_multiplier"`
-	VolumeAvgPeriod     int     `yaml:"volume_avg_period"`
 }
 
 // SecretsConfig holds all credentials loaded from environment variables.
@@ -288,30 +164,32 @@ type SecretsConfig struct {
 	BinanceDemoFuturesAPIKey    string
 	BinanceDemoFuturesAPISecret string
 
-	CoinGlassAPIKey    string
-	CryptoPanicAPIKey  string
+	CoinGlassAPIKey   string
+	CryptoPanicAPIKey string
+	FinnhubAPIKey     string
 
 	DatabaseURL string
 	RedisURL    string
 
-	GeminiAPIKey    string
-	AnthropicAPIKey string
-	OpenAIAPIKey    string
-	OpenAIBaseURL   string
+	GeminiAPIKey     string
+	AnthropicAPIKey  string
+	AnthropicBaseURL string
+	OpenAIAPIKey     string
+	OpenAIBaseURL    string
 
-	TelegramBotToken          string
-	TelegramAllowlistUserIDs  []string
-	DiscordBotToken           string
-	DiscordGuildID            string
-	DiscordTradeChannelID     string
-	DiscordAIReasoningChannelID string
+	TelegramBotToken             string
+	TelegramAllowlistUserIDs     []string
+	DiscordBotToken              string
+	DiscordGuildID               string
+	DiscordTradeChannelID        string
+	DiscordAIReasoningChannelID  string
 	DiscordSystemAlertsChannelID string
 }
 
 // Load reads and merges all four config sources.
 func Load(secretsPath, appPath, marketsPath, strategiesPath string) (*Config, error) {
-	// 1. Load secrets.env into environment
-	if err := godotenv.Load(secretsPath); err != nil && !os.IsNotExist(err) {
+	// 1. Load secrets.env into environment (Overload so .env values always win).
+	if err := godotenv.Overload(secretsPath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load secrets: %w", err)
 	}
 
@@ -337,6 +215,10 @@ func Load(secretsPath, appPath, marketsPath, strategiesPath string) (*Config, er
 	}
 	cfg.Strategies = strategies
 
+	if err := normalizeSymbols(cfg); err != nil {
+		return nil, fmt.Errorf("normalize symbols: %w", err)
+	}
+
 	// 5. Populate secrets from env
 	cfg.Secrets = loadSecrets()
 
@@ -350,105 +232,6 @@ func loadYAML(path string, v any) error {
 	}
 	defer f.Close()
 	return yaml.NewDecoder(f).Decode(v)
-}
-
-// loadStrategies supports both supported schema variants:
-// 1) list-style: { strategies: [ ... ] }
-// 2) preset-map style: { defaults: { ... }, mean_reversion: { ... }, ... }
-func loadStrategies(path string) (StrategiesConfig, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return StrategiesConfig{}, err
-	}
-
-	// First, try canonical list-style schema.
-	var direct StrategiesConfig
-	if err := yaml.Unmarshal(raw, &direct); err != nil {
-		return StrategiesConfig{}, err
-	}
-	if len(direct.Strategies) > 0 {
-		return direct, nil
-	}
-
-	// Fallback: preset-map schema with optional "defaults" inheritance.
-	var top map[string]any
-	if err := yaml.Unmarshal(raw, &top); err != nil {
-		return StrategiesConfig{}, err
-	}
-
-	defaults := map[string]any{}
-	if d, ok := asMap(top["defaults"]); ok {
-		defaults = d
-	}
-
-	out := make([]StrategyConfig, 0, len(top))
-	names := make([]string, 0, len(top))
-	for key := range top {
-		if key == "defaults" {
-			continue
-		}
-		names = append(names, key)
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		section, ok := asMap(top[name])
-		if !ok {
-			continue
-		}
-
-		merged := deepCopyMap(defaults)
-		deepMergeMap(merged, section)
-
-		encoded, err := yaml.Marshal(merged)
-		if err != nil {
-			return StrategiesConfig{}, err
-		}
-
-		var sc StrategyConfig
-		if err := yaml.Unmarshal(encoded, &sc); err != nil {
-			return StrategiesConfig{}, err
-		}
-		sc.Name = domain.StrategyName(name)
-		out = append(out, sc)
-	}
-
-	return StrategiesConfig{Strategies: out}, nil
-}
-
-func asMap(v any) (map[string]any, bool) {
-	m, ok := v.(map[string]any)
-	return m, ok
-}
-
-func deepCopyMap(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		if m, ok := asMap(v); ok {
-			dst[k] = deepCopyMap(m)
-			continue
-		}
-		dst[k] = v
-	}
-	return dst
-}
-
-func deepMergeMap(dst, src map[string]any) {
-	for k, v := range src {
-		srcMap, srcIsMap := asMap(v)
-		if !srcIsMap {
-			dst[k] = v
-			continue
-		}
-
-		dstMap, dstIsMap := asMap(dst[k])
-		if !dstIsMap {
-			dst[k] = deepCopyMap(srcMap)
-			continue
-		}
-		deepMergeMap(dstMap, srcMap)
-		dst[k] = dstMap
-	}
 }
 
 func loadSecrets() SecretsConfig {
@@ -468,10 +251,12 @@ func loadSecrets() SecretsConfig {
 		BinanceDemoFuturesAPISecret:    os.Getenv("BINANCE_DEMO_FUTURES_API_SECRET"),
 		CoinGlassAPIKey:                os.Getenv("COINGLASS_API_KEY"),
 		CryptoPanicAPIKey:              os.Getenv("CRYPTOPANIC_API_KEY"),
+		FinnhubAPIKey:                  os.Getenv("FINNHUB_API_KEY"),
 		DatabaseURL:                    os.Getenv("DATABASE_URL"),
 		RedisURL:                       os.Getenv("REDIS_URL"),
 		GeminiAPIKey:                   os.Getenv("GEMINI_API_KEY"),
 		AnthropicAPIKey:                os.Getenv("ANTHROPIC_API_KEY"),
+		AnthropicBaseURL:               os.Getenv("ANTHROPIC_BASE_URL"),
 		OpenAIAPIKey:                   os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:                  os.Getenv("OPENAI_BASE_URL"),
 		TelegramBotToken:               os.Getenv("TELEGRAM_BOT_TOKEN"),
@@ -494,7 +279,6 @@ func loadSecrets() SecretsConfig {
 }
 
 // Validate enforces all cross-config rules from TECHNICAL_DESIGN.md §11.5.
-// Any failure returns a wrapped ErrConfigInvalid.
 func (c *Config) Validate(cliEnv domain.Environment) error {
 	errs := &validationErrors{}
 
@@ -546,18 +330,15 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 			continue
 		}
 
-		// risk_pct_per_trade must not exceed max_position_size_pct
 		if s.MaxPositionSizePct > 0 && s.RiskPctPerTrade > s.MaxPositionSizePct {
 			errs.add("strategy %q: risk_pct_per_trade (%.2f) > max_position_size_pct (%.2f)",
 				s.Name, s.RiskPctPerTrade, s.MaxPositionSizePct)
 		}
 
-		// trail_trigger_pct > 0 requires trail_step_pct > 0
 		if s.TrailTriggerPct > 0 && s.TrailStepPct == 0 {
 			errs.add("strategy %q: trail_trigger_pct > 0 but trail_step_pct is 0", s.Name)
 		}
 
-		// take_profit scale_out_pct must sum to 100
 		if len(s.TakeProfitLevels) > 0 {
 			var sum float64
 			for _, tp := range s.TakeProfitLevels {
@@ -568,7 +349,6 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 			}
 		}
 
-		// primary_timeframe must be in symbol's timeframes list
 		for _, sym := range s.Markets {
 			tfs, ok := symbolTimeframes[sym]
 			if !ok {
@@ -577,7 +357,6 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 			if !containsTimeframe(tfs, s.PrimaryTimeframe) {
 				errs.add("strategy %q: primary_timeframe %q not in symbol %q timeframes", s.Name, s.PrimaryTimeframe, sym)
 			}
-			// trend_timeframe must be higher than primary_timeframe
 			if s.TrendTimeframe != "" && !isHigherTimeframe(s.TrendTimeframe, s.PrimaryTimeframe) {
 				errs.add("strategy %q: trend_timeframe %q is not higher than primary_timeframe %q", s.Name, s.TrendTimeframe, s.PrimaryTimeframe)
 			}

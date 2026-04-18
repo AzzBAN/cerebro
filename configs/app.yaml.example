@@ -87,6 +87,9 @@ agent:
   # If the key expires before the next run, Risk Gate defaults to Neutral.
   bias_ttl_minutes: 180
 
+  # Max number of entry opportunities returned per cross-symbol screening cycle.
+  screening_max_opportunities: 3
+
   # --- LLM tool-loop limits ---
   # Maximum number of tool-call / response turns per agent invocation.
   # Prevents runaway loops. Recommended: 4–8.
@@ -241,11 +244,18 @@ tui:
 # INGEST — SCRAPERS & NEWS FEEDS
 # =============================================================================
 ingest:
-  # FinancialJuice headless scraper
+  # CoinGlass web scraper (free — no API key required, uses headless Chromium)
+  # Used as fallback when coinglass API key is not set.
+  coinglass_scraper:
+    enabled: true
+    interval_minutes: 5           # how often to refresh derivatives cache
+    timeout_seconds: 30           # per-page headless browser timeout
+
+  # FinancialJuice news scraper (pure HTTP — no browser required)
   financialjuice:
     enabled: true
     interval_minutes: 5
-    timeout_seconds: 30
+    timeout_seconds: 60
 
   # Myfxbook economic calendar RSS
   myfxbook_calendar:

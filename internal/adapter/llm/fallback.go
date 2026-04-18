@@ -44,7 +44,7 @@ func (f *FallbackChain) Complete(
 	ctx context.Context,
 	systemPrompt string,
 	userMessage string,
-	tools map[string]port.ToolHandler,
+	tools map[string]port.Tool,
 ) (string, error) {
 	for i, provider := range f.providers {
 		result, err := provider.Complete(ctx, systemPrompt, userMessage, tools)

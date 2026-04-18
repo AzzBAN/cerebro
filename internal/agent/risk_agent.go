@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	_ "embed"
 
+	"github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 )
@@ -19,12 +21,18 @@ var riskPrompt string
 // On any failure, the caller's risk gate fails closed (signal rejected).
 type RiskAgent struct {
 	runtime *Runtime
-	tools   map[string]port.ToolHandler
+	tools   map[string]port.Tool
+	trades  port.TradeStore
 }
 
 // NewRiskAgent creates a RiskAgent.
-func NewRiskAgent(runtime *Runtime, tools map[string]port.ToolHandler) *RiskAgent {
-	return &RiskAgent{runtime: runtime, tools: tools}
+func NewRiskAgent(runtime *Runtime, agentTools map[string]port.Tool) *RiskAgent {
+	return &RiskAgent{runtime: runtime, tools: agentTools}
+}
+
+// NewRiskAgentWithPerf creates a RiskAgent with trade performance data access.
+func NewRiskAgentWithPerf(runtime *Runtime, agentTools map[string]port.Tool, trades port.TradeStore) *RiskAgent {
+	return &RiskAgent{runtime: runtime, tools: agentTools, trades: trades}
 }
 
 // Evaluate asks the LLM to approve or reject the signal.
@@ -36,6 +44,11 @@ func (r *RiskAgent) Evaluate(ctx context.Context, sig domain.Signal, positions [
 			"Current open positions: %d. Evaluate and call approve_and_route_order or reject_signal.",
 		sig.Symbol, sig.Side, sig.Strategy, sig.Reason, len(positions),
 	)
+
+	// Inject recent strategy performance when available.
+	if r.trades != nil {
+		userMsg = r.injectPerformanceContext(ctx, 7, userMsg)
+	}
 
 	result := r.runtime.Invoke(ctx, domain.AgentRisk, riskPrompt, userMsg, r.tools, "risk_evaluation")
 	if result.Err != nil {
@@ -58,4 +71,18 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func (r *RiskAgent) injectPerformanceContext(ctx context.Context, lookbackDays int, userMsg string) string {
+	from := time.Now().UTC().AddDate(0, 0, -lookbackDays)
+	to := time.Now().UTC()
+
+	recentTrades, err := r.trades.TradesByWindow(ctx, from, to)
+	if err != nil || len(recentTrades) == 0 {
+		return userMsg
+	}
+
+	perf := tools.AggregatePerformance(recentTrades)
+	context := tools.FormatPerformanceContext(perf)
+	return context + "\n\n" + userMsg
 }

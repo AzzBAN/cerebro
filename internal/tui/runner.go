@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/charmbracelet/bubbletea"
 )
@@ -17,9 +18,10 @@ import (
 // Runner also implements observability.LogSink — pass it to observability.Setup
 // so that every slog line is forwarded to the TUI system-log panel.
 type Runner struct {
-	hub   *marketdata.Hub
-	prog  *tea.Program
+	hub  *marketdata.Hub
+	prog *tea.Program
 	msgCh chan tea.Msg
+	model *Model
 }
 
 // NewRunner creates a TUI Runner and initialises the Bubble Tea program.
@@ -30,11 +32,12 @@ func NewRunner(hub *marketdata.Hub, maxLogLines int) *Runner {
 	// Bubble Tea owns stdout for alt-screen rendering.
 	// slog must be directed to stderr (done by observability.Setup) to avoid
 	// interleaving with the TUI output.
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(&m, tea.WithAltScreen())
 	r := &Runner{
 		hub:   hub,
 		prog:  p,
 		msgCh: make(chan tea.Msg, 512),
+		model: &m,
 	}
 
 	// Decouple producers from Bubble Tea internals so startup logs and bursty
@@ -105,6 +108,21 @@ func (r *Runner) SendSysLog(level, line string) {
 // SendHeartbeat pushes a formatted heartbeat summary to the TUI status bar.
 func (r *Runner) SendHeartbeat(line string) {
 	r.Push(HeartbeatMsg{Line: line, At: time.Now()})
+}
+
+// SendPositions pushes an open-position snapshot to the TUI positions panel.
+func (r *Runner) SendPositions(positions []domain.Position) {
+	r.Push(PositionsMsg{Positions: positions})
+}
+
+// SendAgentState pushes a live agent step transition to the TUI agent panel.
+func (r *Runner) SendAgentState(msg AgentStateMsg) {
+	r.Push(msg)
+}
+
+// SetCopilotFn injects the copilot ask function into the TUI model.
+func (r *Runner) SetCopilotFn(fn func(ctx context.Context, query string) (string, error)) {
+	r.model.SetCopilotFn(fn)
 }
 
 // formatAgentLine formats an agent log entry with a visual prefix.

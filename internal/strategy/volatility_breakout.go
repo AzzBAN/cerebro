@@ -150,6 +150,14 @@ func (v *VolatilityBreakout) newSignal(c domain.Candle, side domain.Side, reason
 	}
 }
 
+// Warmup feeds historical candles through OnCandle to prime indicators.
+// Signals produced during warmup are discarded.
+func (v *VolatilityBreakout) Warmup(_ context.Context, candles []domain.Candle) {
+	for _, c := range candles {
+		v.OnCandle(context.Background(), c)
+	}
+}
+
 func (v *VolatilityBreakout) isTargetSymbol(s domain.Symbol) bool {
 	for _, sym := range v.symbols {
 		if sym == s {

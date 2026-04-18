@@ -36,13 +36,13 @@ func (g *GeminiAdapter) Provider() string { return "gemini" }
 func (g *GeminiAdapter) ModelID() string  { return g.modelID }
 
 type geminiContent struct {
-	Role  string      `json:"role"`
+	Role  string       `json:"role"`
 	Parts []geminiPart `json:"parts"`
 }
 
 type geminiPart struct {
-	Text         string              `json:"text,omitempty"`
-	FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+	Text             string              `json:"text,omitempty"`
+	FunctionCall     *geminiFunctionCall `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResp `json:"functionResponse,omitempty"`
 }
 
@@ -75,8 +75,8 @@ type geminiFuncDecl struct {
 
 type geminiResponse struct {
 	Candidates []struct {
-		Content       geminiContent `json:"content"`
-		FinishReason  string        `json:"finishReason"`
+		Content      geminiContent `json:"content"`
+		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
 }
 
@@ -85,24 +85,13 @@ func (g *GeminiAdapter) Complete(
 	ctx context.Context,
 	systemPrompt string,
 	userMessage string,
-	tools map[string]port.ToolHandler,
+	tools map[string]port.Tool,
 ) (string, error) {
 	contents := []geminiContent{
 		{Role: "user", Parts: []geminiPart{{Text: userMessage}}},
 	}
 
-	var geminiTools []geminiTool
-	if len(tools) > 0 {
-		decls := make([]geminiFuncDecl, 0, len(tools))
-		for name := range tools {
-			decls = append(decls, geminiFuncDecl{
-				Name:        name,
-				Description: name,
-				Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
-			})
-		}
-		geminiTools = []geminiTool{{FunctionDeclarations: decls}}
-	}
+	geminiTools := buildGeminiTools(tools)
 
 	baseURL := fmt.Sprintf(
 		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
@@ -133,15 +122,19 @@ func (g *GeminiAdapter) Complete(
 		if err != nil {
 			return "", fmt.Errorf("%w: gemini: http: %v", ErrLLMCall, err)
 		}
-		defer resp.Body.Close()
+
+		rawBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("%w: gemini: read body: %v", ErrLLMCall, readErr)
+		}
 
 		if resp.StatusCode != http.StatusOK {
-			raw, _ := io.ReadAll(resp.Body)
-			return "", fmt.Errorf("%w: gemini: status %d: %s", ErrLLMCall, resp.StatusCode, string(raw))
+			return "", fmt.Errorf("%w: gemini: status %d: %s", ErrLLMCall, resp.StatusCode, string(rawBody))
 		}
 
 		var apiResp geminiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		if err := json.Unmarshal(rawBody, &apiResp); err != nil {
 			return "", fmt.Errorf("%w: gemini: decode: %v", ErrLLMCall, err)
 		}
 
@@ -170,12 +163,12 @@ func (g *GeminiAdapter) Complete(
 		// Dispatch function calls.
 		var responseParts []geminiPart
 		for _, fc := range functionCalls {
-			handler, ok := tools[fc.FunctionCall.Name]
+			tool, ok := tools[fc.FunctionCall.Name]
 			var respJSON json.RawMessage
 			if !ok {
 				respJSON = json.RawMessage(fmt.Sprintf(`{"error":"unknown tool %q"}`, fc.FunctionCall.Name))
 			} else {
-				res, err := handler(ctx, fc.FunctionCall.Args)
+				res, err := tool.Handler(ctx, fc.FunctionCall.Args)
 				if err != nil {
 					respJSON = json.RawMessage(fmt.Sprintf(`{"error":%q}`, err.Error()))
 				} else {
@@ -191,4 +184,23 @@ func (g *GeminiAdapter) Complete(
 		}
 		contents = append(contents, geminiContent{Role: "function", Parts: responseParts})
 	}
+}
+
+func buildGeminiTools(tools map[string]port.Tool) []geminiTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	decls := make([]geminiFuncDecl, 0, len(tools))
+	for _, t := range tools {
+		schema := t.Definition.InputSchema
+		if schema == nil {
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		decls = append(decls, geminiFuncDecl{
+			Name:        t.Definition.Name,
+			Description: t.Definition.Description,
+			Parameters:  schema,
+		})
+	}
+	return []geminiTool{{FunctionDeclarations: decls}}
 }

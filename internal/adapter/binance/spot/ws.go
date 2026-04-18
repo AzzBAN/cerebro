@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"strings"
 	"time"
 
 	gobinance "github.com/adshao/go-binance/v2"
@@ -103,7 +102,7 @@ func (k *KlinesWS) Run(ctx context.Context) error {
 func (k *KlinesWS) connect(ctx context.Context) error {
 	syms := make([]string, len(k.symbols))
 	for i, s := range k.symbols {
-		syms[i] = normalizeSpotSymbol(string(s))
+		syms[i] = domain.ToExchangeSymbol(s)
 	}
 
 	slog.Info("spot klines WS connecting",
@@ -148,14 +147,6 @@ func (k *KlinesWS) connect(ctx context.Context) error {
 	}
 }
 
-func normalizeSpotSymbol(symbol string) string {
-	s := strings.ToLower(strings.TrimSpace(symbol))
-	s = strings.ReplaceAll(s, "/", "")
-	s = strings.TrimSuffix(s, "-perp")
-	s = strings.TrimSuffix(s, " perp")
-	return s
-}
-
 // spotWSEndpoint mirrors the logic inside go-binance's getCombinedEndpoint()
 // so we can log the exact URL that will be dialled before connecting.
 func spotWSEndpoint() string {
@@ -178,6 +169,10 @@ func buildSymbolIntervalMap(symbols []string, interval string) map[string]string
 }
 
 func klineEventToCandle(e *gobinance.WsKlineEvent, tf domain.Timeframe) (domain.Candle, error) {
+	sym, err := domain.NormalizeExchangeSymbol(e.Symbol, domain.ContractSpot)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("symbol: %w", err)
+	}
 	open, err := parseDecimal(e.Kline.Open)
 	if err != nil {
 		return domain.Candle{}, fmt.Errorf("open: %w", err)
@@ -200,7 +195,7 @@ func klineEventToCandle(e *gobinance.WsKlineEvent, tf domain.Timeframe) (domain.
 	}
 
 	return domain.Candle{
-		Symbol:    domain.Symbol(e.Symbol),
+		Symbol:    sym,
 		Timeframe: tf,
 		OpenTime:  msToTime(e.Kline.StartTime),
 		CloseTime: msToTime(e.Kline.EndTime),
@@ -214,16 +209,21 @@ func klineEventToCandle(e *gobinance.WsKlineEvent, tf domain.Timeframe) (domain.
 }
 
 func klineEventToQuote(e *gobinance.WsKlineEvent) (domain.Quote, error) {
+	sym, err := domain.NormalizeExchangeSymbol(e.Symbol, domain.ContractSpot)
+	if err != nil {
+		return domain.Quote{}, fmt.Errorf("quote symbol: %w", err)
+	}
 	mid, err := parseDecimal(e.Kline.Close)
 	if err != nil {
 		return domain.Quote{}, fmt.Errorf("quote close: %w", err)
 	}
 	ts := msToTime(e.Kline.EndTime)
 	return domain.Quote{
-		Symbol:    domain.Symbol(strings.ToUpper(e.Symbol)),
+		Symbol:    sym,
 		Bid:       mid,
 		Ask:       mid,
 		Mid:       mid,
+		Last:      mid,
 		Timestamp: ts,
 	}, nil
 }

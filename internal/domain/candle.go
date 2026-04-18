@@ -20,13 +20,19 @@ type Candle struct {
 	Closed    bool // true once the candle's period has elapsed
 }
 
-// Quote is the latest bid/ask snapshot for a symbol.
+// Quote is the latest market snapshot for a symbol.
+// Fields are populated by multiple WS streams (bookTicker, 24hr ticker) and
+// merged by the Hub before reaching the TUI.
 type Quote struct {
-	Symbol    Symbol
-	Bid       decimal.Decimal
-	Ask       decimal.Decimal
-	Mid       decimal.Decimal
-	Timestamp time.Time
+	Symbol             Symbol
+	Bid                decimal.Decimal
+	Ask                decimal.Decimal
+	Mid                decimal.Decimal
+	Last               decimal.Decimal // last traded price
+	PriceChange        decimal.Decimal // absolute 24h change
+	PriceChangePercent decimal.Decimal // 24h change %
+	Volume24h          decimal.Decimal // 24h quote volume
+	Timestamp          time.Time
 }
 
 // Spread returns (Ask - Bid) / Mid as a percentage.

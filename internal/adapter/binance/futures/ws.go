@@ -98,7 +98,7 @@ func (k *KlinesWS) Run(ctx context.Context) error {
 func (k *KlinesWS) connect(ctx context.Context) error {
 	syms := make([]string, len(k.symbols))
 	for i, s := range k.symbols {
-		syms[i] = string(s)
+		syms[i] = domain.ToExchangeSymbol(s)
 	}
 
 	slog.Info("futures klines WS connecting",
@@ -115,6 +115,9 @@ func (k *KlinesWS) connect(ctx context.Context) error {
 	doneC, stopC, err := gobinancefutures.WsCombinedKlineServe(
 		buildSymbolIntervalMap(symbolIntervalPair),
 		func(event *gobinancefutures.WsKlineEvent) {
+			if q, qErr := klineEventToQuote(event); qErr == nil {
+				k.hub.PublishQuote(q)
+			}
 			if !event.Kline.IsFinal {
 				return
 			}
@@ -165,6 +168,10 @@ func buildSymbolIntervalMap(pairs [][2]string) map[string]string {
 }
 
 func klineEventToCandle(e *gobinancefutures.WsKlineEvent, tf domain.Timeframe) (domain.Candle, error) {
+	sym, err := domain.NormalizeExchangeSymbol(e.Symbol, domain.ContractFuturesPerp)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("symbol: %w", err)
+	}
 	parse := func(s string) (decimal.Decimal, error) {
 		d, err := decimal.NewFromString(s)
 		if err != nil {
@@ -194,7 +201,7 @@ func klineEventToCandle(e *gobinancefutures.WsKlineEvent, tf domain.Timeframe) (
 	}
 
 	return domain.Candle{
-		Symbol:    domain.Symbol(e.Symbol),
+		Symbol:    sym,
 		Timeframe: tf,
 		OpenTime:  time.Unix(e.Kline.StartTime/1000, 0).UTC(),
 		CloseTime: time.Unix(e.Kline.EndTime/1000, 0).UTC(),
@@ -204,5 +211,25 @@ func klineEventToCandle(e *gobinancefutures.WsKlineEvent, tf domain.Timeframe) (
 		Close:     close_,
 		Volume:    vol,
 		Closed:    e.Kline.IsFinal,
+	}, nil
+}
+
+func klineEventToQuote(e *gobinancefutures.WsKlineEvent) (domain.Quote, error) {
+	sym, err := domain.NormalizeExchangeSymbol(e.Symbol, domain.ContractFuturesPerp)
+	if err != nil {
+		return domain.Quote{}, fmt.Errorf("quote symbol: %w", err)
+	}
+	mid, err := decimal.NewFromString(e.Kline.Close)
+	if err != nil {
+		return domain.Quote{}, fmt.Errorf("quote close: %w", err)
+	}
+	ts := time.Unix(e.Kline.EndTime/1000, 0).UTC()
+	return domain.Quote{
+		Symbol:    sym,
+		Bid:       mid,
+		Ask:       mid,
+		Mid:       mid,
+		Last:      mid,
+		Timestamp: ts,
 	}, nil
 }

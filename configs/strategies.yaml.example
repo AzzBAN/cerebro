@@ -176,12 +176,11 @@ defaults:
 # Target: 5–15 pip targets; high-frequency; tight SL; requires fast execution.
 # Target: 0.2–0.5% moves; high-frequency; tight SL; requires fast execution.
 # Best markets: BTC/USDT, ETH/USDT, SOL/USDT during NY open / Asian overlap.
-# Gold (XAU/USDT) excluded — spread is too wide relative to scalp targets.
+# Gold (XAU/USDT-PERP) excluded — spread is too wide relative to scalp targets.
 scalping:
   enabled: true
 
   markets:
-    - EUR/USD
     - BTC/USDT
     - ETH/USDT
     - SOL/USDT
@@ -266,7 +265,7 @@ session_filter: overlap         # NY+Asian overlap; peak crypto + gold liquidity
 # =============================================================================
 # PRESET 2 — SWING TRADING
 # Target: 50–200 pip / 2–5% moves; hold hours to days; fewer, larger positions.
-# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT (4H).
+# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT-PERP (4H).
 # Timeframe: 4H signal, 1D trend.
 # =============================================================================
 swing:
@@ -274,9 +273,8 @@ swing:
 
   markets:
     - BTC/USDT
-    - BTC/USDT
     - ETH/USDT
-    - XAU/USDT
+    - XAU/USDT-PERP
   primary_timeframe: 4h
   trend_timeframe: 1d
 
@@ -351,15 +349,14 @@ swing:
 # =============================================================================
 # PRESET 3 — MEAN REVERSION
 # Logic: RSI extreme + Bollinger Band breach → fade the move.
-# Best markets: XAU/USDT (range-bound hours), BTC/USDT, ETH/USDT (range-bound).
+# Best markets: XAU/USDT-PERP (range-bound hours), BTC/USDT, ETH/USDT (range-bound).
 # Timeframe: 15m signal, 1H trend filter.
 # =============================================================================
 mean_reversion:
   enabled: true
 
   markets:
-    - EUR/USD
-    - XAU/USDT
+    - XAU/USDT-PERP
     - BTC/USDT
     - ETH/USDT
   primary_timeframe: 15m
@@ -449,7 +446,7 @@ mean_reversion:
 # =============================================================================
 # PRESET 4 — TREND FOLLOWING (EMA Cross)
 # Logic: EMA 50/200 golden/death cross on trend TF → entry on 5m pullback.
-# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT (4H — strong USD trends).
+# Best markets: BTC/USDT (4H), ETH/USDT (4H), XAU/USDT-PERP (4H — strong USD trends).
 # Timeframe: 1H trend signal, 4H confirmation.
 # =============================================================================
 trend_following:
@@ -457,9 +454,8 @@ trend_following:
 
   markets:
     - BTC/USDT
-    - BTC/USDT
     - ETH/USDT
-    - XAU/USDT
+    - XAU/USDT-PERP
   primary_timeframe: 1h           # cross detected on 1H
   trend_timeframe: 4h             # direction confirmed on 4H
 
@@ -537,15 +533,14 @@ trend_following:
 # =============================================================================
 # PRESET 5 — VOLATILITY BREAKOUT
 # Logic: ATR-based pending orders above/below consolidation at session opens.
-# Best markets: XAU/USDT, BTC/USDT at NY open and Asian session opens.
+# Best markets: XAU/USDT-PERP, BTC/USDT at NY open and Asian session opens.
 # Timeframe: 15m consolidation, 5m entry.
 # =============================================================================
 volatility_breakout:
   enabled: true
 
   markets:
-    - EUR/USD
-    - XAU/USDT
+    - XAU/USDT-PERP
     - BTC/USDT
     - ETH/USDT
   primary_timeframe: 15m          # breakout detected on 15m
