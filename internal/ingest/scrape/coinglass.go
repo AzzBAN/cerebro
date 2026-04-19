@@ -14,7 +14,6 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
-	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
@@ -45,7 +44,7 @@ type cachedTable struct {
 // CoinglassScraper implements port.DerivativesFeed by scraping the Coinglass
 // website using a headless Chromium instance via chromedp.
 // The homepage table is scraped via DOM extraction (API responses are encrypted).
-// Per-symbol pages use XHR interception for endpoints not on the homepage.
+// Per-symbol pages are scraped via DOM extraction.
 type CoinglassScraper struct {
 	allocCtx   context.Context
 	cancel     context.CancelFunc
@@ -135,14 +134,48 @@ func (s *CoinglassScraper) OpenInterest(ctx context.Context, symbol domain.Symbo
 
 func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.Symbol, refPrice decimal.Decimal, pricePct float64) ([]domain.LiquidationZone, error) {
 	coin := coinGlassSymbol(symbol)
-	url := coinglassBaseURL + "/LiquidationData/" + coin
+	url := coinglassBaseURL + "/LiquidationData"
 
-	body, err := s.interceptAPI(ctx, url, matchKeywords("liquidation"))
-	if err != nil {
+	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
+	defer tabCancel()
+
+	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
+	defer timeoutCancel()
+
+	var raw string
+	if err := chromedp.Run(tabCtx,
+		network.Enable(),
+		emulation.SetUserAgentOverride(stealthUserAgent),
+		chromedp.Navigate(url),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		chromedp.Sleep(6*time.Second),
+		chromedp.Evaluate(`
+			(() => {
+				const tables = document.querySelectorAll('table');
+				for (const table of tables) {
+					const ths = Array.from(table.querySelectorAll('thead th'));
+					const headers = ths.map(th => th.textContent.trim());
+					if (headers.length < 6) continue;
+					const hasSymbol = headers.some(h => /symbol|coin/i.test(h));
+					const hasLong = headers.some(h => /long/i.test(h));
+					const hasShort = headers.some(h => /short/i.test(h));
+					if (!hasSymbol || !hasLong || !hasShort) continue;
+					const rows = table.querySelectorAll('tbody tr');
+					const entries = [];
+					for (const row of rows) {
+						const cells = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
+						entries.push(cells);
+					}
+					return JSON.stringify({headers, entries});
+				}
+				return JSON.stringify({error: 'liquidation table not found'});
+			})()
+		`, &raw),
+	); err != nil {
 		return nil, fmt.Errorf("coinglass scraper: liquidations %s: %w", coin, err)
 	}
 
-	return parseLiquidationResponse(body, symbol, refPrice, pricePct), nil
+	return parseLiquidationDOM(raw, symbol, refPrice, pricePct), nil
 }
 
 func (s *CoinglassScraper) FearGreed(ctx context.Context) (*domain.FearGreedIndex, error) {
@@ -259,12 +292,45 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 	coin := coinGlassSymbol(symbol)
 	url := coinglassBaseURL + "/LongShortRatio/" + coin
 
-	body, err := s.interceptAPI(ctx, url, matchKeywords("longshortrate"))
-	if err != nil {
+	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
+	defer tabCancel()
+
+	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
+	defer timeoutCancel()
+
+	var raw string
+	if err := chromedp.Run(tabCtx,
+		network.Enable(),
+		emulation.SetUserAgentOverride(stealthUserAgent),
+		chromedp.Navigate(url),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		chromedp.Sleep(6*time.Second),
+		chromedp.Evaluate(`
+			(() => {
+				const tables = document.querySelectorAll('table');
+				for (const table of tables) {
+					const ths = Array.from(table.querySelectorAll('thead th'));
+					const headers = ths.map(th => th.textContent.trim());
+					if (headers.length < 6) continue;
+					const hasExchange = headers.some(h => /exchange/i.test(h));
+					const hasLongShort = headers.some(h => /long/i.test(h) && /short/i.test(h));
+					if (!hasExchange || !hasLongShort) continue;
+					const rows = table.querySelectorAll('tbody tr');
+					const entries = [];
+					for (const row of rows) {
+						const cells = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
+						entries.push(cells);
+					}
+					return JSON.stringify({headers, entries});
+				}
+				return JSON.stringify({error: 'long/short table not found'});
+			})()
+		`, &raw),
+	); err != nil {
 		return nil, fmt.Errorf("coinglass scraper: long/short %s: %w", coin, err)
 	}
 
-	return parseLongShortResponse(body, symbol), nil
+	return parseLongShortDOM(raw, symbol), nil
 }
 
 // fetchDerivativesTable scrapes the Coinglass homepage derivatives table via
@@ -428,100 +494,6 @@ func parseDollarAmount(s string) decimal.Decimal {
 	return d.Mul(multiplier)
 }
 
-// urlMatcher determines whether an intercepted XHR/fetch URL is relevant.
-type urlMatcher func(url string) bool
-
-// matchKeywords returns a matcher that checks all keywords appear in the URL
-// (case-insensitive).
-func matchKeywords(keywords ...string) urlMatcher {
-	return func(url string) bool {
-		lower := strings.ToLower(url)
-		for _, kw := range keywords {
-			if !strings.Contains(lower, strings.ToLower(kw)) {
-				return false
-			}
-		}
-		return true
-	}
-}
-
-// interceptAPI navigates to url and listens for XHR/fetch responses that match
-// the given urlMatcher. It returns the first matching response body as raw JSON.
-func (s *CoinglassScraper) interceptAPI(ctx context.Context, pageURL string, matcher urlMatcher) (json.RawMessage, error) {
-	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
-	defer tabCancel()
-
-	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
-	defer timeoutCancel()
-
-	bodyCh := make(chan json.RawMessage, 1)
-
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		respEvt, ok := ev.(*network.EventResponseReceived)
-		if !ok {
-			return
-		}
-
-		respURL := respEvt.Response.URL
-
-		if !strings.Contains(respURL, "capi.coinglass.com/api/") ||
-			strings.Contains(respURL, "/strapi/") {
-			return
-		}
-		if respEvt.Response.Status == 204 || respEvt.Response.Status == 304 {
-			return
-		}
-		if !matcher(respURL) {
-			return
-		}
-
-		slog.Debug("coinglass scraper: intercepted API response",
-			"url", respURL, "status", respEvt.Response.Status)
-
-		go func(requestID network.RequestID) {
-			if tabCtx.Err() != nil {
-				return
-			}
-			cc := chromedp.FromContext(tabCtx)
-			if cc == nil || cc.Target == nil {
-				return
-			}
-			execCtx := cdp.WithExecutor(tabCtx, cc.Target)
-			body, err := network.GetResponseBody(requestID).Do(execCtx)
-			if err != nil {
-				slog.Debug("coinglass scraper: response body not available",
-					"url", respURL, "error", err)
-				return
-			}
-
-			select {
-			case bodyCh <- json.RawMessage(body):
-			default:
-			}
-		}(respEvt.RequestID)
-	})
-
-	if err := chromedp.Run(tabCtx,
-		network.Enable(),
-		emulation.SetUserAgentOverride(stealthUserAgent),
-		chromedp.Navigate(pageURL),
-		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Sleep(2*time.Second),
-	); err != nil {
-		return nil, fmt.Errorf("navigate %s: %w", pageURL, err)
-	}
-
-	select {
-	case body := <-bodyCh:
-		if len(body) == 0 {
-			return nil, fmt.Errorf("empty response from %s", pageURL)
-		}
-		return body, nil
-	case <-tabCtx.Done():
-		return nil, fmt.Errorf("timeout waiting for API response from %s: %w", pageURL, tabCtx.Err())
-	}
-}
-
 func coinGlassSymbol(sym domain.Symbol) string {
 	s := string(sym)
 	if idx := strings.Index(s, "/"); idx > 0 {
@@ -542,25 +514,6 @@ func parseDecimal(s string) decimal.Decimal {
 		return decimal.Zero
 	}
 	return d
-}
-
-func parseAPIResponse(body json.RawMessage) (json.RawMessage, error) {
-	var envelope struct {
-		Success bool            `json:"success"`
-		Code    string          `json:"code"`
-		Data    json.RawMessage `json:"data"`
-		Message string          `json:"message"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return body, nil
-	}
-	if envelope.Message != "" && !envelope.Success {
-		return nil, fmt.Errorf("API error: %s", envelope.Message)
-	}
-	if envelope.Data != nil {
-		return envelope.Data, nil
-	}
-	return body, nil
 }
 
 func parseAlternativeMeFearGreed(body []byte) *domain.FearGreedIndex {
@@ -587,25 +540,63 @@ func parseAlternativeMeFearGreed(body []byte) *domain.FearGreedIndex {
 	return result
 }
 
-func parseLongShortResponse(body json.RawMessage, symbol domain.Symbol) *domain.LongShortRatio {
+func parseLongShortDOM(raw string, symbol domain.Symbol) *domain.LongShortRatio {
 	now := time.Now().UTC()
 	result := &domain.LongShortRatio{Symbol: symbol, FetchedAt: now}
 
-	data, err := parseAPIResponse(body)
-	if err != nil {
-		slog.Warn("coinglass scraper: parse long/short envelope", "error", err)
+	var table struct {
+		Headers []string   `json:"headers"`
+		Entries [][]string `json:"entries"`
+		Error   string     `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &table); err != nil || table.Error != "" {
+		slog.Warn("coinglass scraper: parse long/short DOM", "raw_error", err, "msg", table.Error)
 		return result
 	}
 
-	var arr []struct {
-		GlobalRatio float64 `json:"globalRatio"`
-		TopLongPct  float64 `json:"topLongPct"`
-		TopShortPct float64 `json:"topShortPct"`
+	// Find the Long/Short column for the shortest timeframe (prefer 1h, then 4h, then 24h).
+	colIdx := -1
+	for _, keyword := range []string{"1h", "4h", "24h"} {
+		for i, h := range table.Headers {
+			hLower := strings.ToLower(h)
+			if strings.Contains(hLower, keyword) &&
+				(strings.Contains(hLower, "long") || strings.Contains(hLower, "/")) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx >= 0 {
+			break
+		}
 	}
-	if err := json.Unmarshal(data, &arr); err == nil && len(arr) > 0 {
-		result.GlobalRatio = arr[0].GlobalRatio
-		result.TopLongPct = arr[0].TopLongPct
-		result.TopShortPct = arr[0].TopShortPct
+	if colIdx < 0 {
+		slog.Warn("coinglass scraper: long/short column not found", "headers", table.Headers)
+		return result
+	}
+
+	// Average the ratio values across exchanges.
+	var sum float64
+	var count int
+	for _, cells := range table.Entries {
+		if colIdx >= len(cells) {
+			continue
+		}
+		cell := cells[colIdx]
+		if v, err := strconv.ParseFloat(cell, 64); err == nil && v > 0 {
+			sum += v
+			count++
+			continue
+		}
+		if v := parsePercentage(cell); v > 0 {
+			sum += v / (100 - v)
+			count++
+		}
+	}
+
+	if count > 0 {
+		result.GlobalRatio = sum / float64(count)
+		result.TopShortPct = 100 / (1 + result.GlobalRatio)
+		result.TopLongPct = 100 - result.TopShortPct
 	}
 
 	slog.Info("coinglass scraper: long/short parsed",
@@ -613,48 +604,80 @@ func parseLongShortResponse(body json.RawMessage, symbol domain.Symbol) *domain.
 	return result
 }
 
-func parseLiquidationResponse(body json.RawMessage, symbol domain.Symbol, refPrice decimal.Decimal, pricePct float64) []domain.LiquidationZone {
-	data, err := parseAPIResponse(body)
-	if err != nil {
-		slog.Warn("coinglass scraper: parse liquidation envelope", "error", err)
+func parseLiquidationDOM(raw string, symbol domain.Symbol, refPrice decimal.Decimal, pricePct float64) []domain.LiquidationZone {
+	var table struct {
+		Headers []string   `json:"headers"`
+		Entries [][]string `json:"entries"`
+		Error   string     `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &table); err != nil || table.Error != "" {
+		slog.Warn("coinglass scraper: parse liquidation DOM", "raw_error", err, "msg", table.Error)
 		return nil
 	}
 
-	var rawZones []struct {
-		Price     float64 `json:"price"`
-		AmountUSD float64 `json:"amountUSD"`
-		Side      string  `json:"side"`
-	}
-	if err := json.Unmarshal(data, &rawZones); err != nil {
-		return nil
-	}
+	coin := coinGlassSymbol(symbol)
 
-	var zones []domain.LiquidationZone
-	for _, z := range rawZones {
-		price := decimal.NewFromFloat(z.Price)
-		amount := decimal.NewFromFloat(z.AmountUSD)
-		if price.IsZero() {
-			continue
-		}
-
-		if pricePct > 0 && !refPrice.IsZero() {
-			lower := refPrice.Mul(decimal.NewFromFloat(1 - pricePct/100))
-			upper := refPrice.Mul(decimal.NewFromFloat(1 + pricePct/100))
-			if price.LessThan(lower) || price.GreaterThan(upper) {
-				continue
+	var symbolCol, longCol, shortCol = -1, -1, -1
+	for i, h := range table.Headers {
+		hLower := strings.ToLower(h)
+		if strings.Contains(hLower, "symbol") || strings.Contains(hLower, "coin") {
+			if symbolCol < 0 {
+				symbolCol = i
 			}
 		}
-
-		side := domain.SideSell
-		if strings.EqualFold(z.Side, "short") {
-			side = domain.SideBuy
+		if strings.Contains(hLower, "1h") && strings.Contains(hLower, "long") {
+			longCol = i
 		}
+		if strings.Contains(hLower, "1h") && strings.Contains(hLower, "short") {
+			shortCol = i
+		}
+	}
+	if symbolCol < 0 || (longCol < 0 && shortCol < 0) {
+		slog.Warn("coinglass scraper: liquidation columns not found", "headers", table.Headers)
+		return nil
+	}
 
+	var longAmt, shortAmt decimal.Decimal
+	for _, cells := range table.Entries {
+		if symbolCol >= len(cells) {
+			continue
+		}
+		cell := cells[symbolCol]
+		if !strings.EqualFold(cell, coin) && !strings.HasPrefix(strings.ToUpper(cell), coin) {
+			continue
+		}
+		if longCol >= 0 && longCol < len(cells) {
+			longAmt = parseDollarAmount(cells[longCol])
+		}
+		if shortCol >= 0 && shortCol < len(cells) {
+			shortAmt = parseDollarAmount(cells[shortCol])
+		}
+		break
+	}
+
+	if longAmt.IsZero() && shortAmt.IsZero() {
+		slog.Warn("coinglass scraper: liquidation data not found for coin", "coin", coin)
+		return nil
+	}
+
+	halfRange := refPrice.Mul(decimal.NewFromFloat(pricePct / 200))
+	var zones []domain.LiquidationZone
+
+	if !longAmt.IsZero() && !refPrice.IsZero() {
 		zones = append(zones, domain.LiquidationZone{
-			PriceLow:  price.Mul(decimal.NewFromFloat(0.995)),
-			PriceHigh: price.Mul(decimal.NewFromFloat(1.005)),
-			AmountUSD: amount,
-			Side:      side,
+			PriceLow:  refPrice.Sub(halfRange),
+			PriceHigh: refPrice.Add(halfRange),
+			AmountUSD: longAmt,
+			Side:      domain.SideSell,
+		})
+	}
+
+	if !shortAmt.IsZero() && !refPrice.IsZero() {
+		zones = append(zones, domain.LiquidationZone{
+			PriceLow:  refPrice.Sub(halfRange),
+			PriceHigh: refPrice.Add(halfRange),
+			AmountUSD: shortAmt,
+			Side:      domain.SideBuy,
 		})
 	}
 

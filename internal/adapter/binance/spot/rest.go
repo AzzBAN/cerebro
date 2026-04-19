@@ -312,35 +312,32 @@ func (b *SpotBroker) handleUserDataMessage(message []byte) error {
 		return nil
 	}
 
-	var envelope struct {
-		Event     json.RawMessage `json:"e"`
-		EventData json.RawMessage `json:"event"`
-		Data      json.RawMessage `json:"data"`
+	// Unwrap: the WS API may nest the actual event under "event" or "data".
+	payload := message
+	var wrapper struct {
+		Inner json.RawMessage `json:"event"`
+		Data  json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(message, &envelope); err != nil {
+	if err := json.Unmarshal(message, &wrapper); err != nil {
+		return err
+	}
+	if len(wrapper.Inner) > 0 {
+		payload = wrapper.Inner
+	} else if len(wrapper.Data) > 0 {
+		payload = wrapper.Data
+	}
+
+	// Extract event type. The E field (timestamp) is declared to prevent
+	// case-insensitive collision with the e field (event type).
+	var header struct {
+		EventType string `json:"e"`
+		Timestamp int64  `json:"E"`
+	}
+	if err := json.Unmarshal(payload, &header); err != nil {
 		return err
 	}
 
-	event := ""
-	if len(envelope.Event) > 0 {
-		if err := json.Unmarshal(envelope.Event, &event); err != nil {
-			// `e` is not a string (e.g. numeric); ignore this message.
-			return nil
-		}
-	}
-	if len(envelope.EventData) > 0 {
-		message = envelope.EventData
-		if err := json.Unmarshal(message, &envelope); err != nil {
-			return err
-		}
-	} else if len(envelope.Data) > 0 && event == "" {
-		message = envelope.Data
-		if err := json.Unmarshal(message, &envelope); err != nil {
-			return err
-		}
-	}
-
-	switch event {
+	switch header.EventType {
 	case "outboundAccountPosition":
 		var evt struct {
 			Balances []struct {
@@ -349,7 +346,7 @@ func (b *SpotBroker) handleUserDataMessage(message []byte) error {
 				Locked string `json:"l"`
 			} `json:"B"`
 		}
-		if err := json.Unmarshal(message, &evt); err != nil {
+		if err := json.Unmarshal(payload, &evt); err != nil {
 			return err
 		}
 

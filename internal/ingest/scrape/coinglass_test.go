@@ -1,7 +1,6 @@
 package scrape
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -149,55 +148,6 @@ func TestParseDerivativesTableJSON(t *testing.T) {
 	}
 }
 
-func TestParseAPIResponse(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		wantErr  bool
-		wantData string
-	}{
-		{
-			"success envelope",
-			`{"success":true,"data":{"rate":0.0001}}`,
-			false,
-			`{"rate":0.0001}`,
-		},
-		{
-			"code envelope",
-			`{"code":"0","data":[{"value":72}]}`,
-			false,
-			`[{"value":72}]`,
-		},
-		{
-			"error envelope",
-			`{"success":false,"message":"rate limited","data":null}`,
-			true,
-			"",
-		},
-		{
-			"raw array (no envelope)",
-			`[{"rate":0.0001}]`,
-			false,
-			`[{"rate":0.0001}]`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			data, err := parseAPIResponse(json.RawMessage(tt.input))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseAPIResponse() err = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if tt.wantErr {
-				return
-			}
-			if string(data) != tt.wantData {
-				t.Errorf("parseAPIResponse() data = %s, want %s", string(data), tt.wantData)
-			}
-		})
-	}
-}
-
 func TestParseAlternativeMeFearGreed(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -237,36 +187,44 @@ func TestParseAlternativeMeFearGreed(t *testing.T) {
 	}
 }
 
-func TestParseLongShortResponse(t *testing.T) {
-	body := `{"success":true,"data":[{"globalRatio":1.52,"topLongPct":60.3,"topShortPct":39.7}]}`
+func TestParseLongShortDOM(t *testing.T) {
+	input := `{"headers":["Exchange","Long/Short 15m","Long/Short 1h","Long/Short 4h","Long/Short 12h","Long/Short 24h"],"entries":[["Binance","1.45","1.52","1.48","1.55","1.60"],["OKX","1.38","1.42","1.40","1.47","1.51"],["Bybit","1.50","1.55","1.52","1.58","1.62"]]}`
 
-	ls := parseLongShortResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"))
-	if ls.GlobalRatio != 1.52 {
-		t.Errorf("global_ratio = %v, want 1.52", ls.GlobalRatio)
+	ls := parseLongShortDOM(input, domain.Symbol("BTCUSDT"))
+	if ls.GlobalRatio == 0 {
+		t.Fatal("expected non-zero global ratio")
 	}
-	if ls.TopLongPct != 60.3 {
-		t.Errorf("top_long_pct = %v, want 60.3", ls.TopLongPct)
+	// (1.52 + 1.42 + 1.55) / 3 ≈ 1.497
+	expected := (1.52 + 1.42 + 1.55) / 3
+	if ls.GlobalRatio < expected-0.01 || ls.GlobalRatio > expected+0.01 {
+		t.Errorf("global_ratio = %v, want ~%v", ls.GlobalRatio, expected)
+	}
+	if ls.TopLongPct <= 0 || ls.TopShortPct <= 0 {
+		t.Errorf("expected non-zero top percentages, got long=%v short=%v", ls.TopLongPct, ls.TopShortPct)
 	}
 }
 
-func TestParseLiquidationResponse(t *testing.T) {
-	body := `{"success":true,"data":[` +
-		`{"price":95000,"amountUSD":5000000,"side":"long"},` +
-		`{"price":92000,"amountUSD":3000000,"side":"short"},` +
-		`{"price":50000,"amountUSD":1000000,"side":"long"}` +
-		`]}`
+func TestParseLiquidationDOM(t *testing.T) {
+	input := `{"headers":["Symbol","Price","24h%","1h Long","1h Short","4h Long","4h Short"],"entries":[["BTC","$94,500","-2.1%","$5.2M","$3.1M","$22.4M","$15.8M"],["ETH","$1,800","-3.5%","$2.1M","$1.8M","$8.5M","$6.2M"]]}`
 
-	refPrice := decimal.NewFromInt(94000)
-	zones := parseLiquidationResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"), refPrice, 5.0)
+	refPrice := decimal.NewFromInt(94500)
+	zones := parseLiquidationDOM(input, domain.Symbol("BTCUSDT"), refPrice, 5.0)
 
 	if len(zones) != 2 {
-		t.Fatalf("zones count = %d, want 2 (only within 5%% of 94000)", len(zones))
+		t.Fatalf("expected 2 zones (long + short), got %d", len(zones))
 	}
 
 	if zones[0].Side != domain.SideSell {
 		t.Errorf("zone 0 side = %v, want SELL (longs liquidated)", zones[0].Side)
 	}
+	if zones[0].AmountUSD.String() != "5200000" {
+		t.Errorf("zone 0 amount = %s, want 5200000", zones[0].AmountUSD.String())
+	}
+
 	if zones[1].Side != domain.SideBuy {
 		t.Errorf("zone 1 side = %v, want BUY (shorts liquidated)", zones[1].Side)
+	}
+	if zones[1].AmountUSD.String() != "3100000" {
+		t.Errorf("zone 1 amount = %s, want 3100000", zones[1].AmountUSD.String())
 	}
 }

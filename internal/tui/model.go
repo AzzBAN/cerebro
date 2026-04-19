@@ -61,6 +61,10 @@ type Model struct {
 	askQuery    string
 	askScrollY  int // 0 = bottom, increases = scroll up
 	askLines    int // total rendered lines of current response
+
+	// Mouse mode toggle: enabled = scroll wheel captured by TUI;
+	// disabled = terminal handles mouse (allows text selection to copy).
+	mouseEnabled bool
 }
 
 type quoteState struct {
@@ -79,11 +83,12 @@ func New(maxLogLines int) Model {
 		maxLogLines = 500
 	}
 	return Model{
-		quotes:      make(map[string]quoteState),
-		agentRuns:   make(map[string]*agentRunState),
-		maxLogLines: maxLogLines,
-		logScrollY:  0,
-		now:         time.Now(),
+		quotes:       make(map[string]quoteState),
+		agentRuns:    make(map[string]*agentRunState),
+		maxLogLines:  maxLogLines,
+		logScrollY:   0,
+		now:          time.Now(),
+		mouseEnabled: true,
 	}
 }
 
@@ -94,7 +99,7 @@ func (m *Model) SetCopilotFn(fn func(ctx context.Context, query string) (string,
 
 // Init satisfies the tea.Model interface.
 func (m Model) Init() tea.Cmd {
-	return clockTick()
+	return tea.Batch(clockTick(), tea.EnableMouseCellMotion)
 }
 
 // Update processes messages and updates the model.
@@ -235,6 +240,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyTab:
 			m.focusedPanel = (m.focusedPanel + 1) % 3
 			return m, nil
+		case tea.KeyCtrlO:
+			m.mouseEnabled = !m.mouseEnabled
+			if m.mouseEnabled {
+				return m, tea.EnableMouseCellMotion
+			}
+			return m, tea.DisableMouse
 		case tea.KeyEnter:
 			if m.inputActive && m.input != "" {
 				query := m.input

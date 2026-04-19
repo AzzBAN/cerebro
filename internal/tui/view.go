@@ -562,11 +562,15 @@ func truncateStr(s string, max int) string {
 }
 
 func (m Model) renderStatusBar() string {
+	mouseLabel := "mouse:on"
+	if !m.mouseEnabled {
+		mouseLabel = "mouse:off"
+	}
 	var text string
 	if m.heartbeat == "" {
-		text = "  ♥ waiting for first heartbeat…"
+		text = fmt.Sprintf("  ♥ waiting for first heartbeat…  %s  Ctrl+O toggle", mouseLabel)
 	} else {
-		text = fmt.Sprintf(" %s  ♥  %s", m.heartbeatAt.Format("15:04:05"), m.heartbeat)
+		text = fmt.Sprintf(" %s  ♥  %s  %s  Ctrl+O toggle", m.heartbeatAt.Format("15:04:05"), m.heartbeat, mouseLabel)
 	}
 	maxContent := m.width
 	runes := []rune(text)
