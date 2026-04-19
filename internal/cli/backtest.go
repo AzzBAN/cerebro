@@ -56,7 +56,7 @@ Example:
 				return fmt.Errorf("load config: %w", err)
 			}
 
-			observability.Setup(cfg.Log.Level, cfg.Log.Format)
+			observability.Setup(cfg.Log)
 			// Backtests always run in paper mode.
 			if err := cfg.Validate(domain.EnvironmentPaper); err != nil {
 				return err

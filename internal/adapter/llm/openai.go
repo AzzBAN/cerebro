@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/azhar/cerebro/internal/agent"
 	"github.com/azhar/cerebro/internal/port"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -49,7 +50,8 @@ func (a *OpenAIAdapter) Complete(
 	userMessage string,
 	tools map[string]port.Tool,
 ) (string, error) {
-	const maxTurns = 12
+	const defaultMaxTurns = 12
+	maxTurns := agent.MaxTurnsFromCtx(ctx, defaultMaxTurns)
 
 	msgs := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},

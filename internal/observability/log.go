@@ -7,9 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/azhar/cerebro/internal/config"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // contextKey is the private key type for context values managed by this package.
@@ -34,12 +38,13 @@ var activeHandler *prettyHandler
 //     which owns stdout in alt-screen mode.
 //   - format "json" → machine-readable JSON on stderr (useful for prod / CI).
 //   - Any other value → pretty colored text (default for interactive use).
+//   - If cfg.File is set, logs are also written to a rotating file (JSON format).
 //
 // Call SetLogSink after the TUI runner is created to forward log lines to the
 // TUI panel.
-func Setup(level, format string) {
+func Setup(cfg config.LogConfig) {
 	var lvl slog.Level
-	switch level {
+	switch cfg.Level {
 	case "debug":
 		lvl = slog.LevelDebug
 	case "warn":
@@ -53,13 +58,43 @@ func Setup(level, format string) {
 	opts := &slog.HandlerOptions{Level: lvl}
 
 	var handler slog.Handler
-	if format == "json" {
+	if cfg.Format == "json" {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
 	} else {
 		h := newPrettyHandler(os.Stderr, opts, nil)
 		activeHandler = h
 		handler = h
 	}
+
+	// Attach rotating file output if configured.
+	if cfg.File != "" {
+		if err := os.MkdirAll(filepath.Dir(cfg.File), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "observability: failed to create log directory: %v\n", err)
+		} else {
+			maxSize := cfg.MaxSizeMB
+			if maxSize <= 0 {
+				maxSize = 100
+			}
+			maxBackups := cfg.MaxBackups
+			if maxBackups <= 0 {
+				maxBackups = 5
+			}
+			maxAge := cfg.MaxAgeDays
+			if maxAge <= 0 {
+				maxAge = 30
+			}
+
+			lj := &lumberjack.Logger{
+				Filename:   cfg.File,
+				MaxSize:    maxSize,
+				MaxBackups: maxBackups,
+				MaxAge:     maxAge,
+			}
+			fileHandler := slog.NewJSONHandler(lj, opts)
+			handler = newMultiHandler(handler, fileHandler)
+		}
+	}
+
 	slog.SetDefault(slog.New(handler))
 }
 
@@ -246,6 +281,36 @@ func stripANSI(s string) string {
 		i++
 	}
 	return out.String()
+}
+
+// ─── Multi handler ──────────────────────────────────────────────────────────
+
+// multiHandler dispatches every log record to two handlers (e.g. terminal + file).
+type multiHandler struct {
+	a, b slog.Handler
+}
+
+func newMultiHandler(a, b slog.Handler) *multiHandler {
+	return &multiHandler{a: a, b: b}
+}
+
+func (m *multiHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return m.a.Enabled(ctx, l) || m.b.Enabled(ctx, l)
+}
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	if err := m.a.Handle(ctx, r); err != nil {
+		return err
+	}
+	return m.b.Handle(ctx, r)
+}
+
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return newMultiHandler(m.a.WithAttrs(attrs), m.b.WithAttrs(attrs))
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	return newMultiHandler(m.a.WithGroup(name), m.b.WithGroup(name))
 }
 
 // ─── Heartbeat formatter ──────────────────────────────────────────────────────

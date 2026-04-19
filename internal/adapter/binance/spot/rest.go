@@ -313,26 +313,34 @@ func (b *SpotBroker) handleUserDataMessage(message []byte) error {
 	}
 
 	var envelope struct {
-		Event     string          `json:"e"`
+		Event     json.RawMessage `json:"e"`
 		EventData json.RawMessage `json:"event"`
 		Data      json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(message, &envelope); err != nil {
 		return err
 	}
+
+	event := ""
+	if len(envelope.Event) > 0 {
+		if err := json.Unmarshal(envelope.Event, &event); err != nil {
+			// `e` is not a string (e.g. numeric); ignore this message.
+			return nil
+		}
+	}
 	if len(envelope.EventData) > 0 {
 		message = envelope.EventData
 		if err := json.Unmarshal(message, &envelope); err != nil {
 			return err
 		}
-	} else if len(envelope.Data) > 0 && envelope.Event == "" {
+	} else if len(envelope.Data) > 0 && event == "" {
 		message = envelope.Data
 		if err := json.Unmarshal(message, &envelope); err != nil {
 			return err
 		}
 	}
 
-	switch envelope.Event {
+	switch event {
 	case "outboundAccountPosition":
 		var evt struct {
 			Balances []struct {

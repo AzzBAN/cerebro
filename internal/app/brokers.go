@@ -281,12 +281,17 @@ func buildRouteOrderFn(
 			return err
 		}
 
+		qty := decimal.NewFromFloat(size)
+		if !meta.cfg.LotSize.IsZero() {
+			qty = qty.Div(meta.cfg.LotSize).Floor().Mul(meta.cfg.LotSize)
+		}
+
 		intent := domain.OrderIntent{
 			ID:          uuid.New().String(),
 			Symbol:      resolved,
 			Venue:       meta.venue,
 			Side:        side,
-			Quantity:    decimal.NewFromFloat(size),
+			Quantity:    qty,
 			Strategy:    domain.StrategyName("risk_agent"),
 			Environment: env,
 			CreatedAt:   time.Now().UTC(),

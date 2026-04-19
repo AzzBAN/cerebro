@@ -80,44 +80,43 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderWatchPanel() string {
-	header := headerStyle.Render("Market Watch")
+	symCount := len(m.quotes)
 
-	availW := m.width - borderH
+	// Build header with scroll indicators
+	title := "Market Watch"
+	if symCount > maxWatchLines {
+		title = fmt.Sprintf("Market Watch (%d/%d ↕)", m.watchScrollY+1, symCount)
+	}
+	if m.watchScrollX > 0 {
+		title += " ←"
+	}
+	totalW := watchTotalContentWidth()
+	availW := m.watchContentWidth()
+	if m.watchScrollX+availW < totalW {
+		title += " →"
+	}
+	header := headerStyle.Render(title)
 
 	var content string
-	if len(m.quotes) == 0 {
+	if symCount == 0 {
 		content = dimStyle.Render("  Waiting for market data...")
 	} else {
-		syms := make([]string, 0, len(m.quotes))
+		syms := make([]string, 0, symCount)
 		for s := range m.quotes {
 			syms = append(syms, s)
 		}
 		sort.Strings(syms)
 
-		// Paginate symbols
-		page := syms
-		if len(syms) > maxWatchLines {
-			offset := m.watchScrollOffset
-			if offset >= len(syms) {
-				offset = 0
-			}
-			end := offset + maxWatchLines
-			if end > len(syms) {
-				end = len(syms)
-			}
-			page = syms[offset:end]
+		// Vertical slice
+		offset := m.watchScrollY
+		if offset >= len(syms) {
+			offset = 0
 		}
-
-		// Column widths
-		const (
-			colSymbol = 14
-			colLast   = 13
-			colChg    = 22
-			colBidAsk = 25
-			colSpread = 9
-			colVol    = 10
-			colGap    = 2
-		)
+		end := offset + maxWatchLines
+		if end > len(syms) {
+			end = len(syms)
+		}
+		page := syms[offset:end]
 
 		pad := lipgloss.NewStyle().Width
 		// Header row
@@ -134,11 +133,36 @@ func (m Model) renderWatchPanel() string {
 			q := m.quotes[sym]
 			rows = append(rows, formatWatchRow(q, colSymbol, colLast, colChg, colBidAsk, colSpread, colVol))
 		}
-		content = strings.Join(rows, "\n")
+		fullContent := strings.Join(rows, "\n")
+
+		// Horizontal crop
+		if m.watchScrollX > 0 || availW < totalW {
+			lines := strings.Split(fullContent, "\n")
+			cropped := make([]string, len(lines))
+			for i, line := range lines {
+				runes := []rune(line)
+				sx := m.watchScrollX
+				if sx > len(runes) {
+					sx = len(runes)
+				}
+				ex := sx + availW
+				if ex > len(runes) {
+					ex = len(runes)
+				}
+				cropped[i] = string(runes[sx:ex])
+			}
+			content = strings.Join(cropped, "\n")
+		} else {
+			content = fullContent
+		}
 	}
 
 	outerH := m.computedWatchH()
-	return borderStyle.Width(availW).MaxHeight(outerH).Render(header + "\n" + content)
+	style := borderStyle
+	if m.focusedPanel == focusWatch {
+		style = focusedBorderStyle
+	}
+	return style.Width(availW).MaxHeight(outerH).Render(header + "\n" + content)
 }
 
 func formatWatchRow(q quoteState, wSym, wLast, wChg, wBA, wSpread, wVol int) string {
@@ -232,6 +256,11 @@ func (m *Model) middleHeight() int {
 	askH := 0
 	if m.askResponse != "" {
 		askH = askResponseH
+		// Cap ask panel to at most 40% of terminal height so the middle section stays usable.
+		maxAskH := m.height * 2 / 5
+		if askH > maxAskH && maxAskH > 5 {
+			askH = maxAskH
+		}
 	}
 
 	return m.height - headerH - watchH - agentH - statusH - inputH - askH
@@ -258,7 +287,11 @@ func (m *Model) renderMiddle() string {
 	logContent := truncateLines(m.renderLogPanel(contentH), contentH)
 
 	positions := borderStyle.Width(posContentW).MaxHeight(contentH + 2).Render(posContent)
-	logPanel := borderStyle.Width(logContentW).MaxHeight(contentH + 2).Render(logContent)
+	logStyle := borderStyle
+	if m.focusedPanel == focusLog {
+		logStyle = focusedBorderStyle
+	}
+	logPanel := logStyle.Width(logContentW).MaxHeight(contentH + 2).Render(logContent)
 
 	joined := lipgloss.JoinHorizontal(lipgloss.Top, positions, " ", logPanel)
 	return lipgloss.PlaceHorizontal(m.width, lipgloss.Left, joined)
@@ -283,23 +316,48 @@ func (m *Model) renderPositions(contentH int) string {
 		maxLines = 1
 	}
 
+	const labelW = 7
+	lbl := lipgloss.NewStyle().Width(labelW)
+
 	lines := []string{header}
 	lineCount := 0
 	for _, p := range rows {
 		if lineCount >= maxLines {
 			break
 		}
+
 		pnl := p.UnrealizedPnLPct().StringFixed(2) + "%"
+		var pnlStr string
 		if p.UnrealizedPnLPct().IsPositive() {
-			pnl = "+" + pnl
+			pnlStr = priceStyle.Render("+" + pnl)
+		} else if p.UnrealizedPnLPct().IsNegative() {
+			pnlStr = errStyle.Render(pnl)
+		} else {
+			pnlStr = pnl
 		}
+
+		sideStr := strings.ToUpper(string(p.Side))
+		if p.Side == domain.SideBuy {
+			sideStr = priceStyle.Bold(true).Render(sideStr)
+		} else {
+			sideStr = errStyle.Bold(true).Render(sideStr)
+		}
+
 		posLines := []string{
-			fmt.Sprintf("%s %s %s", dimStyle.Render("["+string(p.Venue)+"]"), symStyle.Render(string(p.Symbol)), strings.ToUpper(string(p.Side))),
-			fmt.Sprintf("  qty=%s entry=%s current=%s pnl=%s", p.Quantity.String(), p.EntryPrice.StringFixed(4), p.CurrentPrice.StringFixed(4), pnl),
+			"  " + dimStyle.Render(string(p.Venue)),
+			"  " + symStyle.Render(string(p.Symbol)) + "    " + sideStr,
+			"  " + lbl.Render(dimStyle.Render("QTY")) + "  " + p.Quantity.String(),
+			"  " + lbl.Render(dimStyle.Render("ENTRY")) + "  " + formatPositionPrice(p.EntryPrice.StringFixed(2)),
+			"  " + lbl.Render(dimStyle.Render("CURRENT")) + "  " + formatPositionPrice(p.CurrentPrice.StringFixed(2)),
+			"  " + lbl.Render(dimStyle.Render("pnl")) + "  " + pnlStr,
 		}
 		if !p.StopLoss.IsZero() || !p.TakeProfit1.IsZero() {
-			posLines = append(posLines, fmt.Sprintf("  sl=%s tp1=%s", p.StopLoss.StringFixed(4), p.TakeProfit1.StringFixed(4)))
+			posLines = append(posLines,
+				"  "+lbl.Render(dimStyle.Render("SL"))+"  "+formatPositionPrice(p.StopLoss.StringFixed(2)),
+				"  "+lbl.Render(dimStyle.Render("TP1"))+"  "+formatPositionPrice(p.TakeProfit1.StringFixed(2)),
+			)
 		}
+
 		remaining := maxLines - lineCount
 		if len(posLines) > remaining {
 			posLines = posLines[:remaining]
@@ -308,6 +366,28 @@ func (m *Model) renderPositions(contentH int) string {
 		lineCount += len(posLines)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatPositionPrice adds dot thousands separator to a decimal string.
+func formatPositionPrice(s string) string {
+	parts := strings.Split(s, ".")
+	intStr := parts[0]
+
+	var buf strings.Builder
+	n := len(intStr)
+	for i := 0; i < n; i++ {
+		if i > 0 && (n-i)%3 == 0 {
+			buf.WriteByte('.')
+		}
+		buf.WriteByte(intStr[i])
+	}
+
+	if len(parts) > 1 {
+		buf.WriteByte('.')
+		buf.WriteString(parts[1])
+	}
+
+	return buf.String()
 }
 
 func (m *Model) renderLogPanel(contentH int) string {
@@ -380,29 +460,36 @@ func (m *Model) renderAgentPanel() string {
 			}
 			continue
 		}
+
+		// First line: spinner + description (what the agent is doing)
+		desc := run.description
+		if desc == "" {
+			desc = string(run.step)
+			if run.step == StepTool && run.toolName != "" {
+				desc = run.toolName
+			}
+		}
+
 		frame := spinnerFrames[m.spinnerFrame]
-		stepLabel := string(run.step)
-		if run.step == StepTool && run.toolName != "" {
-			stepLabel = "TOOL: " + run.toolName
-		}
-		stepProgress := ""
-		if run.maxSteps > 0 {
-			stepProgress = dimStyle.Render(fmt.Sprintf(" %d/%d", run.stepNum, run.maxSteps))
-		}
+		descLine := fmt.Sprintf(" %s %s", agentStyle.Render(frame), agentStyle.Render(desc))
+
+		// Second line: metadata (agent, provider/model, step progress, elapsed)
 		elapsed := time.Since(run.started).Truncate(10 * time.Millisecond)
-		parts := fmt.Sprintf(" %s %-10s [%s]%s %s/%s",
-			agentStyle.Render(frame),
-			run.agent,
-			stepLabel,
-			stepProgress,
-			dimStyle.Render(run.provider),
-			dimStyle.Render(run.model),
-		)
-		if run.symbol != "" {
-			parts += "  " + symStyle.Render(run.symbol)
+		var metaParts []string
+		metaParts = append(metaParts, run.agent)
+		if run.provider != "" || run.model != "" {
+			metaParts = append(metaParts, fmt.Sprintf("%s/%s", run.provider, run.model))
 		}
-		parts += "  " + dimStyle.Render(elapsed.String())
-		activeLines = append(activeLines, parts)
+		if run.maxSteps > 0 {
+			metaParts = append(metaParts, fmt.Sprintf("step %d/%d", run.stepNum, run.maxSteps))
+		}
+		if run.symbol != "" {
+			metaParts = append(metaParts, string(run.symbol))
+		}
+		metaParts = append(metaParts, elapsed.String())
+		metaLine := dimStyle.Render("   " + strings.Join(metaParts, " · "))
+
+		activeLines = append(activeLines, descLine, metaLine)
 	}
 
 	var content strings.Builder
@@ -501,10 +588,41 @@ func (m Model) renderInput() string {
 	if m.askResponse != "" {
 		question := dimStyle.Render(" Q: ") + truncateStr(m.askQuery, m.width-borderH-12)
 		closeBtn := closeBtnStyle.Render(" [×] ")
-		label := question + closeBtn
-		rendered := renderAgentMarkdown(m.askResponse, m.width-borderH, maxAskResponseLines)
-		responseContent := label + "\n" + rendered
-		responseH := 2 + 1 + maxAskResponseLines // border + header + content
+
+		scrollIndicator := ""
+		if m.askLines > maxAskResponseLines {
+			pct := float64(m.askScrollY) / float64(m.askLines-maxAskResponseLines) * 100
+			scrollIndicator = dimStyle.Render(fmt.Sprintf("  ↑↓ %.0f%%", pct))
+		}
+
+		label := question + closeBtn + scrollIndicator
+
+		// Render full markdown content — scrolling handles truncation.
+		rendered := renderAgentMarkdown(m.askResponse, m.width-borderH, 500)
+
+		// Apply scroll: extract lines and pick the visible window.
+		allLines := strings.Split(rendered, "\n")
+		total := len(allLines)
+		start := total - maxAskResponseLines - m.askScrollY
+		if start < 0 {
+			start = 0
+		}
+		end := start + maxAskResponseLines
+		if end > total {
+			end = total
+		}
+		visible := strings.Join(allLines[start:end], "\n")
+		// Cap visible lines when terminal is short.
+		visibleLines := maxAskResponseLines
+		responseH := 2 + 1 + visibleLines // border(2) + header(1) + content
+		maxAskH := m.height * 2 / 5
+		if responseH > maxAskH && maxAskH > 5 {
+			visibleLines = maxAskH - 3 // subtract border(2) + header(1)
+			responseH = maxAskH
+		}
+		visible = padToLines(visible, visibleLines)
+
+		responseContent := label + "\n" + visible
 		parts = append(parts, borderStyle.Width(m.width-borderH).MaxHeight(responseH).Render(responseContent))
 	}
 

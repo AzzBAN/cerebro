@@ -19,6 +19,9 @@ func TestCoinGlassSymbol(t *testing.T) {
 		{"BTC", "BTC"},
 		{"XAUUSDT", "XAU"},
 		{"", ""},
+		{"BTC/USDT", "BTC"},
+		{"XAU/USDT-PERP", "XAU"},
+		{"ETH/USDT", "ETH"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
@@ -53,11 +56,104 @@ func TestParseDecimal(t *testing.T) {
 	}
 }
 
+func TestParsePercentage(t *testing.T) {
+	tests := []struct {
+		input string
+		want  float64
+	}{
+		{"0.0001%", 0.0001},
+		{"-0.0078%", -0.0078},
+		{"+0.03%", 0.03},
+		{"-5.49%", -5.49},
+		{"0%", 0},
+		{"", 0},
+		{"notanumber%", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parsePercentage(tt.input)
+			if got != tt.want {
+				t.Errorf("parsePercentage(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDollarAmount(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"$44.99B", "44990000000"},
+		{"$56.09B", "56090000000"},
+		{"$31.27B", "31270000000"},
+		{"$51.45M", "51450000"},
+		{"$1.51T", "1510000000000"},
+		{"$950.5K", "950500"},
+		{"$0", "0"},
+		{"", "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseDollarAmount(tt.input)
+			want, _ := decimal.NewFromString(tt.want)
+			if !got.Equal(want) {
+				t.Errorf("parseDollarAmount(%q) = %s, want %s", tt.input, got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDerivativesTableJSON(t *testing.T) {
+	input := `[` +
+		`{"symbol":"BTC","fundingRate":"0.0001%","volume24h":"$44.99B","openInterest":"$56.09B","oiChange1h":"+0.03%","oiChange24h":"-5.49%"},` +
+		`{"symbol":"ETH","fundingRate":"-0.0078%","volume24h":"$34.34B","openInterest":"$31.27B","oiChange1h":"+0.43%","oiChange24h":"-5.05%"},` +
+		`{"symbol":"SOL","fundingRate":"0.0052%","volume24h":"$8.12B","openInterest":"$4.87B","oiChange1h":"-0.12%","oiChange24h":"-3.21%"}` +
+		`]`
+
+	entries, err := parseDerivativesTableJSON(input)
+	if err != nil {
+		t.Fatalf("parseDerivativesTableJSON error: %v", err)
+	}
+
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+
+	btc, ok := entries["BTC"]
+	if !ok {
+		t.Fatal("BTC not found in entries")
+	}
+	if btc.FundingRate != 0.0001 {
+		t.Errorf("BTC funding rate = %v, want 0.0001", btc.FundingRate)
+	}
+	if btc.Volume24h.String() != "44990000000" {
+		t.Errorf("BTC volume = %s, want 44990000000", btc.Volume24h.String())
+	}
+	if btc.OpenInterest.String() != "56090000000" {
+		t.Errorf("BTC OI = %s, want 56090000000", btc.OpenInterest.String())
+	}
+	if btc.OIChange1h != 0.03 {
+		t.Errorf("BTC OI 1h = %v, want 0.03", btc.OIChange1h)
+	}
+	if btc.OIChange24h != -5.49 {
+		t.Errorf("BTC OI 24h = %v, want -5.49", btc.OIChange24h)
+	}
+
+	eth, ok := entries["ETH"]
+	if !ok {
+		t.Fatal("ETH not found in entries")
+	}
+	if eth.FundingRate != -0.0078 {
+		t.Errorf("ETH funding rate = %v, want -0.0078", eth.FundingRate)
+	}
+}
+
 func TestParseAPIResponse(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
+		name     string
+		input    string
+		wantErr  bool
 		wantData string
 	}{
 		{
@@ -102,59 +198,7 @@ func TestParseAPIResponse(t *testing.T) {
 	}
 }
 
-func TestParseFundingRateResponse(t *testing.T) {
-	tests := []struct {
-		name     string
-		json     string
-		wantRate float64
-	}{
-		{
-			"array envelope",
-			`{"success":true,"data":[{"rate":0.00012,"nextFundingTime":1714000000000}]}`,
-			0.00012,
-		},
-		{
-			"object response",
-			`{"success":true,"data":{"rate":0.00005,"nextFundingTime":0}}`,
-			0.00005,
-		},
-		{
-			"empty data",
-			`{"success":true,"data":[]}`,
-			0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fr := parseFundingRateResponse(json.RawMessage(tt.json), domain.Symbol("BTCUSDT"))
-			if fr.Rate != tt.wantRate {
-				t.Errorf("rate = %v, want %v", fr.Rate, tt.wantRate)
-			}
-			if fr.Symbol != domain.Symbol("BTCUSDT") {
-				t.Errorf("symbol = %v, want BTCUSDT", fr.Symbol)
-			}
-		})
-	}
-}
-
-func TestParseOpenInterestResponse(t *testing.T) {
-	body := `{"success":true,"data":[{"openInterest":15000000000,"change1h":0.5,"change4h":1.2,"change24h":-0.3}]}`
-
-	oi := parseOpenInterestResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"))
-	expected := decimal.NewFromInt(15000000000)
-	if !oi.TotalUSD.Equal(expected) {
-		t.Errorf("total_usd = %s, want %s", oi.TotalUSD.String(), expected.String())
-	}
-	if oi.Change1h != 0.5 {
-		t.Errorf("change_1h = %v, want 0.5", oi.Change1h)
-	}
-	if oi.Change24h != -0.3 {
-		t.Errorf("change_24h = %v, want -0.3", oi.Change24h)
-	}
-}
-
-func TestParseFearGreedResponse(t *testing.T) {
+func TestParseAlternativeMeFearGreed(t *testing.T) {
 	tests := []struct {
 		name      string
 		json      string
@@ -162,27 +206,27 @@ func TestParseFearGreedResponse(t *testing.T) {
 		wantCat   string
 	}{
 		{
-			"from API",
-			`{"success":true,"data":[{"value":72,"classification":"Greed"}]}`,
+			"from alternative.me API",
+			`{"data":[{"value":"72","value_classification":"Greed","timestamp":"1681862400","time_until_update":"43200"}]}`,
 			72,
 			"Greed",
 		},
 		{
-			"zero value fallback",
-			`{"success":true,"data":[]}`,
+			"empty data",
+			`{"data":[]}`,
 			0,
-			"Extreme Fear",
+			"",
 		},
 		{
-			"neutral range",
-			`{"success":true,"data":[{"value":48,"classification":""}]}`,
-			48,
-			"Neutral",
+			"extreme fear",
+			`{"data":[{"value":"15","value_classification":"Extreme Fear"}]}`,
+			15,
+			"Extreme Fear",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fg := parseFearGreedResponse(json.RawMessage(tt.json))
+			fg := parseAlternativeMeFearGreed([]byte(tt.json))
 			if fg.Value != tt.wantValue {
 				t.Errorf("value = %d, want %d", fg.Value, tt.wantValue)
 			}
@@ -206,11 +250,11 @@ func TestParseLongShortResponse(t *testing.T) {
 }
 
 func TestParseLiquidationResponse(t *testing.T) {
-	body := `{"success":true,"data":[
-		{"price":95000,"amountUSD":5000000,"side":"long"},
-		{"price":92000,"amountUSD":3000000,"side":"short"},
-		{"price":50000,"amountUSD":1000000,"side":"long"}
-	]}`
+	body := `{"success":true,"data":[` +
+		`{"price":95000,"amountUSD":5000000,"side":"long"},` +
+		`{"price":92000,"amountUSD":3000000,"side":"short"},` +
+		`{"price":50000,"amountUSD":1000000,"side":"long"}` +
+		`]}`
 
 	refPrice := decimal.NewFromInt(94000)
 	zones := parseLiquidationResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"), refPrice, 5.0)

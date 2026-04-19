@@ -10,6 +10,7 @@ import (
 type OpenInterest struct {
 	Symbol    Symbol
 	TotalUSD  decimal.Decimal
+	Volume24h decimal.Decimal
 	Change1h  float64
 	Change4h  float64
 	Change24h float64

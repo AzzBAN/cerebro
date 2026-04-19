@@ -31,7 +31,7 @@ No trading actions are performed.`,
 				return fmt.Errorf("load config: %w", err)
 			}
 
-			observability.Setup(cfg.Log.Level, cfg.Log.Format)
+			observability.Setup(cfg.Log)
 
 			// For check, we read ENVIRONMENT from config without requiring CLI flag agreement.
 			// The triple-agreement check only applies to `run`.

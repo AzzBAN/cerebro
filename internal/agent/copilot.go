@@ -28,7 +28,8 @@ func NewCopilot(runtime *Runtime, tools map[string]port.Tool) *Copilot {
 
 // Ask answers a free-form operator query. Non-blocking on the trading path.
 func (c *Copilot) Ask(ctx context.Context, query string) (string, error) {
-	result := c.runtime.Invoke(ctx, domain.AgentCopilot, copilotPrompt, query, c.tools, "copilot_response")
+	result := c.runtime.Invoke(ctx, domain.AgentCopilot, copilotPrompt, query, c.tools, "copilot_response",
+		"Answering operator query")
 	if result.Err != nil {
 		return "", fmt.Errorf("copilot: %w", result.Err)
 	}
