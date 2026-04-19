@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type Config struct {
 	TUI         TUIConfig          `yaml:"tui"`
 	Ingest      IngestConfig       `yaml:"ingest"`
 	Backtest    BacktestConfig     `yaml:"backtest"`
+	LogRetention LogRetentionConfig `yaml:"log_retention"`
 
 	// Loaded separately from markets.yaml and strategies.yaml.
 	Markets    []VenueConfig    `yaml:"-"`
@@ -34,8 +36,19 @@ type Config struct {
 }
 
 type LogConfig struct {
-	Level  string `yaml:"level"`  // debug | info | warn | error
-	Format string `yaml:"format"` // json | text
+	Level      string `yaml:"level"`       // debug | info | warn | error
+	Format     string `yaml:"format"`      // json | text
+	File       string `yaml:"file"`        // path to log file (e.g. logs/cerebro.log); empty = no file output
+	MaxSizeMB  int    `yaml:"max_size_mb"` // max file size before rotation (default 100)
+	MaxBackups int    `yaml:"max_backups"` // max old log files to keep (default 5)
+	MaxAgeDays int    `yaml:"max_age_days"` // max days to retain old logs (default 30)
+}
+
+type LogRetentionConfig struct {
+	AgentLogsDays      int  `yaml:"agent_logs_days"`       // purge agent runs/messages older than N days (default 90)
+	AuditEventsDays    int  `yaml:"audit_events_days"`     // purge audit events older than N days (default 180)
+	ArchiveBeforePurge bool `yaml:"archive_before_purge"` // move to archived_* tables before deleting (default true)
+	PurgeIntervalHours int  `yaml:"purge_interval_hours"`  // how often to run purge (default 24)
 }
 
 type EngineConfig struct {
@@ -62,6 +75,7 @@ type AgentConfig struct {
 	MaxTurns                  int              `yaml:"max_turns"`
 	TimeoutPerTurnSeconds     int              `yaml:"timeout_per_turn_seconds"`
 	TimeoutTotalSeconds       int              `yaml:"timeout_total_seconds"`
+	RetryOnTransient          int              `yaml:"retry_on_transient"`
 	LLM                       LLMConfig        `yaml:"llm"`
 	ToolPolicy                ToolPolicyConfig `yaml:"tool_policy"`
 }
@@ -178,6 +192,7 @@ type SecretsConfig struct {
 	OpenAIBaseURL    string
 
 	TelegramBotToken             string
+	TelegramChatID               int64
 	TelegramAllowlistUserIDs     []string
 	DiscordBotToken              string
 	DiscordGuildID               string
@@ -265,6 +280,12 @@ func loadSecrets() SecretsConfig {
 		DiscordTradeChannelID:          os.Getenv("DISCORD_TRADE_CHANNEL_ID"),
 		DiscordAIReasoningChannelID:    os.Getenv("DISCORD_AI_REASONING_CHANNEL_ID"),
 		DiscordSystemAlertsChannelID:   os.Getenv("DISCORD_SYSTEM_ALERTS_CHANNEL_ID"),
+	}
+
+	if raw := os.Getenv("TELEGRAM_CHAT_ID"); raw != "" {
+		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			s.TelegramChatID = id
+		}
 	}
 
 	if raw := os.Getenv("TELEGRAM_ALLOWLIST_USER_IDS"); raw != "" {

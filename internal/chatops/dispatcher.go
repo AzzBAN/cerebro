@@ -48,7 +48,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, actorID, raw string) string {
 
 	cmd, arg := ParseCommand(raw)
 	if cmd == "" {
-		return "Unknown command. Try /status, /positions, /ask <query>, /pause, /resume, /flatten, /bias <symbol>."
+		return "Unknown command. Try /status, /positions, /ask <query>, /pause, /resume, /flatten, /bias <symbol>, /summary."
 	}
 
 	result := d.handle(ctx, actorID, cmd, arg)
@@ -82,6 +82,9 @@ func (d *Dispatcher) handle(ctx context.Context, actorID, cmd, arg string) strin
 
 	case CmdAsk:
 		return d.handleAsk(ctx, arg)
+
+	case CmdSummary:
+		return d.handleSummary(ctx)
 
 	default:
 		return "Unknown command."
@@ -178,4 +181,56 @@ func (d *Dispatcher) handleAsk(ctx context.Context, query string) string {
 		return fmt.Sprintf("⚠️ Copilot error: %v", err)
 	}
 	return "🤖 " + result
+}
+
+func (d *Dispatcher) handleSummary(ctx context.Context) string {
+	var sections []string
+
+	// Trading state.
+	halted := d.deps.RiskGate.IsHalted()
+	state := d.deps.RiskGate.TradingState()
+	statusEmoji := "🟢"
+	if halted {
+		statusEmoji = "🔴"
+	}
+	sections = append(sections, fmt.Sprintf("%s State: %s", statusEmoji, state))
+
+	// Positions + balance across all venues.
+	var totalPos int
+	var posLines []string
+	for _, b := range d.deps.Brokers {
+		positions, err := b.Positions(ctx)
+		if err != nil {
+			continue
+		}
+		totalPos += len(positions)
+		for _, p := range positions {
+			pnl := p.UnrealizedPnLPct().StringFixed(2) + "%"
+			if p.UnrealizedPnLPct().IsPositive() {
+				pnl = "+" + pnl
+			}
+			posLines = append(posLines, fmt.Sprintf("  %s %s  Qty: %s  Entry: %s  PnL: %s",
+				p.Symbol, p.Side, p.Quantity.String(), p.EntryPrice.String(), pnl))
+		}
+
+		bal, err := b.Balance(ctx)
+		if err != nil {
+			continue
+		}
+		sections = append(sections, fmt.Sprintf("💰 %s: %s USDT (free: %s)",
+			b.Venue(), bal.TotalUSDT.StringFixed(2), bal.FreeUSDT.StringFixed(2)))
+	}
+	if totalPos > 0 {
+		sections = append(sections, fmt.Sprintf("📊 Positions (%d):", totalPos))
+		sections = append(sections, posLines...)
+	} else {
+		sections = append(sections, "📊 No open positions.")
+	}
+
+	// Screening summary (best-effort — may not have run yet).
+	if raw, err := d.deps.Cache.Get(ctx, "screening:summary"); err == nil && raw != nil {
+		sections = append(sections, "📋 Screening:\n"+string(raw))
+	}
+
+	return strings.Join(sections, "\n")
 }

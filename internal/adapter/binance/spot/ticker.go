@@ -132,7 +132,7 @@ func marketStatToQuote(e *gobinance.WsMarketStatEvent) (domain.Quote, error) {
 	}
 	chgPct, err := parseDecimal(e.PriceChangePercent)
 	if err != nil {
-		return domain.Quote{}, fmt.Errorf("ticker change%: %w", err)
+		return domain.Quote{}, fmt.Errorf("ticker change%%: %w", err)
 	}
 	vol, err := parseDecimal(e.QuoteVolume)
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	_ "embed"
 
 	"github.com/azhar/cerebro/internal/agent/tools"
@@ -23,6 +25,9 @@ var screeningPrompt string
 //go:embed prompts/screening_opportunities.tmpl
 var screeningOpportunitiesPrompt string
 
+//go:embed prompts/screening_summary.tmpl
+var screeningSummaryPrompt string
+
 // ScreeningAgent runs on a configurable schedule (every 1–4 h) and writes
 // a BiasResult to Redis for each monitored symbol.
 // It NEVER runs on the hot signal path.
@@ -35,6 +40,7 @@ type ScreeningAgent struct {
 	symbols         []domain.Symbol
 	biasTTL         time.Duration
 	maxOpportunities int
+	notifiers       []port.Notifier
 }
 
 // NewScreeningAgent creates a ScreeningAgent.
@@ -46,6 +52,7 @@ func NewScreeningAgent(
 	cfg config.AgentConfig,
 	symbols []domain.Symbol,
 	biasTTL time.Duration,
+	notifiers []port.Notifier,
 ) *ScreeningAgent {
 	maxOpp := cfg.ScreeningMaxOpportunities
 	if maxOpp <= 0 {
@@ -60,6 +67,7 @@ func NewScreeningAgent(
 		symbols:          symbols,
 		biasTTL:          biasTTL,
 		maxOpportunities: maxOpp,
+		notifiers:        notifiers,
 	}
 }
 
@@ -74,8 +82,7 @@ func (s *ScreeningAgent) Run(ctx context.Context) error {
 		"symbols", len(s.symbols))
 
 	// Run immediately on startup.
-	s.runAll(ctx)
-	s.runOpportunities(ctx)
+	s.runCycle(ctx)
 
 	for {
 		select {
@@ -83,19 +90,48 @@ func (s *ScreeningAgent) Run(ctx context.Context) error {
 			slog.Info("screening agent stopping")
 			return nil
 		case <-ticker.C:
-			s.runAll(ctx)
-			s.runOpportunities(ctx)
+			s.runCycle(ctx)
+		}
+	}
+}
+
+// runCycle executes all three screening phases and sends an alert if the
+// entire cycle fails (no bias data produced and no summary sent).
+func (s *ScreeningAgent) runCycle(ctx context.Context) {
+	s.runAll(ctx)
+	s.runOpportunities(ctx)
+	summaryOk := s.runSummary(ctx)
+
+	if !summaryOk {
+		if biasCtx := s.collectBiasContext(ctx); biasCtx == "" {
+			msg := "Screening cycle failed: no bias data produced. All LLM invocations may have timed out."
+			slog.Error(msg)
+			s.notifyAll(ctx, port.ChannelSystemAlerts, msg)
+		}
+	}
+}
+
+// notifyAll pushes a message to all configured notifiers on the given channel.
+func (s *ScreeningAgent) notifyAll(ctx context.Context, ch port.NotifyChannel, msg string) {
+	for _, n := range s.notifiers {
+		if err := n.Send(ctx, ch, msg); err != nil {
+			slog.Warn("screening: failed to send notification", "channel", ch, "error", err)
 		}
 	}
 }
 
 func (s *ScreeningAgent) runAll(ctx context.Context) {
+	g, gctx := errgroup.WithContext(ctx)
 	for _, sym := range s.symbols {
-		if err := s.runForSymbol(ctx, sym); err != nil {
-			slog.Error("screening agent: symbol run failed",
-				"symbol", sym, "error", err)
-		}
+		g.Go(func() error {
+			if err := s.runForSymbol(gctx, sym); err != nil {
+				slog.Error("screening agent: symbol run failed",
+					"symbol", sym, "error", err)
+			}
+			return nil
+		})
 	}
+	_ = g.Wait()
 }
 
 func (s *ScreeningAgent) runForSymbol(ctx context.Context, sym domain.Symbol) error {
@@ -116,7 +152,8 @@ func (s *ScreeningAgent) runForSymbol(ctx context.Context, sym domain.Symbol) er
 		}
 	}
 
-	result := s.runtime.Invoke(ctx, domain.AgentScreening, screeningPrompt, userMsg, screeningTools, "bias_score")
+	result := s.runtime.Invoke(ctx, domain.AgentScreening, screeningPrompt, userMsg, screeningTools, "bias_score",
+		fmt.Sprintf("Analyzing %s market conditions", sym))
 	if result.Err != nil {
 		// Fail closed: retain previous cached bias, do NOT clear the key.
 		slog.Warn("screening: LLM failed; retaining previous bias",
@@ -294,7 +331,8 @@ func (s *ScreeningAgent) runOpportunities(ctx context.Context) {
 		oppTools["get_all_market_data"] = t
 	}
 
-	result := s.runtime.Invoke(ctx, domain.AgentScreening, screeningOpportunitiesPrompt, userMsg, oppTools, "screening_opportunities")
+	result := s.runtime.Invoke(ctx, domain.AgentScreening, screeningOpportunitiesPrompt, userMsg, oppTools, "screening_opportunities",
+		"Identifying top entry opportunities")
 	if result.Err != nil {
 		slog.Warn("screening opportunities: LLM failed; retaining previous cache", "error", result.Err)
 		return
@@ -360,6 +398,65 @@ func (s *ScreeningAgent) collectBiasContext(ctx context.Context) string {
 			bias.Symbol, bias.Score, bias.Reasoning))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// runSummary runs Phase 3: synthesizes all Phase 1 + Phase 2 results into a
+// single consolidated summary for the operator.
+// Returns true if a summary was produced and sent to notifiers.
+func (s *ScreeningAgent) runSummary(ctx context.Context) bool {
+	biasContext := s.collectBiasContext(ctx)
+	if biasContext == "" {
+		slog.Warn("screening summary: no bias data available; skipping")
+		return false
+	}
+
+	// Collect opportunities.
+	var oppContext string
+	if raw, err := s.cache.Get(ctx, "screening:opportunities"); err == nil && raw != nil {
+		var opps []domain.ScreeningOpportunity
+		if json.Unmarshal(raw, &opps) == nil && len(opps) > 0 {
+			var lines []string
+			for _, o := range opps {
+				avoided := ""
+				if o.Avoided {
+					avoided = " [AVOIDED]"
+				}
+				lines = append(lines, fmt.Sprintf("- %s (%s) %s confidence=%.2f%s: %s",
+					o.Symbol, o.Venue, strings.ToUpper(string(o.Side)), o.Confidence, avoided, o.Reasoning))
+			}
+			oppContext = strings.Join(lines, "\n")
+		}
+	}
+
+	userMsg := fmt.Sprintf("Phase 1 — Per-Symbol Bias:\n%s", biasContext)
+	if oppContext != "" {
+		userMsg += fmt.Sprintf("\n\nPhase 2 — Ranked Opportunities:\n%s", oppContext)
+	}
+	userMsg += "\n\nSynthesize the above into a single operator summary."
+
+	// No tools needed for summarization — pure text synthesis.
+	result := s.runtime.Invoke(ctx, domain.AgentScreening, screeningSummaryPrompt, userMsg, nil, "screening_summary",
+		"Synthesizing screening summary")
+	if result.Err != nil {
+		slog.Warn("screening summary: LLM failed; retaining previous cache", "error", result.Err)
+		return false
+	}
+
+	output := strings.TrimSpace(result.Output)
+	if output == "" {
+		slog.Warn("screening summary: empty model output; skipping")
+		return false
+	}
+
+	if err := s.cache.Set(ctx, "screening:summary", []byte(output), s.biasTTL); err != nil {
+		slog.Error("screening summary: cache write failed", "error", err)
+		return false
+	}
+
+	slog.Info("screening: summary updated", "expires_at", time.Now().UTC().Add(s.biasTTL))
+
+	s.notifyAll(ctx, port.ChannelAIReasoning, output)
+	return true
 }
 
 type opportunitiesOutput struct {

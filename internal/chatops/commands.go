@@ -1,5 +1,7 @@
 package chatops
 
+import "strings"
+
 // Command names — the canonical slash-command identifiers.
 const (
 	CmdStatus    = "/status"
@@ -9,6 +11,7 @@ const (
 	CmdBias      = "/bias"
 	CmdPositions = "/positions"
 	CmdAsk       = "/ask"
+	CmdSummary   = "/summary"
 )
 
 // Permission describes what a command requires.
@@ -27,11 +30,17 @@ var commandPermissions = map[string]Permission{
 	CmdBias:      {RequiresOperator: true},
 	CmdPositions: {RequiresOperator: true},
 	CmdAsk:       {RequiresOperator: true},
+	CmdSummary:   {RequiresOperator: true},
 }
 
 // ParseCommand extracts the command name and argument from a raw input string.
 // "/ask Why did you buy BTC?" → ("/ask", "Why did you buy BTC?")
+// Handles Telegram's "/cmd@BotName" format by stripping the @ suffix.
 func ParseCommand(raw string) (cmd, arg string) {
+	// Strip Telegram @botname suffix before matching.
+	if at := strings.Index(raw, "@"); at > 0 && raw[0] == '/' {
+		raw = raw[:at]
+	}
 	for name := range commandPermissions {
 		if len(raw) >= len(name) && raw[:len(name)] == name {
 			rest := raw[len(name):]

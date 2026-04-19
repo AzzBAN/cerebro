@@ -1,7 +1,6 @@
 package scrape
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -19,6 +18,9 @@ func TestCoinGlassSymbol(t *testing.T) {
 		{"BTC", "BTC"},
 		{"XAUUSDT", "XAU"},
 		{"", ""},
+		{"BTC/USDT", "BTC"},
+		{"XAU/USDT-PERP", "XAU"},
+		{"ETH/USDT", "ETH"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
@@ -53,108 +55,100 @@ func TestParseDecimal(t *testing.T) {
 	}
 }
 
-func TestParseAPIResponse(t *testing.T) {
+func TestParsePercentage(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
-		wantData string
+		input string
+		want  float64
 	}{
-		{
-			"success envelope",
-			`{"success":true,"data":{"rate":0.0001}}`,
-			false,
-			`{"rate":0.0001}`,
-		},
-		{
-			"code envelope",
-			`{"code":"0","data":[{"value":72}]}`,
-			false,
-			`[{"value":72}]`,
-		},
-		{
-			"error envelope",
-			`{"success":false,"message":"rate limited","data":null}`,
-			true,
-			"",
-		},
-		{
-			"raw array (no envelope)",
-			`[{"rate":0.0001}]`,
-			false,
-			`[{"rate":0.0001}]`,
-		},
+		{"0.0001%", 0.0001},
+		{"-0.0078%", -0.0078},
+		{"+0.03%", 0.03},
+		{"-5.49%", -5.49},
+		{"0%", 0},
+		{"", 0},
+		{"notanumber%", 0},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			data, err := parseAPIResponse(json.RawMessage(tt.input))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseAPIResponse() err = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if tt.wantErr {
-				return
-			}
-			if string(data) != tt.wantData {
-				t.Errorf("parseAPIResponse() data = %s, want %s", string(data), tt.wantData)
+		t.Run(tt.input, func(t *testing.T) {
+			got := parsePercentage(tt.input)
+			if got != tt.want {
+				t.Errorf("parsePercentage(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestParseFundingRateResponse(t *testing.T) {
+func TestParseDollarAmount(t *testing.T) {
 	tests := []struct {
-		name     string
-		json     string
-		wantRate float64
+		input string
+		want  string
 	}{
-		{
-			"array envelope",
-			`{"success":true,"data":[{"rate":0.00012,"nextFundingTime":1714000000000}]}`,
-			0.00012,
-		},
-		{
-			"object response",
-			`{"success":true,"data":{"rate":0.00005,"nextFundingTime":0}}`,
-			0.00005,
-		},
-		{
-			"empty data",
-			`{"success":true,"data":[]}`,
-			0,
-		},
+		{"$44.99B", "44990000000"},
+		{"$56.09B", "56090000000"},
+		{"$31.27B", "31270000000"},
+		{"$51.45M", "51450000"},
+		{"$1.51T", "1510000000000"},
+		{"$950.5K", "950500"},
+		{"$0", "0"},
+		{"", "0"},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fr := parseFundingRateResponse(json.RawMessage(tt.json), domain.Symbol("BTCUSDT"))
-			if fr.Rate != tt.wantRate {
-				t.Errorf("rate = %v, want %v", fr.Rate, tt.wantRate)
-			}
-			if fr.Symbol != domain.Symbol("BTCUSDT") {
-				t.Errorf("symbol = %v, want BTCUSDT", fr.Symbol)
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseDollarAmount(tt.input)
+			want, _ := decimal.NewFromString(tt.want)
+			if !got.Equal(want) {
+				t.Errorf("parseDollarAmount(%q) = %s, want %s", tt.input, got.String(), tt.want)
 			}
 		})
 	}
 }
 
-func TestParseOpenInterestResponse(t *testing.T) {
-	body := `{"success":true,"data":[{"openInterest":15000000000,"change1h":0.5,"change4h":1.2,"change24h":-0.3}]}`
+func TestParseDerivativesTableJSON(t *testing.T) {
+	input := `[` +
+		`{"symbol":"BTC","fundingRate":"0.0001%","volume24h":"$44.99B","openInterest":"$56.09B","oiChange1h":"+0.03%","oiChange24h":"-5.49%"},` +
+		`{"symbol":"ETH","fundingRate":"-0.0078%","volume24h":"$34.34B","openInterest":"$31.27B","oiChange1h":"+0.43%","oiChange24h":"-5.05%"},` +
+		`{"symbol":"SOL","fundingRate":"0.0052%","volume24h":"$8.12B","openInterest":"$4.87B","oiChange1h":"-0.12%","oiChange24h":"-3.21%"}` +
+		`]`
 
-	oi := parseOpenInterestResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"))
-	expected := decimal.NewFromInt(15000000000)
-	if !oi.TotalUSD.Equal(expected) {
-		t.Errorf("total_usd = %s, want %s", oi.TotalUSD.String(), expected.String())
+	entries, err := parseDerivativesTableJSON(input)
+	if err != nil {
+		t.Fatalf("parseDerivativesTableJSON error: %v", err)
 	}
-	if oi.Change1h != 0.5 {
-		t.Errorf("change_1h = %v, want 0.5", oi.Change1h)
+
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
 	}
-	if oi.Change24h != -0.3 {
-		t.Errorf("change_24h = %v, want -0.3", oi.Change24h)
+
+	btc, ok := entries["BTC"]
+	if !ok {
+		t.Fatal("BTC not found in entries")
+	}
+	if btc.FundingRate != 0.0001 {
+		t.Errorf("BTC funding rate = %v, want 0.0001", btc.FundingRate)
+	}
+	if btc.Volume24h.String() != "44990000000" {
+		t.Errorf("BTC volume = %s, want 44990000000", btc.Volume24h.String())
+	}
+	if btc.OpenInterest.String() != "56090000000" {
+		t.Errorf("BTC OI = %s, want 56090000000", btc.OpenInterest.String())
+	}
+	if btc.OIChange1h != 0.03 {
+		t.Errorf("BTC OI 1h = %v, want 0.03", btc.OIChange1h)
+	}
+	if btc.OIChange24h != -5.49 {
+		t.Errorf("BTC OI 24h = %v, want -5.49", btc.OIChange24h)
+	}
+
+	eth, ok := entries["ETH"]
+	if !ok {
+		t.Fatal("ETH not found in entries")
+	}
+	if eth.FundingRate != -0.0078 {
+		t.Errorf("ETH funding rate = %v, want -0.0078", eth.FundingRate)
 	}
 }
 
-func TestParseFearGreedResponse(t *testing.T) {
+func TestParseAlternativeMeFearGreed(t *testing.T) {
 	tests := []struct {
 		name      string
 		json      string
@@ -162,27 +156,27 @@ func TestParseFearGreedResponse(t *testing.T) {
 		wantCat   string
 	}{
 		{
-			"from API",
-			`{"success":true,"data":[{"value":72,"classification":"Greed"}]}`,
+			"from alternative.me API",
+			`{"data":[{"value":"72","value_classification":"Greed","timestamp":"1681862400","time_until_update":"43200"}]}`,
 			72,
 			"Greed",
 		},
 		{
-			"zero value fallback",
-			`{"success":true,"data":[]}`,
+			"empty data",
+			`{"data":[]}`,
 			0,
-			"Extreme Fear",
+			"",
 		},
 		{
-			"neutral range",
-			`{"success":true,"data":[{"value":48,"classification":""}]}`,
-			48,
-			"Neutral",
+			"extreme fear",
+			`{"data":[{"value":"15","value_classification":"Extreme Fear"}]}`,
+			15,
+			"Extreme Fear",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fg := parseFearGreedResponse(json.RawMessage(tt.json))
+			fg := parseAlternativeMeFearGreed([]byte(tt.json))
 			if fg.Value != tt.wantValue {
 				t.Errorf("value = %d, want %d", fg.Value, tt.wantValue)
 			}
@@ -193,36 +187,44 @@ func TestParseFearGreedResponse(t *testing.T) {
 	}
 }
 
-func TestParseLongShortResponse(t *testing.T) {
-	body := `{"success":true,"data":[{"globalRatio":1.52,"topLongPct":60.3,"topShortPct":39.7}]}`
+func TestParseLongShortDOM(t *testing.T) {
+	input := `{"headers":["Exchange","Long/Short 15m","Long/Short 1h","Long/Short 4h","Long/Short 12h","Long/Short 24h"],"entries":[["Binance","1.45","1.52","1.48","1.55","1.60"],["OKX","1.38","1.42","1.40","1.47","1.51"],["Bybit","1.50","1.55","1.52","1.58","1.62"]]}`
 
-	ls := parseLongShortResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"))
-	if ls.GlobalRatio != 1.52 {
-		t.Errorf("global_ratio = %v, want 1.52", ls.GlobalRatio)
+	ls := parseLongShortDOM(input, domain.Symbol("BTCUSDT"))
+	if ls.GlobalRatio == 0 {
+		t.Fatal("expected non-zero global ratio")
 	}
-	if ls.TopLongPct != 60.3 {
-		t.Errorf("top_long_pct = %v, want 60.3", ls.TopLongPct)
+	// (1.52 + 1.42 + 1.55) / 3 ≈ 1.497
+	expected := (1.52 + 1.42 + 1.55) / 3
+	if ls.GlobalRatio < expected-0.01 || ls.GlobalRatio > expected+0.01 {
+		t.Errorf("global_ratio = %v, want ~%v", ls.GlobalRatio, expected)
+	}
+	if ls.TopLongPct <= 0 || ls.TopShortPct <= 0 {
+		t.Errorf("expected non-zero top percentages, got long=%v short=%v", ls.TopLongPct, ls.TopShortPct)
 	}
 }
 
-func TestParseLiquidationResponse(t *testing.T) {
-	body := `{"success":true,"data":[
-		{"price":95000,"amountUSD":5000000,"side":"long"},
-		{"price":92000,"amountUSD":3000000,"side":"short"},
-		{"price":50000,"amountUSD":1000000,"side":"long"}
-	]}`
+func TestParseLiquidationDOM(t *testing.T) {
+	input := `{"headers":["Symbol","Price","24h%","1h Long","1h Short","4h Long","4h Short"],"entries":[["BTC","$94,500","-2.1%","$5.2M","$3.1M","$22.4M","$15.8M"],["ETH","$1,800","-3.5%","$2.1M","$1.8M","$8.5M","$6.2M"]]}`
 
-	refPrice := decimal.NewFromInt(94000)
-	zones := parseLiquidationResponse(json.RawMessage(body), domain.Symbol("BTCUSDT"), refPrice, 5.0)
+	refPrice := decimal.NewFromInt(94500)
+	zones := parseLiquidationDOM(input, domain.Symbol("BTCUSDT"), refPrice, 5.0)
 
 	if len(zones) != 2 {
-		t.Fatalf("zones count = %d, want 2 (only within 5%% of 94000)", len(zones))
+		t.Fatalf("expected 2 zones (long + short), got %d", len(zones))
 	}
 
 	if zones[0].Side != domain.SideSell {
 		t.Errorf("zone 0 side = %v, want SELL (longs liquidated)", zones[0].Side)
 	}
+	if zones[0].AmountUSD.String() != "5200000" {
+		t.Errorf("zone 0 amount = %s, want 5200000", zones[0].AmountUSD.String())
+	}
+
 	if zones[1].Side != domain.SideBuy {
 		t.Errorf("zone 1 side = %v, want BUY (shorts liquidated)", zones[1].Side)
+	}
+	if zones[1].AmountUSD.String() != "3100000" {
+		t.Errorf("zone 1 amount = %s, want 3100000", zones[1].AmountUSD.String())
 	}
 }

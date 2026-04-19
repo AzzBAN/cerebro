@@ -97,7 +97,8 @@ func (r *ReviewerAgent) runReview(ctx context.Context) {
 		return
 	}
 
-	result := r.runtime.Invoke(ctx, domain.AgentReviewer, systemPrompt, userMsg, r.tools, "reviewer_recommendation")
+	result := r.runtime.Invoke(ctx, domain.AgentReviewer, systemPrompt, userMsg, r.tools, "reviewer_recommendation",
+		"Reviewing recent trades")
 	if result.Err != nil {
 		slog.Error("reviewer: LLM failed", "error", result.Err)
 		return

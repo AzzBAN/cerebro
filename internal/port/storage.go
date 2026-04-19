@@ -26,3 +26,8 @@ type AgentLogStore interface {
 type AuditStore interface {
 	SaveEvent(ctx context.Context, e domain.AuditEvent) error
 }
+
+// LogArchiver moves old records to archive tables and purges them from hot tables.
+type LogArchiver interface {
+	ArchiveAndPurge(ctx context.Context, agentLogsDays, auditEventsDays int) (archived, purged int, err error)
+}

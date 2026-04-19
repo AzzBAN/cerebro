@@ -60,7 +60,7 @@ all agree — any mismatch causes an immediate fatal error at startup.`,
 				return fmt.Errorf("load config: %w", err)
 			}
 
-			observability.Setup(cfg.Log.Level, cfg.Log.Format)
+			observability.Setup(cfg.Log)
 
 			if err := cfg.Validate(env); err != nil {
 				return err

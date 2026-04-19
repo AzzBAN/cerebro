@@ -57,6 +57,14 @@ The stub lives in `internal/<package>/testhelpers_test.go` (unexported, test-onl
 
 Use stdlib `testing` + comparison with `decimal.Equal` for money. Avoid assertion libraries unless they're already in `go.mod`.
 
+## Coverage & Race
+
+```bash
+go test -race ./...             # Always run with race detector
+go test -cover ./...            # Check coverage
+go test -coverprofile=cover.out ./... && go tool cover -func=cover.out
+```
+
 ## What Must Have Tests
 
 - Every function in `internal/risk/` — risk gate logic is safety-critical.

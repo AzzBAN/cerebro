@@ -2,7 +2,7 @@
 
 BINARY := cerebro
 CONFIG_DIR := configs
-DATABASE_URL := postgresql://postgres.azzplqrjsmeueedehmpm:d%25%4079ff%2fazYAKgD@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres
+DATABASE_URL ?= $(shell echo $$DATABASE_URL)
 
 build:
 	go build -ldflags="-s -w" -o $(BINARY) ./cmd/cerebro

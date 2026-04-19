@@ -347,18 +347,40 @@ func computeQuantity(
 		slog.Debug("position sizing failed; falling back to min lot",
 			"symbol", sig.Symbol, "error", err)
 		if !mkt.MinLotUnits.IsZero() {
-			return mkt.MinLotUnits
+			return roundToLotSize(mkt.MinLotUnits, mkt.LotSize)
 		}
 		return decimal.NewFromFloat(0.001)
 	}
+
+	qty := params.Quantity
+
+	// Round down to the symbol's lot size step so the exchange doesn't reject.
+	if !mkt.LotSize.IsZero() {
+		qty = roundToLotSize(qty, mkt.LotSize)
+	}
+
+	// If rounding brought us below minLot, bump up to minLot.
+	if !mkt.MinLotUnits.IsZero() && qty.LessThan(mkt.MinLotUnits) {
+		qty = roundToLotSize(mkt.MinLotUnits, mkt.LotSize)
+	}
+
 	slog.Debug("position sized",
 		"symbol", sig.Symbol, "side", sig.Side,
 		"entry", entryPrice.StringFixed(4),
 		"stop_loss", sl.StringFixed(4),
-		"qty", params.Quantity.String(),
+		"qty", qty.String(),
 		"risk_usd", params.RiskAmountQuote.StringFixed(2),
 	)
-	return params.Quantity
+	return qty
+}
+
+// roundToLotSize rounds qty down to the nearest step increment.
+// If step is zero, qty is returned unchanged.
+func roundToLotSize(qty, step decimal.Decimal) decimal.Decimal {
+	if step.IsZero() {
+		return qty
+	}
+	return qty.Div(step).Floor().Mul(step)
 }
 
 func deriveStopLoss(side domain.Side, entry decimal.Decimal, sc config.StrategyConfig) decimal.Decimal {

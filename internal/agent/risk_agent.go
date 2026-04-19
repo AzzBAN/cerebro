@@ -50,7 +50,8 @@ func (r *RiskAgent) Evaluate(ctx context.Context, sig domain.Signal, positions [
 		userMsg = r.injectPerformanceContext(ctx, 7, userMsg)
 	}
 
-	result := r.runtime.Invoke(ctx, domain.AgentRisk, riskPrompt, userMsg, r.tools, "risk_evaluation")
+	result := r.runtime.Invoke(ctx, domain.AgentRisk, riskPrompt, userMsg, r.tools, "risk_evaluation",
+		"Evaluating risk for signal")
 	if result.Err != nil {
 		slog.Error("risk agent: invocation failed; failing closed",
 			"signal_id", sig.ID, "error", result.Err)

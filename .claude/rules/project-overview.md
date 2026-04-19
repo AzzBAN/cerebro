@@ -6,7 +6,7 @@
 
 | Concern | Choice |
 |---|---|
-| Language | Go 1.25 (module: `github.com/azhar/cerebro`) |
+| Language | Go 1.26 (module: `github.com/azhar/cerebro`) |
 | CLI | `cobra` |
 | TUI | `bubbletea` + `lipgloss` |
 | Exchange | `go-binance/v2` |
@@ -45,6 +45,18 @@ cmd/cerebro/main.go → internal/cli → internal/app (composition root)
 - `internal/port/` — Go interfaces (ports)
 - `internal/adapter/` — external system implementations
 - `internal/app/runtime.go` — composition root / goroutine wiring
+- `internal/agent/` — LLM agent logic (screener, copilot, reviewer)
+- `internal/backtest/` — historical strategy simulation
+- `internal/chatops/` — Telegram/Discord bot integrations
+- `internal/execution/` — order execution logic
+- `internal/ingest/` — market data ingestion
+- `internal/marketdata/` — market data types and helpers
+- `internal/observability/` — structured logging setup
+- `internal/resilience/` — retry/circuit-breaker patterns
+- `internal/risk/` — risk gate (safety-critical)
+- `internal/strategy/` — signal generation
+- `internal/tui/` — Bubble Tea terminal UI
+- `internal/watchdog/` — health monitoring
 - `configs/` — `app.yaml`, `markets.yaml`, `strategies.yaml`, `secrets.env`
-- `scripts/migrations/` — Goose SQL migrations
+- `scripts/migrations/` — SQL migrations (`golang-migrate`)
 - `deploy/` — `Dockerfile`, `docker-compose.yaml`

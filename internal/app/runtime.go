@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"time"
 
 	"github.com/azhar/cerebro/internal/adapter/llm"
+	"github.com/azhar/cerebro/internal/adapter/postgres"
+	"github.com/azhar/cerebro/internal/adapter/telegram"
+	"github.com/jackc/pgx/v5/pgxpool"
 	agentpkg "github.com/azhar/cerebro/internal/agent"
 	agenttools "github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/chatops"
@@ -57,14 +61,42 @@ func (a *App) runRuntime(ctx context.Context) error {
 		"eval_interval_ms", a.cfg.Engine.EvaluationIntervalMS,
 	)
 
-	// ── Core in-memory infrastructure ────────────────────────────────────────
+	// ── Core infrastructure ──────────────────────────────────────────────────
 	hub := marketdata.NewHub()
 	defer hub.Close()
 
 	cache := newMemoryCache()
-	trades := newMemoryTradeStore()
-	audit := &memoryAuditStore{}
-	agentLog := &memoryAgentLogStore{}
+
+	var (
+		trades   port.TradeStore
+		audit    port.AuditStore
+		agentLog port.AgentLogStore
+		pool     *pgxpool.Pool
+	)
+
+	if a.cfg.Secrets.DatabaseURL != "" {
+		var err error
+		pool, err = postgres.NewPool(ctx, a.cfg.Secrets.DatabaseURL)
+		if err != nil {
+			slog.Warn("database connection failed; falling back to in-memory stores", "error", err)
+			trades = newMemoryTradeStore()
+			audit = &memoryAuditStore{}
+			agentLog = &memoryAgentLogStore{}
+		} else {
+			defer pool.Close()
+			slog.Info("database connected")
+
+			trades = postgres.NewTradeStore(pool)
+			audit = postgres.NewAuditStore(pool)
+			agentLog = postgres.NewAgentLogStore(pool)
+			slog.Info("stores wired: postgres")
+		}
+	} else {
+		trades = newMemoryTradeStore()
+		audit = &memoryAuditStore{}
+		agentLog = &memoryAgentLogStore{}
+		slog.Warn("DATABASE_URL not set; using in-memory stores — data will not persist")
+	}
 
 	// ── Symbol config index ───────────────────────────────────────────────────
 	symbolMeta, err := buildSymbolMetaMap(a.cfg.Markets)
@@ -177,9 +209,26 @@ func (a *App) runRuntime(ctx context.Context) error {
 		slog.Info("ingest: Finnhub economic calendar feed enabled")
 	}
 
-	// ── Notifiers (Telegram/Discord wired in a future phase) ──────────────────
+	// ── Notifiers + Telegram bot ──────────────────────────────────────────────
 	var notifiers []port.Notifier
-	slog.Debug("ChatOps: Telegram/Discord bots deferred to Phase 6")
+	var tgBot *telegram.Bot
+	if a.cfg.Secrets.TelegramBotToken != "" {
+		allowlistIDs := telegram.ParseAllowlist(a.cfg.Secrets)
+		bot, err := telegram.NewBot(a.cfg.Secrets.TelegramBotToken, allowlistIDs)
+		if err != nil {
+			slog.Warn("telegram: bot creation failed; notifications unavailable", "error", err)
+		} else {
+			if a.cfg.Secrets.TelegramChatID != 0 {
+				bot.SetChannel(string(port.ChannelDefault), a.cfg.Secrets.TelegramChatID)
+				bot.SetChannel(string(port.ChannelTradeExecution), a.cfg.Secrets.TelegramChatID)
+				bot.SetChannel(string(port.ChannelAIReasoning), a.cfg.Secrets.TelegramChatID)
+				bot.SetChannel(string(port.ChannelSystemAlerts), a.cfg.Secrets.TelegramChatID)
+			}
+			tgBot = bot
+			notifiers = append(notifiers, bot)
+			slog.Info("telegram bot wired", "chat_id", a.cfg.Secrets.TelegramChatID, "allowlist", len(allowlistIDs))
+		}
+	}
 
 	// ── Tool registry ─────────────────────────────────────────────────────────
 	toolReg := buildToolRegistry(
@@ -202,18 +251,18 @@ func (a *App) runRuntime(ctx context.Context) error {
 		if tuiRunner != nil {
 			provider := llmChain.Provider()
 			model := llmChain.ModelID()
-			agentRuntime.SetOnStep(func(agent, runID string, step agentpkg.AgentStep, toolName, content string, stepNum, maxSteps int) {
+			agentRuntime.SetOnStep(func(agent, runID string, step agentpkg.AgentStep, toolName, description string, stepNum, maxSteps int) {
 				tuiRunner.SendAgentState(tui.AgentStateMsg{
-					Agent:    agent,
-					RunID:    runID,
-					Step:     tui.AgentStep(step),
-					ToolName: toolName,
-					Provider: provider,
-					Model:    model,
-					Content:  content,
-					StepNum:  stepNum,
-					MaxSteps: maxSteps,
-					At:       time.Now(),
+					Agent:       agent,
+					RunID:       runID,
+					Step:        tui.AgentStep(step),
+					ToolName:    toolName,
+					Provider:    provider,
+					Model:       model,
+					Description: description,
+					StepNum:     stepNum,
+					MaxSteps:    maxSteps,
+					At:          time.Now(),
 				})
 			})
 			tuiRunner.SetCopilotFn(copilotFn)
@@ -223,20 +272,36 @@ func (a *App) runRuntime(ctx context.Context) error {
 			"hint", "set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY in secrets.env")
 	}
 
-	// ── ChatOps dispatcher (CLI-only; no bot transport) ───────────────────────
+	// ── ChatOps dispatcher ──────────────────────────────────────────────────
 	confirmTimeout := a.cfg.ChatOps.FlattenConfirmationTimeoutSeconds
 	if confirmTimeout <= 0 {
 		confirmTimeout = 30
 	}
-	_ = chatops.New(chatops.Deps{
+	var allowlistFn func(actorID string) bool
+	if len(a.cfg.Secrets.TelegramAllowlistUserIDs) > 0 {
+		allowed := make(map[string]bool, len(a.cfg.Secrets.TelegramAllowlistUserIDs))
+		for _, id := range a.cfg.Secrets.TelegramAllowlistUserIDs {
+			allowed["telegram:"+id] = true
+		}
+		allowlistFn = func(actorID string) bool { return allowed[actorID] }
+	}
+	chatopsDispatcher := chatops.New(chatops.Deps{
 		RiskGate:    gate,
 		Cache:       cache,
 		Brokers:     brokerList,
 		AuditStore:  audit,
 		CopilotFn:   copilotFn,
-		AllowlistFn: nil,
+		AllowlistFn: allowlistFn,
 	}, confirmTimeout)
-	slog.Debug("ChatOps dispatcher wired (CLI-only)")
+
+	if tgBot != nil {
+		tgBot.SetDispatcher(func(ctx context.Context, actorID, message string) string {
+			return chatopsDispatcher.Dispatch(ctx, actorID, message)
+		})
+		slog.Info("ChatOps: Telegram dispatcher wired")
+	} else {
+		slog.Debug("ChatOps dispatcher wired (no bot transport)")
+	}
 
 	// ── errgroup ──────────────────────────────────────────────────────────────
 	g, gctx := errgroup.WithContext(ctx)
@@ -273,7 +338,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 
 	// Heartbeat: prints full metrics summary every 10 s
 	g.Go(func() error {
-		return runHeartbeat(gctx, gate, brokersByVenue, tuiRunner, &metrics)
+		return runHeartbeat(gctx, hub, gate, brokersByVenue, tuiRunner, &metrics)
 	})
 
 	for _, venue := range activeVenues {
@@ -298,6 +363,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 			toolReg.ForAgentWithDefs("screening"),
 			trades,
 			a.cfg.Agent, symbols, biasTTL,
+			notifiers,
 		)
 		g.Go(func() error {
 			slog.Info("screening agent starting",
@@ -319,8 +385,26 @@ func (a *App) runRuntime(ctx context.Context) error {
 		}
 	}
 
+	// Telegram bot goroutine
+	if tgBot != nil {
+		g.Go(func() error {
+			slog.Info("telegram bot starting")
+			if err := tgBot.Run(gctx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("telegram bot: %w", err)
+			}
+			return nil
+		})
+	}
+
 	// Ingest scheduled runners
 	startIngestRunners(gctx, g, a.cfg, cache, derivFeed, newsFeed, calFeed)
+
+	// Log archival (conditional — requires Postgres pool, nil when no database)
+	if logArchiver := buildLogArchiver(pool, a.cfg); logArchiver != nil {
+		g.Go(func() error {
+			return runLogArchiver(gctx, logArchiver, a.cfg.LogRetention)
+		})
+	}
 
 	// TUI (alt screen)
 	if tuiRunner != nil {
@@ -356,6 +440,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 // runHeartbeat prints a compact runtime summary every 10 seconds.
 func runHeartbeat(
 	ctx context.Context,
+	hub *marketdata.Hub,
 	gate *risk.Gate,
 	brokers map[domain.Venue]port.Broker,
 	tuiRunner *tui.Runner,
@@ -369,6 +454,20 @@ func runHeartbeat(
 			return nil
 		case <-ticker.C:
 			positions := collectPositions(ctx, brokers)
+
+			// Enrich CurrentPrice from live market quotes so the TUI and
+			// downstream consumers see real-time prices instead of the
+			// stale bootstrap snapshot.
+			for i := range positions {
+				if q, ok := hub.LatestQuote(positions[i].Symbol); ok {
+					if !q.Last.IsZero() {
+						positions[i].CurrentPrice = q.Last
+					} else if !q.Mid.IsZero() {
+						positions[i].CurrentPrice = q.Mid
+					}
+				}
+			}
+
 			spotCount := countPositionsByVenue(positions, domain.VenueBinanceSpot)
 			futuresCount := countPositionsByVenue(positions, domain.VenueBinanceFutures)
 
@@ -627,6 +726,64 @@ func durOrDefault(minutes, defaultMinutes int) time.Duration {
 		return time.Duration(defaultMinutes)
 	}
 	return time.Duration(minutes)
+}
+
+// ── Log archival ──────────────────────────────────────────────────────────────
+
+// buildLogArchiver creates a port.LogArchiver when a database pool is
+// available. Returns nil when pool is nil (no database configured).
+func buildLogArchiver(pool *pgxpool.Pool, cfg *config.Config) port.LogArchiver {
+	if pool == nil {
+		return nil
+	}
+	archive := cfg.LogRetention.ArchiveBeforePurge
+	if !archive {
+		if cfg.LogRetention.AgentLogsDays == 0 && cfg.LogRetention.AuditEventsDays == 0 {
+			archive = true
+		}
+	}
+	return postgres.NewLogArchiver(pool, archive)
+}
+
+// runLogArchiver periodically archives and purges old log records.
+func runLogArchiver(ctx context.Context, archiver port.LogArchiver, cfg config.LogRetentionConfig) error {
+	agentDays := cfg.AgentLogsDays
+	if agentDays <= 0 {
+		agentDays = 90
+	}
+	auditDays := cfg.AuditEventsDays
+	if auditDays <= 0 {
+		auditDays = 180
+	}
+	interval := time.Duration(cfg.PurgeIntervalHours) * time.Hour
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+
+	slog.Info("log archiver starting",
+		"agent_logs_days", agentDays,
+		"audit_events_days", auditDays,
+		"interval", interval.String())
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			archived, purged, err := archiver.ArchiveAndPurge(ctx, agentDays, auditDays)
+			if err != nil {
+				slog.Error("log archiver failed", "error", err)
+				continue
+			}
+			if archived > 0 || purged > 0 {
+				slog.Info("log archiver completed",
+					"archived", archived, "purged", purged)
+			}
+		}
+	}
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────

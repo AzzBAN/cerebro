@@ -2,10 +2,20 @@ package tui
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
 	tea "github.com/charmbracelet/bubbletea"
+)
+
+// panelFocus tracks which panel receives scroll input.
+type panelFocus int
+
+const (
+	focusNone  panelFocus = iota
+	focusWatch
+	focusLog
 )
 
 // Model is the root Bubble Tea model.
@@ -17,9 +27,10 @@ type Model struct {
 	now time.Time
 
 	// Market watch
-	quotes            map[string]quoteState
-	watchScrollOffset int
-	watchPageSize     int
+	quotes       map[string]quoteState
+	watchScrollY int        // vertical scroll offset into sorted symbol list
+	watchScrollX int        // horizontal scroll offset for column overflow
+	focusedPanel panelFocus // which panel receives scroll input
 
 	// Positions
 	positionRows []domain.Position
@@ -48,6 +59,12 @@ type Model struct {
 	askLoading  bool
 	askResponse string
 	askQuery    string
+	askScrollY  int // 0 = bottom, increases = scroll up
+	askLines    int // total rendered lines of current response
+
+	// Mouse mode toggle: enabled = scroll wheel captured by TUI;
+	// disabled = terminal handles mouse (allows text selection to copy).
+	mouseEnabled bool
 }
 
 type quoteState struct {
@@ -66,11 +83,12 @@ func New(maxLogLines int) Model {
 		maxLogLines = 500
 	}
 	return Model{
-		quotes:      make(map[string]quoteState),
-		agentRuns:   make(map[string]*agentRunState),
-		maxLogLines: maxLogLines,
-		logScrollY:  0,
-		now:         time.Now(),
+		quotes:       make(map[string]quoteState),
+		agentRuns:    make(map[string]*agentRunState),
+		maxLogLines:  maxLogLines,
+		logScrollY:   0,
+		now:          time.Now(),
+		mouseEnabled: true,
 	}
 }
 
@@ -81,7 +99,7 @@ func (m *Model) SetCopilotFn(fn func(ctx context.Context, query string) (string,
 
 // Init satisfies the tea.Model interface.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(clockTick(), watchTick())
+	return tea.Batch(clockTick(), tea.EnableMouseCellMotion)
 }
 
 // Update processes messages and updates the model.
@@ -96,13 +114,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.now = time.Now()
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
 		return m, clockTick()
-
-	case watchTickMsg:
-		symCount := len(m.quotes)
-		if symCount > m.watchPageSize && m.watchPageSize > 0 {
-			m.watchScrollOffset = (m.watchScrollOffset + m.watchPageSize) % symCount
-		}
-		return m, watchTick()
 
 	case QuoteMsg:
 		sym := string(msg.Quote.Symbol)
@@ -171,6 +182,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		run.toolName = msg.ToolName
 		run.stepNum = msg.StepNum
 		run.maxSteps = msg.MaxSteps
+		if msg.Description != "" {
+			run.description = msg.Description
+		}
 		if msg.Step == StepComplete || msg.Step == StepError {
 			run.content = msg.Content
 			run.finished = msg.At
@@ -185,23 +199,53 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case AskResponseMsg:
 		m.askLoading = false
+		m.askScrollY = 0
 		if msg.Err != nil {
 			m.askResponse = "Error: " + msg.Err.Error()
 		} else {
 			m.askResponse = msg.Response
 		}
+		m.askLines = countRenderedLines(m.askResponse, max(20, m.width-borderH))
 
 	case tea.KeyMsg:
+		if m.askResponse != "" {
+			switch msg.Type {
+			case tea.KeyCtrlC:
+				return m, tea.Quit
+			case tea.KeyEsc:
+				m.askResponse = ""
+				m.askQuery = ""
+				m.askScrollY = 0
+				m.askLines = 0
+				return m, nil
+			case tea.KeyUp:
+				m.scrollAskUp(1)
+				return m, nil
+			case tea.KeyDown:
+				m.scrollAskDown(1)
+				return m, nil
+			case tea.KeyPgUp:
+				m.scrollAskUp(maxAskResponseLines)
+				return m, nil
+			case tea.KeyPgDown:
+				m.scrollAskDown(maxAskResponseLines)
+				return m, nil
+			}
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEsc:
-			if m.askResponse != "" {
-				m.askResponse = ""
-				m.askQuery = ""
-				return m, nil
-			}
 			return m, tea.Quit
+		case tea.KeyTab:
+			m.focusedPanel = (m.focusedPanel + 1) % 3
+			return m, nil
+		case tea.KeyCtrlO:
+			m.mouseEnabled = !m.mouseEnabled
+			if m.mouseEnabled {
+				return m, tea.EnableMouseCellMotion
+			}
+			return m, tea.DisableMouse
 		case tea.KeyEnter:
 			if m.inputActive && m.input != "" {
 				query := m.input
@@ -223,19 +267,43 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case tea.KeyUp:
 			if !m.inputActive {
-				m.scrollLogUp(1)
+				if m.focusedPanel == focusWatch {
+					m.scrollWatchUp(1)
+				} else {
+					m.scrollLogUp(1)
+				}
 			}
 		case tea.KeyDown:
 			if !m.inputActive {
-				m.scrollLogDown(1)
+				if m.focusedPanel == focusWatch {
+					m.scrollWatchDown(1)
+				} else {
+					m.scrollLogDown(1)
+				}
 			}
 		case tea.KeyPgUp:
 			if !m.inputActive {
-				m.scrollLogUp(m.visibleLogLines())
+				if m.focusedPanel == focusWatch {
+					m.scrollWatchUp(maxWatchLines)
+				} else {
+					m.scrollLogUp(m.visibleLogLines())
+				}
 			}
 		case tea.KeyPgDown:
 			if !m.inputActive {
-				m.scrollLogDown(m.visibleLogLines())
+				if m.focusedPanel == focusWatch {
+					m.scrollWatchDown(maxWatchLines)
+				} else {
+					m.scrollLogDown(m.visibleLogLines())
+				}
+			}
+		case tea.KeyLeft:
+			if !m.inputActive && m.focusedPanel == focusWatch {
+				m.scrollWatchLeft(watchScrollXStep)
+			}
+		case tea.KeyRight:
+			if !m.inputActive && m.focusedPanel == focusWatch {
+				m.scrollWatchRight(watchScrollXStep)
 			}
 		default:
 			if !m.inputActive && len(msg.String()) == 1 {
@@ -243,6 +311,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.inputActive {
 				m.input += msg.String()
+			}
+		}
+
+	case tea.MouseMsg:
+		switch msg.Type {
+		case tea.MouseLeft:
+			m.handleMouseClick(msg.X, msg.Y)
+		case tea.MouseWheelUp:
+			if m.focusedPanel == focusWatch {
+				m.scrollWatchUp(1)
+			} else {
+				m.scrollLogUp(3)
+			}
+		case tea.MouseWheelDown:
+			if m.focusedPanel == focusWatch {
+				m.scrollWatchDown(1)
+			} else {
+				m.scrollLogDown(3)
 			}
 		}
 	}
@@ -257,12 +343,6 @@ func clockTick() tea.Cmd {
 	})
 }
 
-func watchTick() tea.Cmd {
-	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
-		return watchTickMsg(t)
-	})
-}
-
 // ─── Layout calculations ─────────────────────────────────────────────────────
 
 // recalculateLayout computes derived sizes from the current terminal dimensions.
@@ -271,17 +351,10 @@ func (m *Model) recalculateLayout() {
 		return
 	}
 
-	symCount := len(m.quotes)
-	watchRows := symCount + 1 // +1 for header row
-	if watchRows == 1 {
-		watchRows = 2 // minimum: header + 1 empty row
-	}
-	if watchRows > maxWatchLines+1 {
-		watchRows = maxWatchLines + 1
-	}
-	m.watchPageSize = watchRows - 1 // symbols per page (excluding header)
-
+	m.clampWatchScrollY()
+	m.clampWatchScrollX()
 	m.clampLogScroll()
+	m.clampAskScroll()
 }
 
 // visibleLogLines returns how many log lines fit in the log viewport.
@@ -329,6 +402,125 @@ func (m *Model) scrollLogDown(n int) {
 	m.clampLogScroll()
 }
 
+// ─── Watch panel scroll helpers ──────────────────────────────────────────────
+
+func (m *Model) clampWatchScrollY() {
+	symCount := len(m.quotes)
+	if symCount <= maxWatchLines {
+		m.watchScrollY = 0
+		return
+	}
+	maxScroll := symCount - maxWatchLines
+	if m.watchScrollY > maxScroll {
+		m.watchScrollY = maxScroll
+	}
+	if m.watchScrollY < 0 {
+		m.watchScrollY = 0
+	}
+}
+
+func (m *Model) clampWatchScrollX() {
+	availW := m.watchContentWidth()
+	totalW := watchTotalContentWidth()
+	if totalW <= availW {
+		m.watchScrollX = 0
+		return
+	}
+	maxScroll := totalW - availW
+	if m.watchScrollX > maxScroll {
+		m.watchScrollX = maxScroll
+	}
+	if m.watchScrollX < 0 {
+		m.watchScrollX = 0
+	}
+}
+
+func (m *Model) scrollWatchUp(n int) {
+	m.watchScrollY += n
+	m.clampWatchScrollY()
+}
+
+func (m *Model) scrollWatchDown(n int) {
+	m.watchScrollY -= n
+	m.clampWatchScrollY()
+}
+
+func (m *Model) scrollWatchLeft(n int) {
+	m.watchScrollX -= n
+	m.clampWatchScrollX()
+}
+
+func (m *Model) scrollWatchRight(n int) {
+	m.watchScrollX += n
+	m.clampWatchScrollX()
+}
+
+// watchContentWidth returns the available content width inside the watch panel border.
+func (m *Model) watchContentWidth() int {
+	return m.width - borderH
+}
+
+// watchTotalContentWidth returns the total width of all watch columns combined.
+func watchTotalContentWidth() int {
+	return colSymbol + colLast + colChg + colBidAsk + colSpread + colVol
+}
+
+// handleMouseClick sets panel focus based on where the user clicked.
+func (m *Model) handleMouseClick(x, y int) {
+	// Layout: header(1) | watch | middle | agent | status(1) | input(1)
+	headerH := 1
+	watchH := m.computedWatchH()
+	agentH := m.computedAgentPanelH()
+	statusH := 1
+	inputH := 1
+	askH := 0
+	if m.askResponse != "" {
+		askH = askResponseH
+		maxAskH := m.height * 2 / 5
+		if askH > maxAskH && maxAskH > 5 {
+			askH = maxAskH
+		}
+	}
+	middleH := m.height - headerH - watchH - agentH - statusH - inputH - askH
+
+	watchStart := headerH
+	watchEnd := watchStart + watchH
+	middleStart := watchEnd
+	middleEnd := middleStart + middleH
+
+	if y >= watchStart && y < watchEnd {
+		m.focusedPanel = focusWatch
+	} else if y >= middleStart && y < middleEnd {
+		m.focusedPanel = focusLog
+	}
+}
+
+// scrollAskUp scrolls the ask response panel up by n lines.
+func (m *Model) scrollAskUp(n int) {
+	m.askScrollY += n
+	m.clampAskScroll()
+}
+
+// scrollAskDown scrolls the ask response panel down by n lines.
+func (m *Model) scrollAskDown(n int) {
+	m.askScrollY -= n
+	m.clampAskScroll()
+}
+
+func (m *Model) clampAskScroll() {
+	if m.askLines <= maxAskResponseLines {
+		m.askScrollY = 0
+		return
+	}
+	maxScroll := m.askLines - maxAskResponseLines
+	if m.askScrollY > maxScroll {
+		m.askScrollY = maxScroll
+	}
+	if m.askScrollY < 0 {
+		m.askScrollY = 0
+	}
+}
+
 func (m *Model) appendLog(e logEntry) {
 	m.logs = append(m.logs, e)
 	if len(m.logs) > m.maxLogLines {
@@ -337,16 +529,9 @@ func (m *Model) appendLog(e logEntry) {
 }
 
 // computedWatchH returns the outer height of the watch panel.
+// Always uses maxWatchLines to keep a stable viewport height.
 func (m *Model) computedWatchH() int {
-	symCount := len(m.quotes)
-	rows := symCount + 1
-	if rows < 2 {
-		rows = 2
-	}
-	if rows > maxWatchLines+1 {
-		rows = maxWatchLines + 1
-	}
-	return 2 + 1 + rows // border(2) + panel header(1) + content rows
+	return 2 + 1 + 1 + maxWatchLines // border(2) + panel header(1) + table header(1) + data rows
 }
 
 // computedAgentPanelH returns the dynamic outer height of the agent panel.
@@ -362,15 +547,15 @@ func (m *Model) computedAgentPanelH() int {
 		}
 	}
 
-	contentLines := activeCount
+	contentLines := activeCount * 2
 	if hasCompleted {
-		contentLines += 2 // summary line + at least 1 result line
+		contentLines += 2
 	}
 	if contentLines == 0 {
-		contentLines = 1 // "No agent activity"
+		contentLines = 1
 	}
 
-	h := 2 + 1 + contentLines // border(2) + header(1) + content
+	h := 2 + 1 + contentLines
 	if h < minAgentPanelH {
 		h = minAgentPanelH
 	}
@@ -378,4 +563,22 @@ func (m *Model) computedAgentPanelH() int {
 		h = maxAgentPanelH
 	}
 	return h
+}
+
+// countRenderedLines estimates how many terminal lines a markdown string will
+// occupy after glamour rendering, given the available content width.
+func countRenderedLines(s string, width int) int {
+	if s == "" {
+		return 0
+	}
+	lines := strings.Split(s, "\n")
+	count := 0
+	for _, line := range lines {
+		if width > 0 && len(line) > width {
+			count += (len(line) + width - 1) / width
+		} else {
+			count++
+		}
+	}
+	return count
 }

@@ -20,6 +20,21 @@ environment: paper
 log:
   level: info               # debug | info | warn | error
   format: json              # json | text (json recommended for production)
+  file: logs/cerebro.log    # rotating log file; empty = no file output
+  max_size_mb: 100          # max file size in MB before rotation
+  max_backups: 5            # number of old log files to keep
+  max_age_days: 30          # max days to retain rotated log files
+
+# =============================================================================
+# LOG RETENTION (Postgres archival)
+# =============================================================================
+# Periodically moves old agent logs and audit events to archived_* tables
+# and purges them from hot tables. Only runs when DATABASE_URL is set.
+log_retention:
+  agent_logs_days: 90       # archive/purge agent runs/messages older than 90 days
+  audit_events_days: 180    # archive/purge audit events older than 180 days
+  archive_before_purge: true # move to archived_* tables before deleting
+  purge_interval_hours: 24  # run purge every 24 hours
 
 # =============================================================================
 # TRADING ENGINE
@@ -101,6 +116,10 @@ agent:
 
   # Total wall-clock deadline for one full agent invocation (all turns).
   timeout_total_seconds: 120
+
+  # Retry transient LLM errors (timeout/connection) this many times before failing.
+  # Each retry uses exponential backoff (1s, 2s, 4s). Set to 0 to disable.
+  retry_on_transient: 2
 
   # --- LLM providers ---
   llm:

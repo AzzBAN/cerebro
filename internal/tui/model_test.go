@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -454,22 +455,24 @@ func TestView_AgentPanelWithActiveAgents(t *testing.T) {
 
 	now := time.Now()
 	m.Update(AgentStateMsg{
-		Agent:    "screening",
-		RunID:    "run-1",
-		Step:     StepThinking,
-		Provider: "anthropic",
-		Model:    "claude-sonnet-4-6",
-		Symbol:   "BTC/USDT",
-		At:       now,
+		Agent:       "screening",
+		RunID:       "run-1",
+		Step:        StepThinking,
+		Provider:    "anthropic",
+		Model:       "claude-sonnet-4-6",
+		Description: "Analyzing BTC/USDT market conditions",
+		Symbol:      "BTC/USDT",
+		At:          now,
 	})
 	m.Update(AgentStateMsg{
-		Agent:    "copilot",
-		RunID:    "run-2",
-		Step:     StepTool,
-		ToolName: "get_positions",
-		Provider: "gemini",
-		Model:    "gemini-2.5-flash",
-		At:       now,
+		Agent:       "copilot",
+		RunID:       "run-2",
+		Step:        StepTool,
+		ToolName:    "get_positions",
+		Provider:    "gemini",
+		Model:       "gemini-2.5-flash",
+		Description: "Fetching open positions",
+		At:          now,
 	})
 
 	view := m.View()
@@ -478,11 +481,11 @@ func TestView_AgentPanelWithActiveAgents(t *testing.T) {
 	if !strings.Contains(plain, "screening") {
 		t.Error("screening agent not visible in view")
 	}
-	if !strings.Contains(plain, "THINKING") {
-		t.Error("THINKING step label not visible")
+	if !strings.Contains(plain, "Analyzing BTC/USDT market conditions") {
+		t.Error("description not visible in view")
 	}
-	if !strings.Contains(plain, "TOOL: get_positions") {
-		t.Error("tool call step not visible")
+	if !strings.Contains(plain, "Fetching open positions") {
+		t.Error("tool description not visible")
 	}
 	if !strings.Contains(plain, "copilot") {
 		t.Error("copilot agent not visible")
@@ -529,11 +532,13 @@ func TestView_ConcurrentAgents(t *testing.T) {
 	now := time.Now()
 	m.Update(AgentStateMsg{
 		Agent: "screening", RunID: "r1", Step: StepThinking,
-		Provider: "anthropic", Model: "claude-sonnet-4-6", Symbol: "BTC/USDT", At: now,
+		Provider: "anthropic", Model: "claude-sonnet-4-6", Symbol: "BTC/USDT",
+		Description: "Analyzing BTC/USDT market conditions", At: now,
 	})
 	m.Update(AgentStateMsg{
 		Agent: "copilot", RunID: "r2", Step: StepObserving,
-		Provider: "gemini", Model: "gemini-2.5-flash", At: now,
+		Provider: "gemini", Model: "gemini-2.5-flash",
+		Description: "Fetching open positions", At: now,
 	})
 	m.Update(AgentStateMsg{
 		Agent: "reviewer", RunID: "r3", Step: StepComplete,
@@ -550,8 +555,8 @@ func TestView_ConcurrentAgents(t *testing.T) {
 	if !strings.Contains(plain, "copilot") {
 		t.Error("active copilot agent missing")
 	}
-	if !strings.Contains(plain, "OBSERVING") {
-		t.Error("OBSERVING step label missing")
+	if !strings.Contains(plain, "Fetching open positions") {
+		t.Error("observing step description missing")
 	}
 	if !strings.Contains(plain, "reviewer") {
 		t.Error("completed reviewer missing")
@@ -829,4 +834,295 @@ func TestAsk_EscWithoutResponseQuits(t *testing.T) {
 		t.Error("expected quit command when pressing Esc without response")
 	}
 	_ = m2
+}
+
+func TestAsk_ScrollResponse(t *testing.T) {
+	m := New(500)
+	m.width = 100
+	m.height = 50
+	m.now = time.Now()
+	m.recalculateLayout()
+
+	// Simulate a long response via AskResponseMsg to populate askLines.
+	m.Update(AskResponseMsg{
+		Query:    "summary",
+		Response: strings.Repeat("line\n", 30),
+	})
+
+	if m.askLines == 0 {
+		t.Fatal("askLines should be populated after AskResponseMsg")
+	}
+	if m.askScrollY != 0 {
+		t.Fatalf("askScrollY should start at 0, got %d", m.askScrollY)
+	}
+
+	// Arrow keys should scroll when ask response is visible.
+	model, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m2 := model.(*Model)
+	if m2.askScrollY != 1 {
+		t.Fatalf("askScrollY should be 1 after Up, got %d", m2.askScrollY)
+	}
+
+	// Page Up.
+	model, _ = m2.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m3 := model.(*Model)
+	if m3.askScrollY <= 1 {
+		t.Fatalf("askScrollY should be >1 after PgUp, got %d", m3.askScrollY)
+	}
+
+	// Down.
+	prevScroll := m3.askScrollY
+	model, _ = m3.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m4 := model.(*Model)
+	if m4.askScrollY >= prevScroll {
+		t.Fatalf("askScrollY should decrease after Down, got %d (was %d)", m4.askScrollY, prevScroll)
+	}
+
+	// Esc dismisses.
+	model, _ = m4.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m5 := model.(*Model)
+	if m5.askResponse != "" {
+		t.Error("Esc should dismiss ask response")
+	}
+	if m5.askScrollY != 0 {
+		t.Error("askScrollY should reset on dismiss")
+	}
+}
+
+// ── Watch scroll / focus tests ─────────────────────────────────────────────────
+
+func TestWatchScroll_Vertical(t *testing.T) {
+	m := New(500)
+	m.width = 120
+	m.height = 40
+	m.now = time.Now()
+
+	symbols := []string{"AAA/USDT", "BBB/USDT", "CCC/USDT", "DDD/USDT", "EEE/USDT",
+		"FFF/USDT", "GGG/USDT", "HHH/USDT", "III/USDT", "JJJ/USDT"}
+	for i, sym := range symbols {
+		m.quotes[sym] = quoteState{
+			symbol: sym,
+			last:   float64(i) * 100,
+			bid:    float64(i)*100 - 1,
+			ask:    float64(i)*100 + 1,
+		}
+	}
+	m.recalculateLayout()
+
+	if m.watchScrollY != 0 {
+		t.Fatalf("initial watchScrollY should be 0, got %d", m.watchScrollY)
+	}
+
+	// Focus watch panel via Tab
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.focusedPanel != focusWatch {
+		t.Fatalf("expected focusWatch after 1 Tab, got %d", m.focusedPanel)
+	}
+
+	// Scroll down
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if m.watchScrollY != 0 {
+		t.Fatalf("watchScrollY should still be 0 (scrolled down = closer to bottom), got %d", m.watchScrollY)
+	}
+
+	// Scroll up
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if m.watchScrollY != 1 {
+		t.Fatalf("watchScrollY should be 1 after Up, got %d", m.watchScrollY)
+	}
+
+	// Verify the view shows different content
+	view := m.View()
+	plain := stripANSI(view)
+	if strings.Contains(plain, "AAA/USDT") {
+		t.Error("AAA should not be visible after scrolling down by 1")
+	}
+}
+
+func TestWatchScroll_ClampsAtEnd(t *testing.T) {
+	m := New(500)
+	m.width = 120
+	m.height = 40
+	m.now = time.Now()
+
+	for i := 0; i < 8; i++ {
+		sym := fmt.Sprintf("SYM%d/USDT", i)
+		m.quotes[sym] = quoteState{symbol: sym, last: float64(i) * 100}
+	}
+	m.recalculateLayout()
+	m.focusedPanel = focusWatch
+
+	m.watchScrollY = 100
+	m.clampWatchScrollY()
+
+	expected := 8 - maxWatchLines
+	if m.watchScrollY != expected {
+		t.Errorf("watchScrollY should clamp to %d, got %d", expected, m.watchScrollY)
+	}
+
+	m.watchScrollY = -5
+	m.clampWatchScrollY()
+	if m.watchScrollY != 0 {
+		t.Errorf("watchScrollY should clamp to 0, got %d", m.watchScrollY)
+	}
+}
+
+func TestWatchFocus_TabCycles(t *testing.T) {
+	m := New(500)
+	m.width = 80
+	m.height = 24
+	m.now = time.Now()
+	m.recalculateLayout()
+
+	if m.focusedPanel != focusNone {
+		t.Fatalf("initial focus should be none, got %d", m.focusedPanel)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.focusedPanel != focusWatch {
+		t.Fatalf("after 1 Tab, expected focusWatch, got %d", m.focusedPanel)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.focusedPanel != focusLog {
+		t.Fatalf("after 2 Tabs, expected focusLog, got %d", m.focusedPanel)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.focusedPanel != focusNone {
+		t.Fatalf("after 3 Tabs, expected focusNone, got %d", m.focusedPanel)
+	}
+}
+
+func TestWatchFocus_ArrowsScrollWhenFocused(t *testing.T) {
+	m := New(500)
+	m.width = 120
+	m.height = 40
+	m.now = time.Now()
+
+	for i := 0; i < 10; i++ {
+		sym := fmt.Sprintf("SYM%d/USDT", i)
+		m.quotes[sym] = quoteState{symbol: sym, last: float64(i) * 100}
+	}
+	m.recalculateLayout()
+
+	// Without focus, arrow keys scroll log — add enough logs to exceed viewport
+	for i := 0; i < 30; i++ {
+		m.appendLog(logEntry{ts: time.Now(), level: "INFO", text: "log line"})
+	}
+	m.clampLogScroll()
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if m.logScrollY != 1 {
+		t.Fatalf("without focus, Up should scroll log, logScrollY=%d", m.logScrollY)
+	}
+	if m.watchScrollY != 0 {
+		t.Fatalf("without focus, Up should not scroll watch, watchScrollY=%d", m.watchScrollY)
+	}
+
+	// With watch focus, arrow keys scroll watch
+	m.focusedPanel = focusWatch
+	m.logScrollY = 0
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if m.watchScrollY != 1 {
+		t.Fatalf("with watch focus, Up should scroll watch, watchScrollY=%d", m.watchScrollY)
+	}
+	if m.logScrollY != 0 {
+		t.Fatalf("with watch focus, Up should not scroll log, logScrollY=%d", m.logScrollY)
+	}
+}
+
+func TestWatchScroll_Horizontal(t *testing.T) {
+	m := New(500)
+	m.width = 60
+	m.height = 24
+	m.now = time.Now()
+
+	m.quotes["BTC/USDT"] = quoteState{
+		symbol:      "BTC/USDT",
+		last:        50000,
+		bid:         49999,
+		ask:         50001,
+		priceChange: 200,
+		volume24h:   1.2e9,
+	}
+	m.recalculateLayout()
+	m.focusedPanel = focusWatch
+
+	totalW := watchTotalContentWidth()
+	availW := m.watchContentWidth()
+	if totalW <= availW {
+		t.Skip("content fits, no horizontal scroll needed")
+	}
+
+	if m.watchScrollX != 0 {
+		t.Fatalf("initial watchScrollX should be 0, got %d", m.watchScrollX)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if m.watchScrollX != watchScrollXStep {
+		t.Fatalf("watchScrollX should be %d after Right, got %d", watchScrollXStep, m.watchScrollX)
+	}
+
+	view := m.View()
+	plain := stripANSI(view)
+	if !strings.Contains(plain, "←") {
+		t.Error("expected ← scroll indicator after scrolling right")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if m.watchScrollX != 0 {
+		t.Fatalf("watchScrollX should be 0 after Left, got %d", m.watchScrollX)
+	}
+}
+
+func TestWatchFocus_MouseClick(t *testing.T) {
+	m := New(500)
+	m.width = 100
+	m.height = 30
+	m.now = time.Now()
+
+	m.quotes["BTC/USDT"] = quoteState{symbol: "BTC/USDT", last: 50000}
+	m.heartbeat = "state=running"
+	m.heartbeatAt = time.Now()
+	m.recalculateLayout()
+
+	if m.focusedPanel != focusNone {
+		t.Fatalf("initial focus should be none, got %d", m.focusedPanel)
+	}
+
+	watchH := m.computedWatchH()
+	m.Update(tea.MouseMsg{Type: tea.MouseLeft, X: 10, Y: 2})
+	if m.focusedPanel != focusWatch {
+		t.Errorf("clicking in watch area (y=2, watchH=%d) should set focusWatch, got %d", watchH, m.focusedPanel)
+	}
+
+	middleStart := 1 + watchH
+	m.Update(tea.MouseMsg{Type: tea.MouseLeft, X: 10, Y: middleStart + 1})
+	if m.focusedPanel != focusLog {
+		t.Errorf("clicking in middle area (y=%d) should set focusLog, got %d", middleStart+1, m.focusedPanel)
+	}
+}
+
+func TestWatchFocus_MouseWheel(t *testing.T) {
+	m := New(500)
+	m.width = 120
+	m.height = 40
+	m.now = time.Now()
+
+	for i := 0; i < 10; i++ {
+		sym := fmt.Sprintf("SYM%d/USDT", i)
+		m.quotes[sym] = quoteState{symbol: sym, last: float64(i) * 100}
+	}
+	m.recalculateLayout()
+	m.focusedPanel = focusWatch
+
+	m.Update(tea.MouseMsg{Type: tea.MouseWheelUp, X: 50, Y: 3})
+	if m.watchScrollY != 1 {
+		t.Fatalf("mouse wheel up on focused watch: expected watchScrollY=1, got %d", m.watchScrollY)
+	}
+
+	m.Update(tea.MouseMsg{Type: tea.MouseWheelDown, X: 50, Y: 3})
+	if m.watchScrollY != 0 {
+		t.Fatalf("mouse wheel down on focused watch: expected watchScrollY=0, got %d", m.watchScrollY)
+	}
 }

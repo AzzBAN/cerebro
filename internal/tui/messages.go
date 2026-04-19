@@ -41,7 +41,7 @@ type OrderMsg struct{ Line string }
 type PositionsMsg struct{ Positions []domain.Position }
 
 // watchTickMsg is fired every 5 seconds to rotate the market watch panel.
-type watchTickMsg time.Time
+// Removed: replaced with manual scrolling.
 
 // clockTickMsg is fired every second to update the live clock.
 type clockTickMsg time.Time
@@ -60,17 +60,18 @@ const (
 
 // AgentStateMsg updates the live state of a running agent in the agent panel.
 type AgentStateMsg struct {
-	Agent    string
-	RunID    string
-	Step     AgentStep
-	ToolName string
-	Provider string
-	Model    string
-	Content  string // markdown result on COMPLETE, error message on ERROR
-	Symbol   string
-	StepNum  int // 1-based step counter in the ReAct loop
-	MaxSteps int // configured turn limit
-	At       time.Time
+	Agent       string
+	RunID       string
+	Step        AgentStep
+	ToolName    string
+	Provider    string
+	Model       string
+	Content     string // markdown result on COMPLETE, error message on ERROR
+	Description string // human-readable context, e.g. "Analyzing BTCUSDT market conditions"
+	Symbol      string
+	StepNum     int // 1-based step counter in the ReAct loop
+	MaxSteps    int // configured turn limit
+	At          time.Time
 }
 
 // ─── Lipgloss styles ─────────────────────────────────────────────────────────
@@ -80,6 +81,10 @@ var (
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	borderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	focusedBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("14")).
+				Padding(0, 1)
 	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 
 	// Log level badges
@@ -126,19 +131,20 @@ type logEntry struct {
 // ─── Agent run state ──────────────────────────────────────────────────────────
 
 type agentRunState struct {
-	agent    string
-	runID    string
-	step     AgentStep
-	toolName string
-	provider string
-	model    string
-	content  string // completed result (markdown)
-	symbol   string
-	stepNum  int // 1-based step counter in the ReAct loop
-	maxSteps int // configured turn limit
-	started  time.Time
-	finished time.Time
-	err      string
+	agent       string
+	runID       string
+	step        AgentStep
+	toolName    string
+	provider    string
+	model       string
+	content     string // completed result (markdown)
+	description string // human-readable context
+	symbol      string
+	stepNum     int // 1-based step counter in the ReAct loop
+	maxSteps    int // configured turn limit
+	started     time.Time
+	finished    time.Time
+	err         string
 }
 
 // AskResponseMsg carries the copilot's response back to the TUI model.
@@ -166,14 +172,27 @@ func newAskCmd(query string, fn func(ctx context.Context, query string) (string,
 // maxWatchLines caps how many symbols the watch panel shows at once.
 const maxWatchLines = 6
 
+// watchScrollXStep is the number of characters to scroll horizontally per key press.
+const watchScrollXStep = 5
+
+// Watch panel column widths.
+const (
+	colSymbol = 14
+	colLast   = 13
+	colChg    = 22
+	colBidAsk = 25
+	colSpread = 9
+	colVol    = 10
+)
+
 // minAgentPanelH is the minimum outer height of the agent panel (border 2 + header 1 + min content 3).
 const minAgentPanelH = 6
 
 // maxAgentPanelH caps the agent panel height so it doesn't consume too much space.
 const maxAgentPanelH = 12
 
-// maxAskResponseLines is the maximum number of lines for the /ask response display.
-const maxAskResponseLines = 4
+// maxAskResponseLines is the maximum number of visible lines for the /ask response display.
+const maxAskResponseLines = 15
 
 // askResponseH is the outer height of the ask response panel when visible.
 const askResponseH = 2 + 1 + maxAskResponseLines

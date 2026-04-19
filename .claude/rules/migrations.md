@@ -1,8 +1,8 @@
 # Database Migrations
 
-## Tool: Goose
+## Tool: golang-migrate
 
-Migrations are managed by **Goose** (Docker Compose profile `migrate`). Use the `migrate-up` / `migrate-down` Makefile targets for local development.
+Migrations are managed by **golang-migrate** (`migrate` CLI). Use the `migrate-up` / `migrate-down` Makefile targets for local development.
 
 ```bash
 make migrate-up    # applies all pending migrations
@@ -47,5 +47,6 @@ CREATE INDEX IF NOT EXISTS idx_order_intents_symbol ON order_intents (symbol);
 | `001_initial_schema` | `order_intents`, `trades` |
 | `002_agent_tables` | Agent log tables |
 | `003_audit_events` | `audit_events` |
+| `004_log_archival` | Log archival tables |
 
 Never modify a migration that has already been applied in any environment. Write a new migration instead.
