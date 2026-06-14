@@ -19,7 +19,16 @@ type OrderRequest struct {
 // OrderResponse is the result returned to the sender.
 type OrderResponse struct {
 	BrokerOrderID string
-	Err           error
+	// Bracket is populated when the intent carried StopLoss / TakeProfit1
+	// and the post-entry bracket placement succeeded. An empty Bracket with
+	// a nil Err means the entry went through but no bracket was requested.
+	Bracket domain.BracketResponse
+	// BracketErr, when non-nil, signals that the entry order submitted but
+	// the protective bracket did not. Operators must treat this as an
+	// unprotected position: either retry bracket placement, fall back to
+	// the client-side Monitor, or flatten the position immediately.
+	BracketErr error
+	Err        error
 }
 
 // Worker serialises order submissions for a single venue.
@@ -30,6 +39,7 @@ type Worker struct {
 	store   port.TradeStore
 	audit   port.AuditStore
 	cache   port.Cache
+	tracker *BracketTracker
 	inputCh <-chan OrderRequest
 }
 
@@ -40,6 +50,7 @@ func NewWorker(
 	store port.TradeStore,
 	audit port.AuditStore,
 	cache port.Cache,
+	tracker *BracketTracker,
 	inputCh <-chan OrderRequest,
 ) *Worker {
 	return &Worker{
@@ -48,6 +59,7 @@ func NewWorker(
 		store:   store,
 		audit:   audit,
 		cache:   cache,
+		tracker: tracker,
 		inputCh: inputCh,
 	}
 }
@@ -55,10 +67,14 @@ func NewWorker(
 // Run processes order requests sequentially until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
 	slog.Info("execution worker started", "venue", w.venue)
+	// Always emit a "stopping" message so log analysis can pair Run-entry
+	// with Run-exit. Previously the input-channel-closed path returned
+	// silently, producing a `started > stopping` mismatch in production
+	// logs (~6 leaked terminations across 126 sessions).
+	defer slog.Info("execution worker stopping", "venue", w.venue)
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("execution worker stopping", "venue", w.venue)
 			return nil
 		case req, ok := <-w.inputCh:
 			if !ok {
@@ -119,9 +135,86 @@ func (w *Worker) process(ctx context.Context, intent domain.OrderIntent) OrderRe
 		"symbol":          string(intent.Symbol),
 		"side":            string(intent.Side),
 		"quantity":        intent.Quantity.String(),
+		"order_type":      string(intent.OrderTypeOrDefault()),
 	})
 
-	return OrderResponse{BrokerOrderID: brokerID}
+	// 5. Attach protective bracket when the intent requested one.
+	//
+	// This runs sequentially inside the per-venue worker goroutine so we
+	// preserve the single-writer invariant. On spot/live the bracket is a
+	// Binance OCO attached to the position; on futures it's a pair of
+	// STOP_MARKET + TAKE_PROFIT_MARKET algo orders. Paper brokers simulate
+	// OCO-style triggers against future candles.
+	//
+	// For MARKET entries the position is effectively open the moment the
+	// broker accepts the order, so we can place the bracket immediately.
+	// For LIMIT / STOP_LIMIT entries the fill may be delayed; Phase D.2
+	// will move bracket placement onto the user-data fill event. For now,
+	// the safety net is the client-side Monitor, which still checks
+	// intent.StopLoss each tick.
+	if !intent.HasBracket() {
+		return OrderResponse{BrokerOrderID: brokerID}
+	}
+	if intent.OrderTypeOrDefault() != domain.OrderTypeMarket {
+		log.Debug("bracket placement deferred for non-market entry; Monitor acts as fallback",
+			"order_type", intent.OrderType)
+		return OrderResponse{BrokerOrderID: brokerID}
+	}
+
+	bracketReq := domain.BracketRequest{
+		ParentIntentID: intent.ID,
+		CorrelationID:  intent.CorrelationID,
+		Symbol:         intent.Symbol,
+		Venue:          intent.Venue,
+		Side:           intent.Side,
+		Quantity:       intent.Quantity,
+		StopLoss:       intent.StopLoss,
+		TakeProfit:     intent.TakeProfit1,
+		ScaleOutPct:    intent.ScaleOutPct,
+		TIF:            intent.TIF,
+		PositionSide:   intent.PositionSide,
+	}
+	bracket, berr := w.broker.PlaceBracket(ctx, bracketReq)
+	if berr != nil {
+		log.Error("bracket placement failed; position may be unprotected",
+			"error", berr,
+			"stop", intent.StopLoss.String(), "tp", intent.TakeProfit1.String())
+		_ = w.saveAudit(ctx, "bracket_failed", map[string]any{
+			"intent_id":       intent.ID,
+			"broker_order_id": brokerID,
+			"symbol":          string(intent.Symbol),
+			"error":           berr.Error(),
+		})
+		return OrderResponse{
+			BrokerOrderID: brokerID,
+			Bracket:       bracket, // may be partial (stop OK, TP failed)
+			BracketErr:    berr,
+		}
+	}
+
+	log.Info("bracket attached",
+		"stop_order_id", bracket.StopOrderID,
+		"tp_order_id", bracket.TakeProfitOrderID,
+		"list_id", bracket.ListID,
+	)
+	_ = w.saveAudit(ctx, "bracket_attached", map[string]any{
+		"intent_id":         intent.ID,
+		"stop_order_id":     bracket.StopOrderID,
+		"tp_order_id":       bracket.TakeProfitOrderID,
+		"list_id":           bracket.ListID,
+		"symbol":            string(intent.Symbol),
+		"stop_price":        intent.StopLoss.String(),
+		"take_profit_price": intent.TakeProfit1.String(),
+	})
+
+	if w.tracker != nil {
+		w.tracker.Record(intent.Symbol, bracket)
+	}
+
+	return OrderResponse{
+		BrokerOrderID: brokerID,
+		Bracket:       bracket,
+	}
 }
 
 func (w *Worker) saveAudit(ctx context.Context, evtType string, payload map[string]any) error {
