@@ -493,7 +493,7 @@ func (b *FuturesBroker) Positions(_ context.Context) ([]domain.Position, error) 
 // levels, Strategy, CorrelationID — is carried forward from any existing entry.
 // This is the recovery path for user-data WS events that were missed or never
 // delivered.
-func (b *FuturesBroker) applyPositionSnapshot(snapshot map[domain.Symbol]domain.Position) {
+func (b *FuturesBroker) applyPositionSnapshot(snapshot map[domain.Symbol]domain.Position, detected map[domain.Symbol]protectiveOrders) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -513,6 +513,7 @@ func (b *FuturesBroker) applyPositionSnapshot(snapshot map[domain.Symbol]domain.
 		next[sym] = pos
 	}
 	b.positions = next
+	b.protective = detected
 }
 
 // Balance returns the current futures wallet balance.
@@ -538,12 +539,13 @@ func (b *FuturesBroker) Balance(ctx context.Context) (port.AccountBalance, error
 }
 
 func (b *FuturesBroker) bootstrapPositions(ctx context.Context) error {
-	snapshot, err := b.fetchPositionSnapshot(ctx)
+	snapshot, detected, err := b.fetchPositionSnapshot(ctx)
 	if err != nil {
 		return err
 	}
 	b.mu.Lock()
 	b.positions = snapshot
+	b.protective = detected
 	b.mu.Unlock()
 	return nil
 }
@@ -551,10 +553,10 @@ func (b *FuturesBroker) bootstrapPositions(ctx context.Context) error {
 // fetchPositionSnapshot queries the futures account REST endpoint and returns
 // the authoritative open-position map. Shared by bootstrap (replace) and the
 // periodic resync (merge via applyPositionSnapshot).
-func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.Symbol]domain.Position, error) {
+func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.Symbol]domain.Position, map[domain.Symbol]protectiveOrders, error) {
 	account, err := b.client.NewGetAccountService().Do(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("binance futures get account: %w", err)
+		return nil, nil, fmt.Errorf("binance futures get account: %w", err)
 	}
 
 	next := make(map[domain.Symbol]domain.Position)
@@ -566,7 +568,7 @@ func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.S
 		markStr := deriveFuturesMarkPrice(p.Notional, p.PositionAmt)
 		pos, ok, err := futuresAccountPositionToDomain(p.Symbol, p.PositionAmt, p.EntryPrice, markStr)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !ok {
 			continue
@@ -593,8 +595,8 @@ func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.S
 
 	openOrders, ooErr := b.client.NewListOpenOrdersService().Do(ctx)
 	if ooErr != nil {
-		slog.Warn("futures open-orders fetch for SL/TP detection failed", "error", ooErr)
-		return next, nil
+		slog.WarnContext(ctx, "futures open-orders fetch for SL/TP detection failed", "err", ooErr)
+		return next, nil, nil
 	}
 	stops, tps, ids := detectProtectiveLevels(openOrders)
 	detected := make(map[domain.Symbol]protectiveOrders, len(ids))
@@ -619,23 +621,20 @@ func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.S
 		next[sym] = pos
 		detected[sym] = po
 	}
-	b.mu.Lock()
-	b.protective = detected
-	b.mu.Unlock()
 
-	return next, nil
+	return next, detected, nil
 }
 
 // resyncPositions fetches an authoritative REST snapshot and merges it into the
 // cache, recovering any open/close the user-data WS stream missed. Errors are
 // logged, not fatal — the next tick retries.
 func (b *FuturesBroker) resyncPositions(ctx context.Context) {
-	snapshot, err := b.fetchPositionSnapshot(ctx)
+	snapshot, detected, err := b.fetchPositionSnapshot(ctx)
 	if err != nil {
-		slog.Warn("futures position resync failed", "error", err)
+		slog.WarnContext(ctx, "futures position resync failed", "err", err)
 		return
 	}
-	b.applyPositionSnapshot(snapshot)
+	b.applyPositionSnapshot(snapshot, detected)
 }
 
 func (b *FuturesBroker) runUserDataStream(ctx context.Context) {
@@ -907,6 +906,8 @@ func detectProtectiveLevels(orders []*gobinancefutures.Order) (
 			continue
 		}
 		cur := ids[o.Symbol]
+		// If a symbol has multiple orders of the same type, the last one seen
+		// wins — Binance should only have one live protective order per leg.
 		switch o.Type {
 		case orderTypeStopMarket:
 			stops[o.Symbol] = px

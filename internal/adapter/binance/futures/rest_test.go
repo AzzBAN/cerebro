@@ -59,7 +59,7 @@ func TestApplyPositionSnapshot_Resync(t *testing.T) {
 		},
 	}
 
-	b.applyPositionSnapshot(snapshot)
+	b.applyPositionSnapshot(snapshot, nil)
 
 	// ETH must be dropped (closed on the exchange).
 	if _, ok := b.positions[eth]; ok {
@@ -287,19 +287,66 @@ func TestFuturesAccountPositionToDomain_CurrentPriceIsMark(t *testing.T) {
 }
 
 func TestDetectProtectiveLevels_Futures(t *testing.T) {
-	orders := []*gobinancefutures.Order{
-		{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", ClosePosition: true, OrderID: 111},
-		{Symbol: "BTCUSDT", Type: orderTypeTakeProfitMarket, StopPrice: "70000", ClosePosition: true, OrderID: 222},
-		{Symbol: "BTCUSDT", Type: gobinancefutures.OrderTypeLimit, Price: "65000", OrderID: 333}, // ignored
+	tests := []struct {
+		name      string
+		orders    []*gobinancefutures.Order
+		wantStop  string // "" = expect no stop entry
+		wantTP    string // "" = expect no tp entry
+		wantStopID string
+		wantTPID   string
+	}{
+		{
+			name: "closePosition stop+tp pair, limit ignored",
+			orders: []*gobinancefutures.Order{
+				{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", ClosePosition: true, OrderID: 111},
+				{Symbol: "BTCUSDT", Type: orderTypeTakeProfitMarket, StopPrice: "70000", ClosePosition: true, OrderID: 222},
+				{Symbol: "BTCUSDT", Type: gobinancefutures.OrderTypeLimit, Price: "65000", OrderID: 333}, // ignored
+			},
+			wantStop: "60000", wantTP: "70000", wantStopID: "111", wantTPID: "222",
+		},
+		{
+			name: "reduceOnly (not closePosition) is still protective",
+			orders: []*gobinancefutures.Order{
+				{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", ReduceOnly: true, OrderID: 11},
+				{Symbol: "BTCUSDT", Type: orderTypeTakeProfitMarket, StopPrice: "70000", ReduceOnly: true, OrderID: 22},
+			},
+			wantStop: "60000", wantTP: "70000", wantStopID: "11", wantTPID: "22",
+		},
+		{
+			name: "stop-only leg leaves tp empty",
+			orders: []*gobinancefutures.Order{
+				{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", ClosePosition: true, OrderID: 111},
+			},
+			wantStop: "60000", wantTP: "", wantStopID: "111", wantTPID: "",
+		},
+		{
+			name: "non-protective order (no closePosition, no reduceOnly) ignored",
+			orders: []*gobinancefutures.Order{
+				{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", OrderID: 111},
+			},
+			wantStop: "", wantTP: "", wantStopID: "", wantTPID: "",
+		},
 	}
-	sl, tp, ids := detectProtectiveLevels(orders)
-	if !sl["BTCUSDT"].Equal(decimal.RequireFromString("60000")) {
-		t.Errorf("stop = %s, want 60000", sl["BTCUSDT"])
-	}
-	if !tp["BTCUSDT"].Equal(decimal.RequireFromString("70000")) {
-		t.Errorf("tp = %s, want 70000", tp["BTCUSDT"])
-	}
-	if ids["BTCUSDT"].StopOrderID != "111" || ids["BTCUSDT"].TakeProfitOrderID != "222" {
-		t.Errorf("ids = %+v, want stop=111 tp=222", ids["BTCUSDT"])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sl, tp, ids := detectProtectiveLevels(tt.orders)
+			if tt.wantStop == "" {
+				if _, ok := sl["BTCUSDT"]; ok {
+					t.Errorf("stop = %s, want none", sl["BTCUSDT"])
+				}
+			} else if !sl["BTCUSDT"].Equal(decimal.RequireFromString(tt.wantStop)) {
+				t.Errorf("stop = %s, want %s", sl["BTCUSDT"], tt.wantStop)
+			}
+			if tt.wantTP == "" {
+				if _, ok := tp["BTCUSDT"]; ok {
+					t.Errorf("tp = %s, want none", tp["BTCUSDT"])
+				}
+			} else if !tp["BTCUSDT"].Equal(decimal.RequireFromString(tt.wantTP)) {
+				t.Errorf("tp = %s, want %s", tp["BTCUSDT"], tt.wantTP)
+			}
+			if ids["BTCUSDT"].StopOrderID != tt.wantStopID || ids["BTCUSDT"].TakeProfitOrderID != tt.wantTPID {
+				t.Errorf("ids = %+v, want stop=%q tp=%q", ids["BTCUSDT"], tt.wantStopID, tt.wantTPID)
+			}
+		})
 	}
 }
