@@ -10,15 +10,19 @@ const (
 	CmdResume    = "/resume"
 	CmdBias      = "/bias"
 	CmdPositions = "/positions"
+	CmdClose     = "/close"
+	CmdConfirm   = "/confirm"
+	CmdReject    = "/reject"
 	CmdAsk       = "/ask"
 	CmdSummary   = "/summary"
+	CmdHelp      = "/help"
 )
 
 // Permission describes what a command requires.
 type Permission struct {
-	RequiresOperator      bool
-	RequiresConfirmation  bool
-	ConfirmationTimeoutS  int
+	RequiresOperator     bool
+	RequiresConfirmation bool
+	ConfirmationTimeoutS int
 }
 
 // commandPermissions maps each command to its permission requirements.
@@ -29,8 +33,12 @@ var commandPermissions = map[string]Permission{
 	CmdResume:    {RequiresOperator: true},
 	CmdBias:      {RequiresOperator: true},
 	CmdPositions: {RequiresOperator: true},
+	CmdClose:     {RequiresOperator: true, RequiresConfirmation: true, ConfirmationTimeoutS: 30},
+	CmdConfirm:   {RequiresOperator: true},
+	CmdReject:    {RequiresOperator: true},
 	CmdAsk:       {RequiresOperator: true},
 	CmdSummary:   {RequiresOperator: true},
+	CmdHelp:      {RequiresOperator: true},
 }
 
 // ParseCommand extracts the command name and argument from a raw input string.

@@ -198,6 +198,17 @@ func (q *ActionQueue) Tick(ctx context.Context) {
 	}
 }
 
+// Owns reports whether this queue holds an item with the given ID, regardless
+// of status. ChatOps /confirm and /reject receive a bare UUID with no venue
+// prefix, so the wiring closure calls Owns to route the ID to the per-venue
+// queue that holds it before calling Confirm/Reject.
+func (q *ActionQueue) Owns(id string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	_, ok := q.items[id]
+	return ok
+}
+
 // Pending returns a snapshot of all currently pending items.
 func (q *ActionQueue) Pending() []*QueuedAction {
 	q.mu.Lock()

@@ -458,14 +458,41 @@ func (a *App) runRuntime(ctx context.Context) error {
 		}
 		allowlistFn = func(actorID string) bool { return allowed[actorID] }
 	}
+
+	// pmQueues holds the per-venue action queues created when the position
+	// manager is enabled, so ChatOps /confirm and /reject can resolve an
+	// action ID to the queue that owns it. It is declared here (before the
+	// dispatcher) and populated later in the errgroup wiring loop; the
+	// confirm/reject closures capture it by reference and only run when a
+	// command fires — long after the map is fully populated.
+	pmQueues := make(map[domain.Venue]*execution.ActionQueue)
+	confirmActionFn := func(ctx context.Context, id string) error {
+		for _, q := range pmQueues {
+			if q.Owns(id) {
+				return q.Confirm(ctx, id)
+			}
+		}
+		return fmt.Errorf("no pending action with id %q", id)
+	}
+	rejectActionFn := func(id string) error {
+		for _, q := range pmQueues {
+			if q.Owns(id) {
+				return q.Reject(id)
+			}
+		}
+		return fmt.Errorf("no pending action with id %q", id)
+	}
+
 	chatopsDispatcher := chatops.New(chatops.Deps{
-		RiskGate:    gate,
-		Cache:       cache,
-		Brokers:     brokerList,
-		AuditStore:  audit,
-		CopilotFn:   copilotFn,
-		AllowlistFn: allowlistFn,
-		CloseFn:     buildCloseFn(router, env),
+		RiskGate:        gate,
+		Cache:           cache,
+		Brokers:         brokerList,
+		AuditStore:      audit,
+		CopilotFn:       copilotFn,
+		AllowlistFn:     allowlistFn,
+		CloseFn:         buildCloseFn(router, env),
+		ConfirmActionFn: confirmActionFn,
+		RejectActionFn:  rejectActionFn,
 	}, confirmTimeout)
 
 	if tgBot != nil {
@@ -481,11 +508,6 @@ func (a *App) runRuntime(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	bracketTracker := execution.NewBracketTracker()
-
-	// pmQueues holds the per-venue action queues created when the position
-	// manager is enabled, so ChatOps /confirm and /reject can resolve an
-	// action ID to the queue that owns it.
-	pmQueues := make(map[domain.Venue]*execution.ActionQueue)
 
 	for _, venue := range activeVenues {
 		venue := venue
