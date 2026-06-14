@@ -350,3 +350,41 @@ func TestDetectProtectiveLevels_Futures(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleAccountUpdate_CarriesExternallyProtected guards the carry-forward of
+// the ExternallyProtected flag across a user-data ACCOUNT_UPDATE event. Without
+// it, a funding-fee/margin/partial-fill event between REST resyncs would leave a
+// position with its SL/TP levels intact but ExternallyProtected=false, causing
+// the reconciler to lay a duplicate Cerebro bracket over the operator's own
+// exchange-side STOP_MARKET/TAKE_PROFIT_MARKET orders.
+func TestHandleAccountUpdate_CarriesExternallyProtected(t *testing.T) {
+	b := NewFuturesBroker(nil, "mainnet")
+	sym, _ := domain.NormalizeExchangeSymbol("BTCUSDT", domain.ContractFuturesPerp)
+	b.positions[sym] = domain.Position{
+		Symbol:              sym,
+		Venue:               domain.VenueBinanceFutures,
+		Side:                domain.SideBuy,
+		Quantity:            decimal.RequireFromString("0.033"),
+		EntryPrice:          decimal.RequireFromString("77325.80"),
+		CurrentPrice:        decimal.RequireFromString("77325.80"),
+		StopLoss:            decimal.RequireFromString("75000"),
+		TakeProfit1:         decimal.RequireFromString("80000"),
+		Leverage:            125,
+		ExternallyProtected: true,
+	}
+
+	// A routine price-only ACCOUNT_UPDATE (no SL/TP, no detection re-run).
+	msg := []byte(`{"e":"ACCOUNT_UPDATE","a":{"P":[{"s":"BTCUSDT","pa":"0.033","ep":"77325.80","mp":"77500.00"}]}}`)
+	if err := b.handleAccountUpdate(msg); err != nil {
+		t.Fatalf("handleAccountUpdate: %v", err)
+	}
+
+	got := b.positions[sym]
+	if !got.ExternallyProtected {
+		t.Error("ExternallyProtected must be carried forward across an ACCOUNT_UPDATE event")
+	}
+	if !got.StopLoss.Equal(decimal.RequireFromString("75000")) ||
+		!got.TakeProfit1.Equal(decimal.RequireFromString("80000")) {
+		t.Errorf("SL/TP not preserved: got SL=%s TP=%s", got.StopLoss, got.TakeProfit1)
+	}
+}

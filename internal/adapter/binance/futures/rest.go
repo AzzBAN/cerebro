@@ -773,6 +773,11 @@ func (b *FuturesBroker) handleAccountUpdate(message []byte) error {
 			pos.Strategy = existing.Strategy
 			pos.CorrelationID = existing.CorrelationID
 			pos.Leverage = existing.Leverage
+			// Carry forward the externally-protected flag: a user-data event
+			// must not reset it, or the reconciler would lay a duplicate Cerebro
+			// bracket on top of the operator's exchange-side SL/TP before the
+			// next REST resync re-detects it.
+			pos.ExternallyProtected = existing.ExternallyProtected
 			// Carry forward margin/isolated by default; the WS payload is
 			// updated below only when the relevant fields are present.
 			pos.Margin = existing.Margin
