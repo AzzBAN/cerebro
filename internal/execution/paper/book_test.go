@@ -159,3 +159,53 @@ func TestBook_MultipleOrdersAndFills(t *testing.T) {
 		t.Errorf("expected 2 positions, got %d", len(positions))
 	}
 }
+
+func TestBook_Fill_ReduceOnlyFlattens(t *testing.T) {
+	b := NewBook()
+	now := time.Now().UTC()
+
+	// Open a long 1.0 BTC.
+	b.AddOrder(domain.OrderIntent{
+		ID: "entry", Symbol: "BTCUSDT", Side: domain.SideBuy,
+		Quantity: decimal.NewFromInt(1),
+	})
+	b.Fill("entry", decimal.NewFromInt(100), now)
+
+	// Reduce-only opposite-side fill for the full quantity should flatten.
+	b.AddOrder(domain.OrderIntent{
+		ID: "close", Symbol: "BTCUSDT", Side: domain.SideSell,
+		Quantity: decimal.NewFromInt(1), ReduceOnly: true,
+	})
+	b.Fill("close", decimal.NewFromInt(110), now)
+
+	if got := len(b.Positions()); got != 0 {
+		t.Fatalf("expected position flattened, got %d positions", got)
+	}
+}
+
+func TestBook_Fill_ReduceOnlyPartial(t *testing.T) {
+	b := NewBook()
+	now := time.Now().UTC()
+	b.AddOrder(domain.OrderIntent{
+		ID: "entry", Symbol: "BTCUSDT", Side: domain.SideBuy,
+		Quantity: decimal.NewFromInt(2),
+	})
+	b.Fill("entry", decimal.NewFromInt(100), now)
+
+	b.AddOrder(domain.OrderIntent{
+		ID: "reduce", Symbol: "BTCUSDT", Side: domain.SideSell,
+		Quantity: decimal.NewFromInt(1), ReduceOnly: true,
+	})
+	b.Fill("reduce", decimal.NewFromInt(110), now)
+
+	pos := b.Positions()
+	if len(pos) != 1 {
+		t.Fatalf("expected 1 position remaining, got %d", len(pos))
+	}
+	if !pos[0].Quantity.Equal(decimal.NewFromInt(1)) {
+		t.Errorf("expected qty 1 remaining, got %s", pos[0].Quantity)
+	}
+	if pos[0].Side != domain.SideBuy {
+		t.Errorf("expected side unchanged (BUY), got %s", pos[0].Side)
+	}
+}
