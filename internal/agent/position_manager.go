@@ -51,14 +51,14 @@ type positionManagerInput struct {
 
 // pmRawResponse is the JSON shape the LLM is asked to return.
 type pmRawResponse struct {
-	Action               string  `json:"action"`
-	Symbol               string  `json:"symbol"`
-	CorrelationID        string  `json:"correlation_id"`
-	Reasoning            string  `json:"reasoning"`
-	NewStop              float64 `json:"new_stop"`
-	CloseQuantity        string  `json:"close_quantity"`
-	Confidence           float64 `json:"confidence"`
-	RequiresConfirmation bool    `json:"requires_confirmation"`
+	Action               string      `json:"action"`
+	Symbol               string      `json:"symbol"`
+	CorrelationID        string      `json:"correlation_id"`
+	Reasoning            string      `json:"reasoning"`
+	NewStop              json.Number `json:"new_stop"`
+	CloseQuantity        string      `json:"close_quantity"`
+	Confidence           float64     `json:"confidence"`
+	RequiresConfirmation bool        `json:"requires_confirmation"`
 }
 
 // PositionManagerAgent reviews open positions and returns a ManagedAction.
@@ -202,7 +202,9 @@ func parsePMResponse(raw string) (domain.ManagedAction, error) {
 		action.Decision = domain.ActionHold
 	case "MOVE_STOP":
 		action.Decision = domain.ActionTightenStop
-		action.NewStopLoss = decimal.NewFromFloat(resp.NewStop)
+		if sl, err := decimal.NewFromString(resp.NewStop.String()); err == nil {
+			action.NewStopLoss = sl
+		}
 	case "PARTIAL_CLOSE":
 		action.Decision = domain.ActionClose
 		// A partial close carries an explicit quantity; a malformed or
