@@ -993,3 +993,20 @@ func (b *FuturesBroker) userDataEndpoint() string {
 		return gobinancefutures.BaseWsPrivateMainUrl
 	}
 }
+
+// ProtectiveBracket returns a BracketResponse describing the externally-set
+// protective orders detected for sym, suitable for CancelBracket. ok is false
+// when no externally-set protection is cached.
+func (b *FuturesBroker) ProtectiveBracket(sym domain.Symbol) (domain.BracketResponse, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	po, ok := b.protective[sym]
+	if !ok {
+		return domain.BracketResponse{}, false
+	}
+	return domain.BracketResponse{
+		Symbol:            sym,
+		StopOrderID:       po.StopOrderID,
+		TakeProfitOrderID: po.TakeProfitOrderID,
+	}, true
+}
