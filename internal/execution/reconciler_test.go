@@ -225,3 +225,33 @@ func TestReconciler_JobB_NoopWhenUnwired(t *testing.T) {
 	})
 	r.reviewPositions(context.Background()) // must not panic
 }
+
+func TestEnforceBrackets_SkipsExternallyProtected(t *testing.T) {
+	broker := &stubReconBroker{}
+	tracker := NewBracketTracker()
+	pos := domain.Position{
+		Symbol:              "BTC/USDT-PERP",
+		Venue:               domain.VenueBinanceFutures,
+		Side:                domain.SideBuy,
+		Quantity:            decimal.NewFromInt(1),
+		StopLoss:            decimal.NewFromInt(60000),
+		TakeProfit1:         decimal.NewFromInt(70000),
+		ExternallyProtected: true,
+	}
+	r := NewReconciler(ReconcilerDeps{
+		Venue:     domain.VenueBinanceFutures,
+		Broker:    broker,
+		Tracker:   tracker,
+		Router:    nil, // flatten must not be reached
+		Env:       domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{pos} },
+	})
+	r.enforceBrackets(context.Background())
+
+	if len(broker.placedBrackets) != 0 {
+		t.Errorf("expected no bracket placed, got %d", len(broker.placedBrackets))
+	}
+	if tracker.Has(pos.Symbol) {
+		t.Error("expected symbol not tracked")
+	}
+}

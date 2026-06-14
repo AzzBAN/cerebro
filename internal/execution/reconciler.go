@@ -112,6 +112,11 @@ func (r *Reconciler) enforceBrackets(ctx context.Context) {
 		if r.deps.Tracker.Has(pos.Symbol) {
 			continue
 		}
+		if pos.ExternallyProtected {
+			// Operator set SL/TP directly on the exchange. Respect it: do not
+			// flatten and do not attach a duplicate Cerebro bracket.
+			continue
+		}
 		if pos.StopLoss.IsZero() && pos.TakeProfit1.IsZero() {
 			slog.Warn("reconciler: position has no SL/TP levels to attach; flattening",
 				"symbol", pos.Symbol)
