@@ -99,9 +99,10 @@ func (f *testFallback) FetchLatest(ctx context.Context, asset string, limit int)
 	}
 
 	// Only fall back to the browser when the RE path is structurally
-	// broken. Transient errors (network/5xx) propagate to the caller so
-	// the runner can skip the tick and reuse the Redis cache.
-	if !errors.Is(err, ErrBadPayload) {
+	// broken (ErrBadPayload) or denied at the edge (ErrAntiBot). Other
+	// transient errors (network/5xx) propagate to the caller so the runner
+	// can skip the tick and reuse the Redis cache.
+	if !errors.Is(err, ErrBadPayload) && !errors.Is(err, ErrAntiBot) {
 		return nil, err
 	}
 
@@ -178,6 +179,27 @@ func TestFallback_CircuitBreaker_AlertsOnce(t *testing.T) {
 	// Browser should carry the load.
 	if b.calls.Load() < 5 {
 		t.Errorf("browser called %d times; want >=5 after breaker trip", b.calls.Load())
+	}
+}
+
+func TestFallback_AntiBot_FallsBackToBrowser(t *testing.T) {
+	// A Cloudflare 403 on the RE path must route to the browser, which
+	// presents a real fingerprint and can pass the challenge. This is the
+	// production failure: the pure-Go client is blocked at the edge while
+	// the headless browser still works.
+	p := &fakePrimary{err: fmt.Errorf("fetch: %w", ErrAntiBot)}
+	b := &fakeBrowser{items: []port.NewsItem{{ID: "b1"}}}
+	f := newTestFallback(p, b, nil)
+
+	items, err := f.FetchLatest(context.Background(), "", 10)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "b1" {
+		t.Fatalf("got %+v; want one item from browser", items)
+	}
+	if p.calls.Load() != 1 || b.calls.Load() != 1 {
+		t.Errorf("primary=%d, browser=%d; want 1 and 1", p.calls.Load(), b.calls.Load())
 	}
 }
 

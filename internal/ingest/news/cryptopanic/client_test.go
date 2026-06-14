@@ -217,8 +217,84 @@ func TestClient_RateLimitedDefaultCooldown(t *testing.T) {
 	}
 }
 
-// TestClient_Exhausts502 verifies the client gives up after maxAttempts
-// of repeated 502s and surfaces a retry-exhaustion error.
+// TestClient_HomeForbiddenIsAntiBot verifies that a 403 on the CSRF
+// bootstrap GET / surfaces ErrAntiBot immediately — no retry storm, no
+// "exhausted 3 attempts" — so the FallbackFeed can route to the browser.
+// This is the exact failure observed in production:
+//
+//	"cryptopanic: exhausted 3 attempts: cryptopanic: home GET status 403"
+func TestClient_HomeForbiddenIsAntiBot(t *testing.T) {
+	var homeCalls, postCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		homeCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	})
+	mux.HandleFunc("/web-api/posts/", func(w http.ResponseWriter, r *http.Request) {
+		postCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := newTestServer(t, mux)
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	_, err := c.FetchPosts(testCtx(t), Query{})
+	if err == nil {
+		t.Fatal("expected ErrAntiBot; got nil")
+	}
+	if !errors.Is(err, ErrAntiBot) {
+		t.Errorf("error %v does not wrap ErrAntiBot", err)
+	}
+	// Must NOT retry: a 403 fingerprint block won't clear by retrying.
+	if strings.Contains(err.Error(), "exhausted") {
+		t.Errorf("403 should not trigger retry exhaustion; got %q", err)
+	}
+	if got := homeCalls.Load(); got != 1 {
+		t.Errorf("home GET called %d times, want 1 (no retries on 403)", got)
+	}
+	// We never got a token, so the POST must not have been attempted.
+	if got := postCalls.Load(); got != 0 {
+		t.Errorf("posts called %d times, want 0 (no CSRF token)", got)
+	}
+}
+
+// TestClient_PostForbiddenIsAntiBot verifies that a 403 on the posts POST
+// (CSRF accepted on GET but rejected at the API edge) also surfaces
+// ErrAntiBot rather than retrying into exhaustion.
+func TestClient_PostForbiddenIsAntiBot(t *testing.T) {
+	var postCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name: "csrftoken", Value: "CSRFTOKEN403POST0000000000000000000000000000000000000000000000000",
+			Path: "/",
+		})
+		_, _ = w.Write([]byte("<html/>"))
+	})
+	mux.HandleFunc("/web-api/posts/", func(w http.ResponseWriter, r *http.Request) {
+		postCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	})
+
+	srv := newTestServer(t, mux)
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	_, err := c.FetchPosts(testCtx(t), Query{})
+	if !errors.Is(err, ErrAntiBot) {
+		t.Fatalf("expected ErrAntiBot; got %v", err)
+	}
+	if strings.Contains(err.Error(), "exhausted") {
+		t.Errorf("403 should not trigger retry exhaustion; got %q", err)
+	}
+	// ErrAntiBot must be distinguishable from ErrBadPayload — they route
+	// to the browser for different reasons but must not be conflated.
+	if errors.Is(err, ErrBadPayload) {
+		t.Error("anti-bot 403 should not be ErrBadPayload")
+	}
+}
+
 func TestClient_Exhausts502(t *testing.T) {
 	var calls atomic.Int32
 	mux := http.NewServeMux()
