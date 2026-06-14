@@ -105,6 +105,22 @@ agent:
   # Max number of entry opportunities returned per cross-symbol screening cycle.
   screening_max_opportunities: 3
 
+  # --- Phase 0: dynamic symbol discovery ---
+  # When enabled, before each screening cycle Cerebro scans the full Binance
+  # USDT-M futures ticker feed for top movers and new listings, then feeds
+  # the survivors into Phase 1/2 alongside the configured markets.yaml
+  # symbols. Discovered symbols are screening-only: the risk gate still
+  # blocks any execution path for symbols not listed in markets.yaml.
+  discovery:
+    enabled: false
+    include_venues: [binance_futures]        # only futures for MVP
+    quote_asset: USDT
+    min_quote_volume_24h_usd: 50000000       # 50M USDT liquidity floor
+    min_abs_price_change_pct_24h: 8.0        # ignore quiet symbols
+    max_candidates: 15                       # top-K cap
+    new_listing_max_age_days: 30             # flag perps onboarded within N days
+    boost_new_listings: true
+
   # --- LLM tool-loop limits ---
   # Maximum number of tool-call / response turns per agent invocation.
   # Prevents runaway loops. Recommended: 4–8.
@@ -112,10 +128,15 @@ agent:
 
   # Context deadline per single LLM completion call (seconds).
   # On timeout → fail closed (no new risk).
+  # 30s suits fast providers (gemini-flash, claude-haiku). For reasoning
+  # models on OpenRouter (minimax, deepseek-r1, …) raise to 90–120s; their
+  # reasoning_details phase routinely pushes a single turn past 30s.
   timeout_per_turn_seconds: 30
 
   # Total wall-clock deadline for one full agent invocation (all turns).
-  timeout_total_seconds: 120
+  # 180s is a safe default; trim toward 60s when using fast providers like
+  # gemini-flash or claude-haiku, widen toward 240s when using reasoning models.
+  timeout_total_seconds: 180
 
   # Retry transient LLM errors (timeout/connection) this many times before failing.
   # Each retry uses exponential backoff (1s, 2s, 4s). Set to 0 to disable.
@@ -143,18 +164,18 @@ agent:
       gemini:
         model_id: gemini-1.5-flash
         temperature: 0.2          # lower = more deterministic
-        max_output_tokens: 2048
+        max_output_tokens: 512
 
       anthropic:
         model_id: claude-3-haiku-20240307
         temperature: 0.2
-        max_output_tokens: 2048
+        max_output_tokens: 512
 
       openai_compatible:
         model_id: llama3.1
         # base_url is loaded from OPENAI_BASE_URL in secrets.env
         temperature: 0.2
-        max_output_tokens: 2048
+        max_output_tokens: 512
 
     # --- Token / cost budgets ---
     # Counters are stored in Redis and reset daily at midnight UTC.
@@ -183,6 +204,7 @@ agent:
     copilot:
       denied:
         - approve_and_route_order
+        - resize_and_route_order
         - reject_signal
         - force_halt_trading
     reviewer:
@@ -276,22 +298,34 @@ ingest:
     interval_minutes: 5
     timeout_seconds: 60
 
-  # Myfxbook economic calendar RSS
-  myfxbook_calendar:
+  # Economic calendar (macro events: NFP, CPI, FOMC, GDP, ECB...)
+  # Uses the free, keyless FairEconomy weekly feed (same data as ForexFactory).
+  # No API key required. NOTE: kept under the `finnhub` key for backward
+  # compatibility — Finnhub's /calendar/economic endpoint is premium-only.
+  finnhub:
     enabled: true
     interval_minutes: 60
+    timeout_seconds: 15
 
-  # CryptoPanic sentiment API
+  # CryptoPanic news feed — no API key required.
+  # Primary path: pure-Go reverse-engineered AES+zlib decrypt of the
+  # internal /web-api/posts/ endpoint (~200ms per scrape).
+  # Fallback path: headless Chromium that hooks JSON.parse to capture
+  # the decrypted payload (~5s per scrape, kicks in automatically when
+  # CryptoPanic rotates their AES key).
   cryptopanic:
     enabled: true
     interval_minutes: 15
+    timeout_seconds: 15
     # Filter: hot | rising | bullish | bearish | important | saved | lol
     filter: hot
-
-  # Marketaux / FMP stock news
-  marketaux:
-    enabled: true
-    interval_minutes: 30
+    # Optional: per-currency feeds in addition to the global feed. Each
+    # is cached under news:by_asset:<CODE> and exposed to the agent via
+    # the fetch_latest_news tool.
+    currencies: [BTC, ETH]
+    # Maximum items to keep in the Redis cache per tick (global + per-asset
+    # keys). Defaults to 50 when unset.
+    max_items: 50
 
 # =============================================================================
 # BACKTEST ENGINE
@@ -308,3 +342,38 @@ backtest:
 
   # Simulated slippage per side (percentage of price, e.g. 0.01 = 0.01%).
   slippage_pct: 0.01
+
+# =============================================================================
+# POSITION MANAGER AGENT
+# Controls the position-lifecycle reconciler and the Position Manager agent.
+# When enabled: false the reconciler goroutine is not started and existing
+# Monitor/bracket behaviour is unchanged.
+# =============================================================================
+position_manager:
+  enabled: true
+
+  # How often the reconciler checks open positions against live broker state (ms).
+  reconcile_interval_ms: 5000
+
+  # Seconds to wait for operator confirmation before acting autonomously.
+  confirm_timeout_sec: 60
+
+  # If true, act autonomously after confirm_timeout_sec without operator input.
+  autonomous_on_timeout: true
+
+  # Minimum seconds between consecutive trigger evaluations for the same position.
+  trigger_debounce_sec: 300
+
+  # Action taken when the LLM is unavailable or returns an unusable response.
+  # tighten_breakeven — move SL to entry price (lock in breakeven)
+  # hold              — take no action, leave bracket unchanged
+  llm_failure_action: tighten_breakeven
+
+  # Minimum unrealised profit (%) before the agent considers active management.
+  profit_threshold_pct: 1.0
+
+  # Distance from TP or SL (%) that counts as "near" for trigger detection.
+  near_tp_sl_pct: 0.2
+
+  # If true, a bias flip against the position direction is a trigger condition.
+  bias_flip_against: true

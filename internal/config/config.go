@@ -14,18 +14,19 @@ import (
 
 // Config is the merged, validated application configuration.
 type Config struct {
-	Environment domain.Environment `yaml:"environment"`
-	Log         LogConfig          `yaml:"log"`
-	Engine      EngineConfig       `yaml:"engine"`
-	Risk        RiskConfig         `yaml:"risk"`
-	Agent       AgentConfig        `yaml:"agent"`
-	Reviewer    ReviewerConfig     `yaml:"reviewer"`
-	WebSocket   WSConfig           `yaml:"websocket"`
-	ChatOps     ChatOpsConfig      `yaml:"chatops"`
-	TUI         TUIConfig          `yaml:"tui"`
-	Ingest      IngestConfig       `yaml:"ingest"`
-	Backtest    BacktestConfig     `yaml:"backtest"`
-	LogRetention LogRetentionConfig `yaml:"log_retention"`
+	Environment     domain.Environment    `yaml:"environment"`
+	Log             LogConfig             `yaml:"log"`
+	Engine          EngineConfig          `yaml:"engine"`
+	Risk            RiskConfig            `yaml:"risk"`
+	Agent           AgentConfig           `yaml:"agent"`
+	PositionManager PositionManagerConfig `yaml:"position_manager"`
+	Reviewer        ReviewerConfig        `yaml:"reviewer"`
+	WebSocket       WSConfig              `yaml:"websocket"`
+	ChatOps         ChatOpsConfig         `yaml:"chatops"`
+	TUI             TUIConfig             `yaml:"tui"`
+	Ingest          IngestConfig          `yaml:"ingest"`
+	Backtest        BacktestConfig        `yaml:"backtest"`
+	LogRetention    LogRetentionConfig    `yaml:"log_retention"`
 
 	// Loaded separately from markets.yaml and strategies.yaml.
 	Markets    []VenueConfig    `yaml:"-"`
@@ -36,19 +37,19 @@ type Config struct {
 }
 
 type LogConfig struct {
-	Level      string `yaml:"level"`       // debug | info | warn | error
-	Format     string `yaml:"format"`      // json | text
-	File       string `yaml:"file"`        // path to log file (e.g. logs/cerebro.log); empty = no file output
-	MaxSizeMB  int    `yaml:"max_size_mb"` // max file size before rotation (default 100)
-	MaxBackups int    `yaml:"max_backups"` // max old log files to keep (default 5)
+	Level      string `yaml:"level"`        // debug | info | warn | error
+	Format     string `yaml:"format"`       // json | text
+	File       string `yaml:"file"`         // path to log file (e.g. logs/cerebro.log); empty = no file output
+	MaxSizeMB  int    `yaml:"max_size_mb"`  // max file size before rotation (default 100)
+	MaxBackups int    `yaml:"max_backups"`  // max old log files to keep (default 5)
 	MaxAgeDays int    `yaml:"max_age_days"` // max days to retain old logs (default 30)
 }
 
 type LogRetentionConfig struct {
-	AgentLogsDays      int  `yaml:"agent_logs_days"`       // purge agent runs/messages older than N days (default 90)
-	AuditEventsDays    int  `yaml:"audit_events_days"`     // purge audit events older than N days (default 180)
+	AgentLogsDays      int  `yaml:"agent_logs_days"`      // purge agent runs/messages older than N days (default 90)
+	AuditEventsDays    int  `yaml:"audit_events_days"`    // purge audit events older than N days (default 180)
 	ArchiveBeforePurge bool `yaml:"archive_before_purge"` // move to archived_* tables before deleting (default true)
-	PurgeIntervalHours int  `yaml:"purge_interval_hours"`  // how often to run purge (default 24)
+	PurgeIntervalHours int  `yaml:"purge_interval_hours"` // how often to run purge (default 24)
 }
 
 type EngineConfig struct {
@@ -78,6 +79,68 @@ type AgentConfig struct {
 	RetryOnTransient          int              `yaml:"retry_on_transient"`
 	LLM                       LLMConfig        `yaml:"llm"`
 	ToolPolicy                ToolPolicyConfig `yaml:"tool_policy"`
+	Discovery                 DiscoveryConfig  `yaml:"discovery"`
+}
+
+// PositionManagerConfig controls the position-lifecycle reconciler and the
+// Position Manager agent. When Enabled is false the reconciler goroutine is
+// not started and existing Monitor/bracket behaviour is unchanged.
+type PositionManagerConfig struct {
+	Enabled             bool    `yaml:"enabled"`
+	ReconcileIntervalMS int     `yaml:"reconcile_interval_ms"`
+	ConfirmTimeoutSec   int     `yaml:"confirm_timeout_sec"`
+	AutonomousOnTimeout bool    `yaml:"autonomous_on_timeout"`
+	TriggerDebounceSec  int     `yaml:"trigger_debounce_sec"`
+	LLMFailureAction    string  `yaml:"llm_failure_action"` // tighten_breakeven | hold
+	ProfitThresholdPct  float64 `yaml:"profit_threshold_pct"`
+	NearTPSLPct         float64 `yaml:"near_tp_sl_pct"`
+	BiasFlipAgainst     bool    `yaml:"bias_flip_against"`
+}
+
+// Validate checks the position-manager config. A disabled block skips all
+// numeric checks so operators can leave placeholder zeros.
+func (p PositionManagerConfig) Validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.ReconcileIntervalMS <= 0 {
+		return fmt.Errorf("position_manager.reconcile_interval_ms must be > 0")
+	}
+	if p.ConfirmTimeoutSec <= 0 {
+		return fmt.Errorf("position_manager.confirm_timeout_sec must be > 0")
+	}
+	if p.TriggerDebounceSec < 0 {
+		return fmt.Errorf("position_manager.trigger_debounce_sec must be >= 0")
+	}
+	switch p.LLMFailureAction {
+	case "tighten_breakeven", "hold":
+	default:
+		return fmt.Errorf("position_manager.llm_failure_action must be tighten_breakeven|hold, got %q", p.LLMFailureAction)
+	}
+	if p.ProfitThresholdPct < 0 {
+		return fmt.Errorf("position_manager.profit_threshold_pct must be >= 0")
+	}
+	if p.NearTPSLPct < 0 {
+		return fmt.Errorf("position_manager.near_tp_sl_pct must be >= 0")
+	}
+	return nil
+}
+
+// DiscoveryConfig controls the dynamic symbol-discovery phase (Phase 0) that
+// expands the screening universe beyond markets.yaml by scanning Binance's
+// full USDT-M futures ticker feed for top movers and new listings.
+//
+// Discovered symbols are screening-only: the risk gate still blocks any
+// execution path for symbols that are not configured in markets.yaml.
+type DiscoveryConfig struct {
+	Enabled                 bool     `yaml:"enabled"`
+	IncludeVenues           []string `yaml:"include_venues"`               // e.g. [binance_futures]
+	QuoteAsset              string   `yaml:"quote_asset"`                  // e.g. USDT
+	MinQuoteVolume24hUSD    float64  `yaml:"min_quote_volume_24h_usd"`     // liquidity floor
+	MinAbsPriceChangePct24h float64  `yaml:"min_abs_price_change_pct_24h"` // |Δ24h| floor
+	MaxCandidates           int      `yaml:"max_candidates"`               // top-K cap
+	NewListingMaxAgeDays    int      `yaml:"new_listing_max_age_days"`     // 0 = disabled
+	BoostNewListings        bool     `yaml:"boost_new_listings"`
 }
 
 type LLMConfig struct {
@@ -89,8 +152,13 @@ type LLMConfig struct {
 	DailyTokenBudget            int                       `yaml:"daily_token_budget"`
 	DailyCostBudgetUSD          float64                   `yaml:"daily_cost_budget_usd"`
 	AlertAtBudgetPct            float64                   `yaml:"alert_at_budget_pct"`
-	CircuitBreakerErrorRate     float64                   `yaml:"circuit_breaker_error_rate"`
-	CircuitBreakerWindowS       int                       `yaml:"circuit_breaker_window_seconds"`
+
+	// Circuit breaker — trips when the observed LLM error rate exceeds the
+	// threshold over a sliding window, then stops calling the LLM for a
+	// cooldown period. Set ErrorRatePct to 0 to disable.
+	CircuitBreakerErrorRatePct       float64 `yaml:"circuit_breaker_error_rate_pct"`
+	CircuitBreakerErrorWindowMinutes int     `yaml:"circuit_breaker_error_window_minutes"`
+	CircuitBreakerCooldownMinutes    int     `yaml:"circuit_breaker_cooldown_minutes"`
 }
 
 type LLMModelConfig struct {
@@ -137,7 +205,7 @@ type TUIConfig struct {
 type IngestConfig struct {
 	CoinGlass        IngestSourceConfig `yaml:"coinglass"`
 	CoinGlassScraper IngestSourceConfig `yaml:"coinglass_scraper"`
-	CryptoPanic      IngestSourceConfig `yaml:"cryptopanic"`
+	CryptoPanic      CryptoPanicConfig  `yaml:"cryptopanic"`
 	Finnhub          IngestSourceConfig `yaml:"finnhub"`
 	FinancialJuice   IngestSourceConfig `yaml:"financialjuice"`
 }
@@ -146,6 +214,18 @@ type IngestSourceConfig struct {
 	Enabled         bool `yaml:"enabled"`
 	IntervalMinutes int  `yaml:"interval_minutes"`
 	TimeoutSeconds  int  `yaml:"timeout_seconds"`
+}
+
+// CryptoPanicConfig extends the shared ingest knobs with CryptoPanic-specific
+// tuning. Filter maps to the SPA's filter query parameter
+// (hot|rising|bullish|bearish|important|saved|lol). Currencies limits the
+// per-tick scrape to the given tickers (empty = global feed). MaxItems caps
+// how many posts we keep in the Redis cache per tick.
+type CryptoPanicConfig struct {
+	IngestSourceConfig `yaml:",inline"`
+	Filter             string   `yaml:"filter"`
+	Currencies         []string `yaml:"currencies"`
+	MaxItems           int      `yaml:"max_items"`
 }
 
 type BacktestConfig struct {
@@ -178,9 +258,8 @@ type SecretsConfig struct {
 	BinanceDemoFuturesAPIKey    string
 	BinanceDemoFuturesAPISecret string
 
-	CoinGlassAPIKey   string
-	CryptoPanicAPIKey string
-	FinnhubAPIKey     string
+	CoinGlassAPIKey string
+	FinnhubAPIKey   string
 
 	DatabaseURL string
 	RedisURL    string
@@ -214,14 +293,12 @@ func Load(secretsPath, appPath, marketsPath, strategiesPath string) (*Config, er
 		return nil, fmt.Errorf("load app.yaml: %w", err)
 	}
 
-	// 3. Parse markets.yaml
-	var marketsFile struct {
-		Venues []VenueConfig `yaml:"venues"`
-	}
-	if err := loadYAML(marketsPath, &marketsFile); err != nil {
+	// 3. Parse markets.yaml (with venue-level `defaults:` merged into each symbol).
+	venues, err := loadMarkets(marketsPath)
+	if err != nil {
 		return nil, fmt.Errorf("load markets.yaml: %w", err)
 	}
-	cfg.Markets = marketsFile.Venues
+	cfg.Markets = venues
 
 	// 4. Parse strategies.yaml
 	strategies, err := loadStrategies(strategiesPath)
@@ -233,6 +310,11 @@ func Load(secretsPath, appPath, marketsPath, strategiesPath string) (*Config, er
 	if err := normalizeSymbols(cfg); err != nil {
 		return nil, fmt.Errorf("normalize symbols: %w", err)
 	}
+
+	// 4b. Resolve per-symbol `strategies:` opt-ins and `default_strategies:`
+	//     fallback into each strategy's Markets list. This must happen after
+	//     normalizeSymbols so all symbol names are in canonical form.
+	resolveStrategyAssignments(cfg)
 
 	// 5. Populate secrets from env
 	cfg.Secrets = loadSecrets()
@@ -265,7 +347,6 @@ func loadSecrets() SecretsConfig {
 		BinanceDemoFuturesAPIKey:       os.Getenv("BINANCE_DEMO_FUTURES_API_KEY"),
 		BinanceDemoFuturesAPISecret:    os.Getenv("BINANCE_DEMO_FUTURES_API_SECRET"),
 		CoinGlassAPIKey:                os.Getenv("COINGLASS_API_KEY"),
-		CryptoPanicAPIKey:              os.Getenv("CRYPTOPANIC_API_KEY"),
 		FinnhubAPIKey:                  os.Getenv("FINNHUB_API_KEY"),
 		DatabaseURL:                    os.Getenv("DATABASE_URL"),
 		RedisURL:                       os.Getenv("REDIS_URL"),
@@ -315,6 +396,43 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 	if c.Agent.BiasTTLMinutes < c.Agent.ScreeningIntervalMinutes {
 		errs.add("bias_ttl_minutes (%d) must be >= screening_interval_minutes (%d)",
 			c.Agent.BiasTTLMinutes, c.Agent.ScreeningIntervalMinutes)
+	}
+
+	// Discovery config (Phase 0) — only validated when enabled.
+	if c.Agent.Discovery.Enabled {
+		d := c.Agent.Discovery
+		if d.MaxCandidates <= 0 {
+			errs.add("agent.discovery.max_candidates (%d) must be > 0 when discovery is enabled", d.MaxCandidates)
+		}
+		if d.MaxCandidates > 100 {
+			errs.add("agent.discovery.max_candidates (%d) must be <= 100 to keep the LLM prompt tractable", d.MaxCandidates)
+		}
+		if strings.TrimSpace(d.QuoteAsset) == "" {
+			errs.add("agent.discovery.quote_asset must be set when discovery is enabled (e.g. USDT)")
+		}
+		if len(d.IncludeVenues) == 0 {
+			errs.add("agent.discovery.include_venues must list at least one venue when discovery is enabled")
+		}
+		if d.MinQuoteVolume24hUSD < 0 {
+			errs.add("agent.discovery.min_quote_volume_24h_usd must be >= 0")
+		}
+		if d.MinAbsPriceChangePct24h < 0 {
+			errs.add("agent.discovery.min_abs_price_change_pct_24h must be >= 0")
+		}
+		if d.NewListingMaxAgeDays < 0 {
+			errs.add("agent.discovery.new_listing_max_age_days must be >= 0 (0 disables new-listing detection)")
+		}
+		// Every include_venues entry must match a venue declared in markets.yaml.
+		known := make(map[domain.Venue]bool, len(c.Markets))
+		for _, v := range c.Markets {
+			known[v.Venue] = true
+		}
+		for _, raw := range d.IncludeVenues {
+			v := domain.Venue(strings.TrimSpace(raw))
+			if !known[v] {
+				errs.add("agent.discovery.include_venues: venue %q is not declared in markets.yaml", raw)
+			}
+		}
 	}
 
 	// Risk guardrails: at least one limit must be set
@@ -395,6 +513,9 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 
 	if errs.hasErrors() {
 		return fmt.Errorf("%w: %s", domain.ErrConfigInvalid, errs.Error())
+	}
+	if err := c.PositionManager.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
