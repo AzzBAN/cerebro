@@ -18,6 +18,11 @@ type ActionExecutorDeps struct {
 	Router  *Router
 	Tracker *BracketTracker
 	Env     domain.Environment
+	// EntryFn opens a new gated, strategy-sized position in the direction of
+	// the supplied Position.Side. Used only by ActionFlip after the existing
+	// position is closed. When nil, a flip degrades to a plain close (logged),
+	// so the position is never left reversed-but-naked.
+	EntryFn func(ctx context.Context, want domain.Position) error
 }
 
 // ActionExecutor translates a ManagedAction decision into concrete broker
@@ -28,7 +33,9 @@ type ActionExecutorDeps struct {
 //   - ActionClose        → reduce-only market close routed via Router.
 //   - ActionTightenStop  → cancel existing bracket (if tracked) then place a
 //     new bracket with the tighter stop from action.NewStopLoss.
-//   - ActionFlip         → close the position (reverse entry is a future task).
+//   - ActionFlip         → reduce-only close, then open a gated, strategy-sized
+//     entry in the opposite direction via EntryFn. A gate rejection on the
+//     re-entry leaves the position flat (never reversed-but-naked).
 type ActionExecutor struct {
 	deps ActionExecutorDeps
 }
@@ -44,10 +51,10 @@ func (e *ActionExecutor) Execute(ctx context.Context, item QueuedAction) error {
 	switch item.Action.Decision {
 	case domain.ActionHold:
 		return nil
-	case domain.ActionClose, domain.ActionFlip:
-		// ActionFlip closes the current position; the reverse entry is deferred
-		// to a future task once the signal generation path supports it.
+	case domain.ActionClose:
 		return e.routeClose(ctx, item)
+	case domain.ActionFlip:
+		return e.flip(ctx, item)
 	case domain.ActionTightenStop:
 		return e.tightenStop(ctx, item)
 	default:
@@ -80,6 +87,35 @@ func (e *ActionExecutor) routeClose(ctx context.Context, item QueuedAction) erro
 	}
 	slog.Info("executor: close routed",
 		"symbol", pos.Symbol, "decision", item.Action.Decision, "reason", item.Action.Reason)
+	return nil
+}
+
+// flip closes the current position reduce-only, then opens a new gated,
+// strategy-sized entry in the opposite direction via EntryFn. If EntryFn is
+// nil the flip degrades to a plain close. A gate rejection (EntryFn error)
+// leaves the position flat — never reversed-but-naked — and is logged, not
+// propagated, since the protective close already succeeded.
+func (e *ActionExecutor) flip(ctx context.Context, item QueuedAction) error {
+	if err := e.routeClose(ctx, item); err != nil {
+		return fmt.Errorf("executor: flip close leg: %w", err)
+	}
+	if e.deps.EntryFn == nil {
+		slog.Warn("executor: flip requested but no EntryFn wired; left flat after close",
+			"symbol", item.Position.Symbol)
+		return nil
+	}
+	want := item.Position
+	want.Side = domain.SideSell
+	if item.Position.Side == domain.SideSell {
+		want.Side = domain.SideBuy
+	}
+	if err := e.deps.EntryFn(ctx, want); err != nil {
+		slog.Warn("executor: flip re-entry rejected; position left flat",
+			"symbol", want.Symbol, "wanted_side", want.Side, "error", err)
+		return nil
+	}
+	slog.Info("executor: flip complete",
+		"symbol", want.Symbol, "new_side", want.Side, "reason", item.Action.Reason)
 	return nil
 }
 

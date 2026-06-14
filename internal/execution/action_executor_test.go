@@ -110,7 +110,7 @@ func TestActionExecutor_TightenStop_NoExistingBracket(t *testing.T) {
 	}
 }
 
-func TestActionExecutor_FlipActsAsClose(t *testing.T) {
+func TestActionExecutor_FlipClosesThenReenters(t *testing.T) {
 	broker := &stubReconBroker{}
 	tracker := NewBracketTracker()
 	router := NewRouter([]domain.Venue{domain.VenueBinanceFutures})
@@ -120,15 +120,74 @@ func TestActionExecutor_FlipActsAsClose(t *testing.T) {
 			req.RespCh <- OrderResponse{BrokerOrderID: "flipped"}
 		}
 	}()
+
+	var entries []domain.Position
 	ex := NewActionExecutor(ActionExecutorDeps{
 		Venue: domain.VenueBinanceFutures, Broker: broker,
 		Router: router, Tracker: tracker, Env: domain.EnvironmentPaper,
+		EntryFn: func(_ context.Context, want domain.Position) error {
+			entries = append(entries, want)
+			return nil
+		},
 	})
 
+	// makeExecItem builds a long (BUY) position; flip should re-enter SHORT.
 	if err := ex.Execute(context.Background(), makeExecItem(domain.ActionFlip)); err != nil {
 		t.Fatalf("Execute(FLIP) error = %v", err)
 	}
-	// Flip closes the position; reverse entry is a future enhancement.
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one re-entry, got %d", len(entries))
+	}
+	if entries[0].Side != domain.SideSell {
+		t.Errorf("flip of a long should re-enter SELL, got %s", entries[0].Side)
+	}
+}
+
+func TestActionExecutor_FlipReentryRejectedLeavesFlat(t *testing.T) {
+	broker := &stubReconBroker{}
+	tracker := NewBracketTracker()
+	router := NewRouter([]domain.Venue{domain.VenueBinanceFutures})
+	ch, _ := router.Channel(domain.VenueBinanceFutures)
+	go func() {
+		for req := range ch {
+			req.RespCh <- OrderResponse{BrokerOrderID: "closed"}
+		}
+	}()
+
+	ex := NewActionExecutor(ActionExecutorDeps{
+		Venue: domain.VenueBinanceFutures, Broker: broker,
+		Router: router, Tracker: tracker, Env: domain.EnvironmentPaper,
+		EntryFn: func(_ context.Context, _ domain.Position) error {
+			return context.DeadlineExceeded // simulate gate rejection
+		},
+	})
+
+	// A rejected re-entry must NOT propagate an error — the protective close
+	// already succeeded and the position is safely flat.
+	if err := ex.Execute(context.Background(), makeExecItem(domain.ActionFlip)); err != nil {
+		t.Fatalf("flip with rejected re-entry should return nil, got %v", err)
+	}
+}
+
+func TestActionExecutor_FlipNoEntryFnDegradesToClose(t *testing.T) {
+	broker := &stubReconBroker{}
+	tracker := NewBracketTracker()
+	router := NewRouter([]domain.Venue{domain.VenueBinanceFutures})
+	ch, _ := router.Channel(domain.VenueBinanceFutures)
+	go func() {
+		for req := range ch {
+			req.RespCh <- OrderResponse{BrokerOrderID: "closed"}
+		}
+	}()
+	ex := NewActionExecutor(ActionExecutorDeps{
+		Venue: domain.VenueBinanceFutures, Broker: broker,
+		Router: router, Tracker: tracker, Env: domain.EnvironmentPaper,
+		// EntryFn nil → flip degrades to a plain close.
+	})
+
+	if err := ex.Execute(context.Background(), makeExecItem(domain.ActionFlip)); err != nil {
+		t.Fatalf("Execute(FLIP, no EntryFn) error = %v", err)
+	}
 	if len(broker.placedOrders) != 0 {
 		t.Errorf("expected no direct broker orders for FLIP, got %d", len(broker.placedOrders))
 	}

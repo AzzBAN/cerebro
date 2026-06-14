@@ -51,6 +51,46 @@ func TestActionQueue_EnqueueCreatesPendingItem(t *testing.T) {
 	}
 }
 
+func TestActionQueue_GuardDropsWhenPositionGone(t *testing.T) {
+	executed := 0
+	q := NewActionQueue(30, false, func(_ context.Context, _ QueuedAction) error {
+		executed++
+		return nil
+	})
+	q.SetPositionExists(func(domain.Symbol) bool { return false }) // position vanished
+
+	id := q.Enqueue(makeQueuedPos("BTCUSDT"),
+		domain.ReviewTrigger{Type: domain.TriggerProfitThreshold, Symbol: "BTCUSDT"},
+		makeAction(domain.ActionClose))
+
+	if err := q.Confirm(context.Background(), id); err != nil {
+		t.Fatalf("Confirm returned error: %v", err)
+	}
+	if executed != 0 {
+		t.Errorf("expected guard to drop execution, but execute ran %d times", executed)
+	}
+}
+
+func TestActionQueue_GuardAllowsWhenPositionPresent(t *testing.T) {
+	executed := 0
+	q := NewActionQueue(30, false, func(_ context.Context, _ QueuedAction) error {
+		executed++
+		return nil
+	})
+	q.SetPositionExists(func(domain.Symbol) bool { return true })
+
+	id := q.Enqueue(makeQueuedPos("BTCUSDT"),
+		domain.ReviewTrigger{Type: domain.TriggerProfitThreshold, Symbol: "BTCUSDT"},
+		makeAction(domain.ActionClose))
+
+	if err := q.Confirm(context.Background(), id); err != nil {
+		t.Fatalf("Confirm returned error: %v", err)
+	}
+	if executed != 1 {
+		t.Errorf("expected execution to run once, got %d", executed)
+	}
+}
+
 func TestActionQueue_Confirm_ExecutesItem(t *testing.T) {
 	executed := 0
 	q := NewActionQueue(30, false, func(_ context.Context, _ QueuedAction) error {

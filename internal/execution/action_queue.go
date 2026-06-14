@@ -48,6 +48,11 @@ type ActionQueue struct {
 	confirmTimeoutSec   int
 	autonomousOnTimeout bool
 	execute             ExecuteFunc
+	// positionExists, when set, is consulted immediately before any execution
+	// (confirm or autonomous timeout). Returning false drops the action — this
+	// guards the race where the position's own bracket fired during the
+	// confirm window, so we never act on a position that is already gone.
+	positionExists func(domain.Symbol) bool
 }
 
 // NewActionQueue creates an ActionQueue.
@@ -62,6 +67,28 @@ func NewActionQueue(confirmTimeoutSec int, autonomousOnTimeout bool, execute Exe
 		autonomousOnTimeout: autonomousOnTimeout,
 		execute:             execute,
 	}
+}
+
+// SetPositionExists installs the guard consulted before every execution.
+// When fn returns false for a queued action's symbol, the action is dropped
+// instead of executed (the position's bracket likely fired during the wait).
+// Safe to call once at startup before the queue begins processing.
+func (q *ActionQueue) SetPositionExists(fn func(domain.Symbol) bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.positionExists = fn
+}
+
+// stillOpen reports whether the guard permits executing against this symbol.
+// A nil guard permits everything (back-compat for tests/demo).
+func (q *ActionQueue) stillOpen(sym domain.Symbol) bool {
+	q.mu.Lock()
+	fn := q.positionExists
+	q.mu.Unlock()
+	if fn == nil {
+		return true
+	}
+	return fn(sym)
 }
 
 // Enqueue adds a pending action and returns its ID.
@@ -103,6 +130,12 @@ func (q *ActionQueue) Confirm(ctx context.Context, id string) error {
 	snapshot := *item
 	delete(q.items, id)
 	q.mu.Unlock()
+
+	if !q.stillOpen(snapshot.Position.Symbol) {
+		slog.Info("action_queue: dropped on confirm; position already gone",
+			"id", id, "symbol", snapshot.Position.Symbol)
+		return nil
+	}
 
 	slog.Info("action_queue: confirmed", "id", id, "symbol", snapshot.Position.Symbol)
 	if err := q.execute(ctx, snapshot); err != nil {
@@ -147,6 +180,11 @@ func (q *ActionQueue) Tick(ctx context.Context) {
 
 	for _, item := range expired {
 		if q.autonomousOnTimeout {
+			if !q.stillOpen(item.Position.Symbol) {
+				slog.Info("action_queue: dropped on timeout; position already gone",
+					"id", item.ID, "symbol", item.Position.Symbol)
+				continue
+			}
 			slog.Info("action_queue: autonomous execution on timeout",
 				"id", item.ID, "symbol", item.Position.Symbol)
 			if err := q.execute(ctx, *item); err != nil {
