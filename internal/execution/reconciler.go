@@ -10,6 +10,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// PositionDecider is the reconciler's view of the position-manager agent.
+// It is declared here as an interface so the execution package never imports
+// the agent package — *agent.PositionManagerAgent satisfies it via its Review
+// method, keeping the dependency direction one-way.
+type PositionDecider interface {
+	Review(ctx context.Context, review domain.PositionReview) (domain.ManagedAction, error)
+}
+
 // ReconcilerDeps bundles the reconciler's collaborators.
 type ReconcilerDeps struct {
 	Venue     domain.Venue
@@ -20,6 +28,21 @@ type ReconcilerDeps struct {
 	Positions func() []domain.Position
 	// IntervalMS is the tick cadence; 0 defaults to 5000.
 	IntervalMS int
+
+	// ── Job B (optional) — review triggers + agent judgment ────────────────
+	// When all three of Detector, Decider, and Queue are non-nil, the
+	// reconciler runs Job B each tick: detect review triggers, ask the agent
+	// for a decision, and enqueue the resulting action. When any is nil, only
+	// the deterministic Job A (bracket guarantee + orphan sweep) runs.
+	Detector *TriggerDetector
+	Decider  PositionDecider
+	Queue    *ActionQueue
+	// Bias resolves the current bias for a symbol (e.g. from the Redis cache).
+	// May be nil to skip the bias-flip trigger.
+	Bias BiasFunc
+	// BiasReason resolves an optional human-readable bias rationale for a
+	// symbol, surfaced to the agent. May be nil.
+	BiasReason func(domain.Symbol) string
 }
 
 // Reconciler enforces the hard TP/SL guarantee (Job A). Job B (review-trigger
@@ -52,6 +75,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-tick.C:
 			r.enforceBrackets(ctx)
 			r.sweepOrphans(ctx)
+			r.reviewPositions(ctx)
 		}
 	}
 }
@@ -111,6 +135,66 @@ func (r *Reconciler) sweepOrphans(ctx context.Context) {
 		}
 		r.deps.Tracker.Remove(sym)
 		slog.Info("reconciler: cancelled orphan bracket", "symbol", sym)
+	}
+}
+
+// reviewPositions runs Job B: detect review triggers on open positions, ask
+// the agent for a decision, and enqueue the resulting action. It is a no-op
+// unless Detector, Decider, and Queue are all wired (Job B is optional).
+func (r *Reconciler) reviewPositions(ctx context.Context) {
+	if r.deps.Detector == nil || r.deps.Decider == nil || r.deps.Queue == nil {
+		return
+	}
+
+	// Snapshot this venue's open positions and index them for trigger lookup.
+	var positions []domain.Position
+	bySymbol := make(map[domain.Symbol]domain.Position)
+	for _, p := range r.deps.Positions() {
+		if p.Venue != r.deps.Venue {
+			continue
+		}
+		positions = append(positions, p)
+		bySymbol[p.Symbol] = p
+	}
+	if len(positions) == 0 {
+		return
+	}
+
+	for _, trig := range r.deps.Detector.Detect(positions, r.deps.Bias) {
+		pos, ok := bySymbol[trig.Symbol]
+		if !ok {
+			continue
+		}
+		review := domain.PositionReview{
+			Position: pos,
+			Trigger:  trig,
+		}
+		if r.deps.Bias != nil {
+			if score, found := r.deps.Bias(trig.Symbol); found {
+				review.BiasScore = score
+			}
+		}
+		if r.deps.BiasReason != nil {
+			review.BiasReasoning = r.deps.BiasReason(trig.Symbol)
+		}
+
+		action, err := r.deps.Decider.Review(ctx, review)
+		if err != nil {
+			// Review already fails safe internally (returns a fallback action,
+			// not an error), but guard anyway so a future change can't drop
+			// the position silently.
+			slog.Error("reconciler: position review failed; skipping",
+				"symbol", trig.Symbol, "trigger", trig.Type, "error", err)
+			continue
+		}
+		if action.Decision == domain.ActionHold {
+			slog.Debug("reconciler: review decided HOLD",
+				"symbol", trig.Symbol, "trigger", trig.Type)
+			continue
+		}
+		id := r.deps.Queue.Enqueue(pos, trig, action)
+		slog.Info("reconciler: queued managed action",
+			"id", id, "symbol", trig.Symbol, "trigger", trig.Type, "action", action.Decision)
 	}
 }
 

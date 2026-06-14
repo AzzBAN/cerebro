@@ -146,3 +146,82 @@ type errReconTestType string
 func (e errReconTestType) Error() string { return string(e) }
 
 var errReconTest = errReconTestType("boom")
+
+// stubDecider returns a fixed ManagedAction, satisfying PositionDecider.
+type stubDecider struct {
+	action domain.ManagedAction
+	calls  int
+}
+
+func (s *stubDecider) Review(_ context.Context, _ domain.PositionReview) (domain.ManagedAction, error) {
+	s.calls++
+	return s.action, nil
+}
+
+func TestReconciler_JobB_EnqueuesNonHoldDecision(t *testing.T) {
+	broker := &stubReconBroker{}
+	tracker := NewBracketTracker()
+	tracker.Record("BTCUSDT", domain.BracketResponse{StopOrderID: "s", Symbol: "BTCUSDT"}) // protected, so Job A skips it
+	router := NewRouter([]domain.Venue{domain.VenueBinanceFutures})
+
+	decider := &stubDecider{action: domain.ManagedAction{Decision: domain.ActionClose, Reason: "bias flip"}}
+	queue := NewActionQueue(60, true, func(context.Context, QueuedAction) error { return nil })
+	detector := NewTriggerDetector(0, 0, 0, true)
+
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: broker, Tracker: tracker,
+		Router: router, Env: domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{longPos("BTCUSDT")} },
+		Detector:  detector,
+		Decider:   decider,
+		Queue:     queue,
+		Bias: func(domain.Symbol) (domain.BiasScore, bool) {
+			return domain.BiasBearish, true // opposes the BUY position
+		},
+	})
+
+	r.reviewPositions(context.Background())
+
+	if decider.calls != 1 {
+		t.Fatalf("expected decider consulted once, got %d", decider.calls)
+	}
+	if got := len(queue.Pending()); got != 1 {
+		t.Fatalf("expected 1 queued action, got %d", got)
+	}
+}
+
+func TestReconciler_JobB_HoldIsNotQueued(t *testing.T) {
+	tracker := NewBracketTracker()
+	tracker.Record("BTCUSDT", domain.BracketResponse{StopOrderID: "s", Symbol: "BTCUSDT"})
+	decider := &stubDecider{action: domain.ManagedAction{Decision: domain.ActionHold}}
+	queue := NewActionQueue(60, true, func(context.Context, QueuedAction) error { return nil })
+	detector := NewTriggerDetector(0, 0, 0, true)
+
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: &stubReconBroker{}, Tracker: tracker,
+		Router: NewRouter([]domain.Venue{domain.VenueBinanceFutures}), Env: domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{longPos("BTCUSDT")} },
+		Detector:  detector,
+		Decider:   decider,
+		Queue:     queue,
+		Bias:      func(domain.Symbol) (domain.BiasScore, bool) { return domain.BiasBearish, true },
+	})
+
+	r.reviewPositions(context.Background())
+
+	if got := len(queue.Pending()); got != 0 {
+		t.Fatalf("HOLD must not be queued, got %d pending", got)
+	}
+}
+
+func TestReconciler_JobB_NoopWhenUnwired(t *testing.T) {
+	// No Detector/Decider/Queue → Job B is a no-op and must not panic.
+	tracker := NewBracketTracker()
+	tracker.Record("BTCUSDT", domain.BracketResponse{StopOrderID: "s", Symbol: "BTCUSDT"})
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: &stubReconBroker{}, Tracker: tracker,
+		Router: NewRouter([]domain.Venue{domain.VenueBinanceFutures}), Env: domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{longPos("BTCUSDT")} },
+	})
+	r.reviewPositions(context.Background()) // must not panic
+}
