@@ -688,9 +688,15 @@ func (s *ScreeningAgent) loadOpportunities(ctx context.Context) []domain.Screeni
 	return opps
 }
 
-// renderScreeningSummary formats a human-readable markdown summary from
+// renderScreeningSummary formats a clean, scannable markdown summary from
 // cached Phase 1 + Phase 2 state. Pure function (no I/O, no LLM) so we
 // can unit-test it cheaply.
+//
+// The layout is deliberately compact — one line per symbol/opportunity with a
+// short, whitespace-collapsed reason — so it reads well in a Telegram chat
+// without the verbose "...(truncated)" log markers the old renderer leaked.
+// A short legend is appended so a non-technical operator can read it at a
+// glance.
 func renderScreeningSummary(biases []domain.BiasResult, opps []domain.ScreeningOpportunity) string {
 	var b strings.Builder
 
@@ -706,65 +712,108 @@ func renderScreeningSummary(biases []domain.BiasResult, opps []domain.ScreeningO
 			neutral++
 		}
 	}
-	b.WriteString("### Market Overview\n")
+
+	var mood string
 	switch {
 	case bullish > bearish && bullish > neutral:
-		fmt.Fprintf(&b, "Broadly bullish across monitored assets (%d bullish / %d bearish / %d neutral).\n",
-			bullish, bearish, neutral)
+		mood = "Broadly bullish"
 	case bearish > bullish && bearish > neutral:
-		fmt.Fprintf(&b, "Broadly bearish across monitored assets (%d bullish / %d bearish / %d neutral).\n",
-			bullish, bearish, neutral)
+		mood = "Broadly bearish"
 	default:
-		fmt.Fprintf(&b, "Mixed / neutral market conditions (%d bullish / %d bearish / %d neutral).\n",
-			bullish, bearish, neutral)
+		mood = "Mixed / neutral"
 	}
+	b.WriteString("### 📊 Market Overview\n")
+	fmt.Fprintf(&b, "%s — 🟢 %d bullish · 🔴 %d bearish · ⚪ %d neutral\n",
+		mood, bullish, bearish, neutral)
 
 	// --- Per-Symbol Bias ------------------------------------------------
-	b.WriteString("\n### Per-Symbol Bias\n")
+	b.WriteString("\n### 🧭 Per-Symbol Bias\n")
 	for _, bi := range biases {
-		reason := truncateOutput(strings.ReplaceAll(bi.Reasoning, "\n", " "), 160)
-		fmt.Fprintf(&b, "- **%s**: %s — %s\n", bi.Symbol, bi.Score, reason)
+		reason := cleanReason(bi.Reasoning, 80)
+		if reason == "" {
+			fmt.Fprintf(&b, "%s **%s** — %s\n", biasEmoji(bi.Score), bi.Symbol, bi.Score)
+			continue
+		}
+		fmt.Fprintf(&b, "%s **%s** — %s · %s\n", biasEmoji(bi.Score), bi.Symbol, bi.Score, reason)
 	}
 
 	// --- Top Opportunities ---------------------------------------------
-	b.WriteString("\n### Top Opportunities\n")
+	b.WriteString("\n### 🎯 Top Opportunities\n")
 	if len(opps) == 0 {
-		b.WriteString("_No actionable opportunities identified this cycle._\n")
+		b.WriteString("_No actionable opportunities this cycle._\n")
 	} else {
 		for _, o := range opps {
-			reason := truncateOutput(strings.ReplaceAll(o.Reasoning, "\n", " "), 160)
-			marker := ""
+			label := strings.ToUpper(string(o.Side))
 			if o.Avoided {
-				marker = " [AVOIDED]"
+				label = "AVOIDED " + label
 			}
-			fmt.Fprintf(&b, "- **%s** (%s) %s — conf=%.2f%s: %s\n",
-				o.Symbol, o.Venue, strings.ToUpper(string(o.Side)),
-				o.Confidence, marker, reason)
+			fmt.Fprintf(&b, "%s **%s** %s · %.0f%% — %s\n",
+				sideEmoji(o.Side, o.Avoided), label, o.Symbol,
+				o.Confidence*100, cleanReason(o.Reasoning, 110))
 		}
 	}
 
 	// --- Watchlist ------------------------------------------------------
-	// Flag divergences and avoided opportunities as items to watch.
-	var watch []string
+	// Flag a bull/bear divergence — correlated assets disagreeing is the one
+	// signal worth surfacing on top of the per-symbol list.
 	if bullish > 0 && bearish > 0 {
-		watch = append(watch, fmt.Sprintf("Divergence: %d bullish vs %d bearish — correlated assets disagree.", bullish, bearish))
-	}
-	for _, o := range opps {
-		if o.Avoided {
-			watch = append(watch, fmt.Sprintf("Avoided %s: %s", o.Symbol, truncateOutput(o.Reasoning, 120)))
-		}
-	}
-	if len(watch) > 3 {
-		watch = watch[:3]
-	}
-	if len(watch) > 0 {
-		b.WriteString("\n### Watchlist\n")
-		for _, w := range watch {
-			fmt.Fprintf(&b, "- %s\n", w)
-		}
+		b.WriteString("\n### 👀 Watchlist\n")
+		fmt.Fprintf(&b, "- Divergence: %d bullish vs %d bearish — correlated assets disagree.\n",
+			bullish, bearish)
 	}
 
+	// --- Legend ---------------------------------------------------------
+	b.WriteString("\n### ℹ️ How to read this\n")
+	b.WriteString("- Bias: directional lean per symbol — 🟢 Bullish · 🔴 Bearish · ⚪ Neutral\n")
+	b.WriteString("- Top Opportunities: best entries this cycle — side, symbol, confidence %\n")
+	b.WriteString("- AVOIDED ⏸️: a setup the agent skipped (e.g. event risk).\n")
+	b.WriteString("- Advisory only — every entry still passes the risk gate before any order.\n")
+
 	return b.String()
+}
+
+// biasEmoji maps a bias direction to a colour dot for at-a-glance scanning.
+func biasEmoji(s domain.BiasScore) string {
+	switch s {
+	case domain.BiasBullish:
+		return "🟢"
+	case domain.BiasBearish:
+		return "🔴"
+	default:
+		return "⚪"
+	}
+}
+
+// sideEmoji maps an opportunity side to an indicator, using a "paused" glyph
+// when the setup was avoided rather than acted on.
+func sideEmoji(side domain.Side, avoided bool) string {
+	if avoided {
+		return "⏸️"
+	}
+	switch strings.ToUpper(string(side)) {
+	case "BUY":
+		return "🟢"
+	case "SELL":
+		return "🔴"
+	default:
+		return "▫️"
+	}
+}
+
+// cleanReason collapses all whitespace (newlines included) and truncates at a
+// word boundary with a single ellipsis. Unlike truncateOutput — which appends
+// a "...(truncated)" marker intended for debug logs — this produces clean,
+// chat-friendly text with no leaked tooling noise.
+func cleanReason(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	if i := strings.LastIndexByte(cut, ' '); i > 0 {
+		cut = cut[:i]
+	}
+	return strings.TrimRight(cut, " ,.;:") + "…"
 }
 
 type opportunitiesOutput struct {
