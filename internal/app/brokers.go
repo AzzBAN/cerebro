@@ -113,6 +113,17 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 		if broker == nil {
 			return nil, nil, nil, fmt.Errorf("failed to wire broker for venue %s", venue)
 		}
+		// Apply the configured position-resync cadence (zero leaves the broker
+		// default in effect). Brokers ignore non-positive overrides.
+		if ms := cfg.Engine.PositionResyncIntervalMS; ms > 0 {
+			resync := time.Duration(ms) * time.Millisecond
+			switch b := broker.(type) {
+			case *spot.SpotBroker:
+				b.SetResyncInterval(resync)
+			case *futures.FuturesBroker:
+				b.SetResyncInterval(resync)
+			}
+		}
 		if err := broker.Connect(ctx); err != nil {
 			return nil, nil, nil, fmt.Errorf("%s broker connect: %w", venue, err)
 		}

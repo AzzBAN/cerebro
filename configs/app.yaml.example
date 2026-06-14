@@ -48,6 +48,11 @@ engine:
   # without requiring a ChatOps command. Useful for maintenance.
   kill_switch: false
 
+  # How often each broker re-fetches the authoritative open-position snapshot
+  # over REST, recovering any open/close the private user-data WebSocket stream
+  # missed (dropped events, silent socket stalls). 0 uses the broker default (5s).
+  position_resync_interval_ms: 5000
+
 # =============================================================================
 # GLOBAL RISK LIMITS
 # These are hard limits enforced in pure Go — they cannot be overridden by
@@ -280,6 +285,17 @@ tui:
 
   # Maximum number of rows in the Active Positions panel.
   max_position_rows: 20
+
+# =============================================================================
+# WEB — HTTP + WEBSOCKET DASHBOARD
+# =============================================================================
+# Serves the high-density terminal dashboard over HTTP with live WebSocket
+# updates. Requires WEB_AUTH_TOKEN in secrets.env when enabled — it gates
+# every /api and /ws request and the ChatOps write controls.
+web:
+  enabled: false
+  listen_addr: ":8080"
+  allowed_origins: []
 
 # =============================================================================
 # INGEST — SCRAPERS & NEWS FEEDS

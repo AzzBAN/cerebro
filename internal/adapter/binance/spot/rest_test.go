@@ -142,3 +142,51 @@ func TestHandleUserDataMessage_AckMessage(t *testing.T) {
 		t.Fatalf("ack should not error: %v", err)
 	}
 }
+
+// TestApplyBalanceSnapshot_Resync verifies the periodic REST resync path:
+// balances are REPLACED wholesale (not merged) so an asset sold to zero — which
+// may be absent from the fresh snapshot entirely — has its position dropped,
+// while a newly-funded asset becomes a position. Cerebro-internal metadata on
+// survivors is preserved via rebuildPositionsLocked. This recovers state the
+// user-data WS may have missed.
+func TestApplyBalanceSnapshot_Resync(t *testing.T) {
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT", "ETH/USDT"}, nil)
+
+	// Cache: ETH position (with internal metadata) that has since been closed,
+	// plus a stale balance entry for it.
+	b.mu.Lock()
+	b.balances["ETH"] = spotBalance{free: decimal.NewFromFloat(2.0), locked: decimal.Zero}
+	b.positions = map[domain.Symbol]domain.Position{
+		"ETH/USDT": {
+			Symbol:        "ETH/USDT",
+			Venue:         domain.VenueBinanceSpot,
+			Side:          domain.SideBuy,
+			Quantity:      decimal.NewFromFloat(2.0),
+			StopLoss:      decimal.NewFromFloat(2800),
+			TakeProfit1:   decimal.NewFromFloat(3500),
+			Strategy:      domain.StrategyName("rsi_bb"),
+			CorrelationID: "corr-eth",
+		},
+	}
+	b.mu.Unlock()
+
+	// Fresh REST snapshot: ETH gone (sold), BTC newly held.
+	snapshot := map[string]spotBalance{
+		"BTC":  {free: decimal.NewFromFloat(0.5), locked: decimal.Zero},
+		"USDT": {free: decimal.NewFromFloat(10000), locked: decimal.Zero},
+	}
+
+	b.applyBalanceSnapshot(snapshot)
+
+	positions, _ := b.Positions(context.Background())
+	gotSyms := map[domain.Symbol]bool{}
+	for _, p := range positions {
+		gotSyms[p.Symbol] = true
+	}
+	if gotSyms["ETH/USDT"] {
+		t.Error("ETH/USDT should be dropped after it disappeared from the balance snapshot")
+	}
+	if !gotSyms["BTC/USDT"] {
+		t.Error("BTC/USDT should be added from the balance snapshot")
+	}
+}

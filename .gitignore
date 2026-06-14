@@ -27,3 +27,6 @@ vendor/
 # Logs
 *.log
 logs/*.log
+
+# MCP server config (contains API keys)
+.mcp.json

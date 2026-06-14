@@ -21,6 +21,12 @@ type futuresMode string
 
 const userDataKeepaliveInterval = 25 * time.Minute
 
+// defaultPositionResyncInterval is how often the broker re-fetches the
+// authoritative position snapshot over REST to recover any open/close the
+// user-data WS stream may have missed (dropped events, silent socket stalls).
+// Overridable per-deployment via engine.position_resync_interval_ms.
+const defaultPositionResyncInterval = 5 * time.Second
+
 const (
 	futuresModeMainnet futuresMode = "mainnet"
 	futuresModeTestnet futuresMode = "testnet"
@@ -33,9 +39,21 @@ type FuturesBroker struct {
 	mode    futuresMode
 	filters *FuturesExchangeInfo
 
+	// resyncInterval overrides defaultPositionResyncInterval when positive.
+	resyncInterval time.Duration
+
 	mu            sync.RWMutex
 	positions     map[domain.Symbol]domain.Position
 	leverageCache map[domain.Symbol]int // last-applied leverage per symbol (avoids redundant REST calls)
+}
+
+// SetResyncInterval overrides the periodic REST position-resync cadence. A
+// non-positive value is ignored, leaving the default in effect. Must be called
+// before Connect.
+func (b *FuturesBroker) SetResyncInterval(d time.Duration) {
+	if d > 0 {
+		b.resyncInterval = d
+	}
 }
 
 // NewFuturesBroker creates a FuturesBroker.
@@ -57,7 +75,9 @@ func (b *FuturesBroker) ExchangeInfo() *FuturesExchangeInfo { return b.filters }
 func (b *FuturesBroker) Venue() domain.Venue { return domain.VenueBinanceFutures }
 
 // Connect bootstraps positions once, then keeps them fresh via the private
-// user-data websocket. It also preloads the exchangeInfo filter cache.
+// user-data websocket. A periodic REST resync runs alongside as a safety net
+// for any WS events that are dropped or never delivered. It also preloads the
+// exchangeInfo filter cache.
 func (b *FuturesBroker) Connect(ctx context.Context) error {
 	if err := b.filters.Refresh(ctx); err != nil {
 		slog.Warn("futures: exchange info refresh failed on connect; orders will reject until recovered", "error", err)
@@ -66,7 +86,28 @@ func (b *FuturesBroker) Connect(ctx context.Context) error {
 		return err
 	}
 	go b.runUserDataStream(ctx)
+	go b.runPositionResync(ctx)
 	return nil
+}
+
+// runPositionResync periodically re-fetches the authoritative position
+// snapshot over REST so the cache converges to the exchange's true state even
+// when the user-data WS stream misses events. Exits cleanly on ctx cancel.
+func (b *FuturesBroker) runPositionResync(ctx context.Context) {
+	interval := b.resyncInterval
+	if interval <= 0 {
+		interval = defaultPositionResyncInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.resyncPositions(ctx)
+		}
+	}
 }
 
 // StreamQuotes is not supported on REST; use the futures KlinesWS.
@@ -474,16 +515,35 @@ func (b *FuturesBroker) Balance(ctx context.Context) (port.AccountBalance, error
 }
 
 func (b *FuturesBroker) bootstrapPositions(ctx context.Context) error {
+	snapshot, err := b.fetchPositionSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.positions = snapshot
+	b.mu.Unlock()
+	return nil
+}
+
+// fetchPositionSnapshot queries the futures account REST endpoint and returns
+// the authoritative open-position map. Shared by bootstrap (replace) and the
+// periodic resync (merge via applyPositionSnapshot).
+func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.Symbol]domain.Position, error) {
 	account, err := b.client.NewGetAccountService().Do(ctx)
 	if err != nil {
-		return fmt.Errorf("binance futures get account: %w", err)
+		return nil, fmt.Errorf("binance futures get account: %w", err)
 	}
 
 	next := make(map[domain.Symbol]domain.Position)
 	for _, p := range account.Positions {
-		pos, ok, err := futuresAccountPositionToDomain(p.Symbol, p.PositionAmt, p.EntryPrice, p.UnrealizedProfit)
+		// The account endpoint does not expose markPrice directly. Derive it
+		// from notional (= markPrice * positionAmt, signed): markPrice =
+		// |notional| / |positionAmt|. Passing UnrealizedProfit here was a bug —
+		// it stored PnL (which is negative for a loser) into CurrentPrice.
+		markStr := deriveFuturesMarkPrice(p.Notional, p.PositionAmt)
+		pos, ok, err := futuresAccountPositionToDomain(p.Symbol, p.PositionAmt, p.EntryPrice, markStr)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !ok {
 			continue
@@ -507,11 +567,19 @@ func (b *FuturesBroker) bootstrapPositions(ctx context.Context) error {
 		}
 		next[pos.Symbol] = pos
 	}
+	return next, nil
+}
 
-	b.mu.Lock()
-	b.positions = next
-	b.mu.Unlock()
-	return nil
+// resyncPositions fetches an authoritative REST snapshot and merges it into the
+// cache, recovering any open/close the user-data WS stream missed. Errors are
+// logged, not fatal — the next tick retries.
+func (b *FuturesBroker) resyncPositions(ctx context.Context) {
+	snapshot, err := b.fetchPositionSnapshot(ctx)
+	if err != nil {
+		slog.Warn("futures position resync failed", "error", err)
+		return
+	}
+	b.applyPositionSnapshot(snapshot)
 }
 
 func (b *FuturesBroker) runUserDataStream(ctx context.Context) {
@@ -697,6 +765,23 @@ func (b *FuturesBroker) handleAccountConfigUpdate(message []byte) error {
 		b.positions[sym] = existing
 	}
 	return nil
+}
+
+// deriveFuturesMarkPrice computes the mark price from a position's signed
+// notional and signed position amount: markPrice = |notional| / |positionAmt|.
+// The futures account endpoint exposes notional and positionAmt but not
+// markPrice directly. Returns "" when either input is missing or the amount is
+// zero, so the caller's decimal parse degrades to zero rather than a bad value.
+func deriveFuturesMarkPrice(notionalStr, amountStr string) string {
+	notional, err := decimal.NewFromString(notionalStr)
+	if err != nil {
+		return ""
+	}
+	amount, err := decimal.NewFromString(amountStr)
+	if err != nil || amount.IsZero() {
+		return ""
+	}
+	return notional.Abs().Div(amount.Abs()).String()
 }
 
 func futuresAccountPositionToDomain(rawSymbol, amountStr, entryStr, currentStr string) (domain.Position, bool, error) {

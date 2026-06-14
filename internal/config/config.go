@@ -24,6 +24,7 @@ type Config struct {
 	WebSocket       WSConfig              `yaml:"websocket"`
 	ChatOps         ChatOpsConfig         `yaml:"chatops"`
 	TUI             TUIConfig             `yaml:"tui"`
+	Web             WebConfig             `yaml:"web"`
 	Ingest          IngestConfig          `yaml:"ingest"`
 	Backtest        BacktestConfig        `yaml:"backtest"`
 	LogRetention    LogRetentionConfig    `yaml:"log_retention"`
@@ -55,6 +56,11 @@ type LogRetentionConfig struct {
 type EngineConfig struct {
 	EvaluationIntervalMS int  `yaml:"evaluation_interval_ms"`
 	KillSwitch           bool `yaml:"kill_switch"`
+	// PositionResyncIntervalMS is how often each broker re-fetches the
+	// authoritative open-position snapshot over REST, recovering any
+	// open/close the user-data WebSocket stream missed. Zero falls back to
+	// the broker default (5s).
+	PositionResyncIntervalMS int `yaml:"position_resync_interval_ms"`
 }
 
 type RiskConfig struct {
@@ -202,6 +208,17 @@ type TUIConfig struct {
 	MaxAgentLogLines int `yaml:"max_agent_log_lines"`
 }
 
+// WebConfig controls the embedded HTTP + WebSocket dashboard server.
+type WebConfig struct {
+	// Enabled turns the web dashboard server on. When false no socket is opened.
+	Enabled bool `yaml:"enabled"`
+	// ListenAddr is the host:port the server binds to (e.g. ":8080").
+	ListenAddr string `yaml:"listen_addr"`
+	// AllowedOrigins is the WebSocket Origin allowlist. Entries are matched
+	// exactly against the request Origin header. Empty means same-origin only.
+	AllowedOrigins []string `yaml:"allowed_origins"`
+}
+
 type IngestConfig struct {
 	CoinGlass        IngestSourceConfig `yaml:"coinglass"`
 	CoinGlassScraper IngestSourceConfig `yaml:"coinglass_scraper"`
@@ -263,6 +280,11 @@ type SecretsConfig struct {
 
 	DatabaseURL string
 	RedisURL    string
+
+	// WebAuthToken is the bearer token required by the web dashboard's
+	// /api/* and /ws endpoints. Empty disables the web auth gate (only
+	// acceptable when web.enabled is false).
+	WebAuthToken string
 
 	GeminiAPIKey     string
 	AnthropicAPIKey  string
@@ -350,6 +372,7 @@ func loadSecrets() SecretsConfig {
 		FinnhubAPIKey:                  os.Getenv("FINNHUB_API_KEY"),
 		DatabaseURL:                    os.Getenv("DATABASE_URL"),
 		RedisURL:                       os.Getenv("REDIS_URL"),
+		WebAuthToken:                   os.Getenv("WEB_AUTH_TOKEN"),
 		GeminiAPIKey:                   os.Getenv("GEMINI_API_KEY"),
 		AnthropicAPIKey:                os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicBaseURL:               os.Getenv("ANTHROPIC_BASE_URL"),
@@ -398,6 +421,12 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 			c.Agent.BiasTTLMinutes, c.Agent.ScreeningIntervalMinutes)
 	}
 
+	// Position resync interval is optional (zero falls back to the broker
+	// default), but a negative value is always a misconfiguration.
+	if c.Engine.PositionResyncIntervalMS < 0 {
+		errs.add("engine.position_resync_interval_ms (%d) must be >= 0", c.Engine.PositionResyncIntervalMS)
+	}
+
 	// Discovery config (Phase 0) — only validated when enabled.
 	if c.Agent.Discovery.Enabled {
 		d := c.Agent.Discovery
@@ -438,6 +467,18 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 	// Risk guardrails: at least one limit must be set
 	if c.Risk.MaxDrawdownPct == 0 && c.Risk.MaxDailyLossPct == 0 {
 		errs.add("at least one of max_drawdown_pct or max_daily_loss_pct must be > 0 (no guardrails)")
+	}
+
+	// Web dashboard: when enabled it must have a bind address and an auth
+	// token. The token gates every /api/* and /ws request; an enabled server
+	// with no token would expose ChatOps write controls unauthenticated.
+	if c.Web.Enabled {
+		if strings.TrimSpace(c.Web.ListenAddr) == "" {
+			errs.add("web.listen_addr must be set when web.enabled is true (e.g. \":8080\")")
+		}
+		if strings.TrimSpace(c.Secrets.WebAuthToken) == "" {
+			errs.add("WEB_AUTH_TOKEN is required when web.enabled is true (gates /api and /ws)")
+		}
 	}
 
 	// DEMO env requires Binance Demo Trading API keys

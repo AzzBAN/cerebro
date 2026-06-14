@@ -98,6 +98,11 @@ func (r *Runner) SendAgentLog(line string) {
 	r.Push(AgentLogMsg{Line: line})
 }
 
+// SendOrderLog delivers an order-lifecycle line to the TUI log panel.
+func (r *Runner) SendOrderLog(line string) {
+	r.Push(OrderMsg{Line: line})
+}
+
 // SendSysLog implements observability.LogSink.
 // It delivers a system log line (from slog) to the TUI log panel with the
 // appropriate level label so it can be coloured differently from agent output.

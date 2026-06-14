@@ -27,6 +27,12 @@ const (
 	spotModeDemo    spotMode = "demo"
 )
 
+// defaultPositionResyncInterval is how often the broker re-fetches the
+// authoritative balance snapshot over REST to recover any open/close the
+// user-data WS stream may have missed (dropped events, silent socket stalls).
+// Overridable per-deployment via engine.position_resync_interval_ms.
+const defaultPositionResyncInterval = 5 * time.Second
+
 type spotBalance struct {
 	free   decimal.Decimal
 	locked decimal.Decimal
@@ -47,9 +53,21 @@ type SpotBroker struct {
 	minLots  map[domain.Symbol]decimal.Decimal // minimum tradeable qty per symbol (dust filter)
 	filters  *SpotExchangeInfo                 // symbol filter cache (PRICE/LOT/NOTIONAL)
 
+	// resyncInterval overrides defaultPositionResyncInterval when positive.
+	resyncInterval time.Duration
+
 	mu        sync.RWMutex
 	balances  map[string]spotBalance
 	positions map[domain.Symbol]domain.Position
+}
+
+// SetResyncInterval overrides the periodic REST position-resync cadence. A
+// non-positive value is ignored, leaving the default in effect. Must be called
+// before Connect.
+func (b *SpotBroker) SetResyncInterval(d time.Duration) {
+	if d > 0 {
+		b.resyncInterval = d
+	}
 }
 
 // NewSpotBroker creates a SpotBroker wrapping the provided client.
@@ -85,9 +103,11 @@ func (b *SpotBroker) ExchangeInfo() *SpotExchangeInfo { return b.filters }
 func (b *SpotBroker) Venue() domain.Venue { return domain.VenueBinanceSpot }
 
 // Connect bootstraps positions once, then maintains a local position cache from
-// the private user-data websocket stream. It also loads the exchangeInfo
-// filter cache so subsequent order placements can quantise qty/price to
-// each symbol's tickSize and stepSize without an extra round-trip.
+// the private user-data websocket stream. A periodic REST resync runs alongside
+// as a safety net for any WS events that are dropped or never delivered. It
+// also loads the exchangeInfo filter cache so subsequent order placements can
+// quantise qty/price to each symbol's tickSize and stepSize without an extra
+// round-trip.
 func (b *SpotBroker) Connect(ctx context.Context) error {
 	if err := b.filters.Refresh(ctx); err != nil {
 		// Soft-fail: we still want to come up even if exchangeInfo is
@@ -99,7 +119,28 @@ func (b *SpotBroker) Connect(ctx context.Context) error {
 		return err
 	}
 	go b.runUserDataStream(ctx)
+	go b.runPositionResync(ctx)
 	return nil
+}
+
+// runPositionResync periodically re-fetches the authoritative balance snapshot
+// over REST so the cache converges to the exchange's true state even when the
+// user-data WS stream misses events. Exits cleanly on ctx cancel.
+func (b *SpotBroker) runPositionResync(ctx context.Context) {
+	interval := b.resyncInterval
+	if interval <= 0 {
+		interval = defaultPositionResyncInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.resyncPositions(ctx)
+		}
+	}
 }
 
 // StreamQuotes is not implemented on the REST broker; use KlinesWS.
@@ -455,17 +496,13 @@ func (b *SpotBroker) Balance(_ context.Context) (port.AccountBalance, error) {
 }
 
 func (b *SpotBroker) bootstrapPositions(ctx context.Context) error {
-	account, err := b.client.NewGetAccountService().Do(ctx)
+	snapshot, err := b.fetchBalanceSnapshot(ctx)
 	if err != nil {
-		return fmt.Errorf("binance spot get account: %w", err)
+		return err
 	}
 
 	b.mu.Lock()
-	for _, bal := range account.Balances {
-		free, _ := decimal.NewFromString(bal.Free)
-		locked, _ := decimal.NewFromString(bal.Locked)
-		b.balances[strings.ToUpper(bal.Asset)] = spotBalance{free: free, locked: locked}
-	}
+	b.balances = snapshot
 	b.rebuildPositionsLocked()
 	b.mu.Unlock()
 
@@ -474,6 +511,37 @@ func (b *SpotBroker) bootstrapPositions(ctx context.Context) error {
 	b.fetchCurrentPrices(ctx)
 
 	return nil
+}
+
+// fetchBalanceSnapshot queries the spot account REST endpoint and returns the
+// authoritative balance map. Shared by bootstrap (replace + price backfill)
+// and the periodic resync (replace via applyBalanceSnapshot).
+func (b *SpotBroker) fetchBalanceSnapshot(ctx context.Context) (map[string]spotBalance, error) {
+	account, err := b.client.NewGetAccountService().Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("binance spot get account: %w", err)
+	}
+	next := make(map[string]spotBalance, len(account.Balances))
+	for _, bal := range account.Balances {
+		free, _ := decimal.NewFromString(bal.Free)
+		locked, _ := decimal.NewFromString(bal.Locked)
+		next[strings.ToUpper(bal.Asset)] = spotBalance{free: free, locked: locked}
+	}
+	return next, nil
+}
+
+// resyncPositions fetches an authoritative REST balance snapshot, applies it
+// wholesale, and backfills prices for any newly-discovered positions. This
+// recovers any open/close the user-data WS stream missed. Errors are logged,
+// not fatal — the next tick retries.
+func (b *SpotBroker) resyncPositions(ctx context.Context) {
+	snapshot, err := b.fetchBalanceSnapshot(ctx)
+	if err != nil {
+		slog.Warn("spot position resync failed", "error", err)
+		return
+	}
+	b.applyBalanceSnapshot(snapshot)
+	b.fetchCurrentPrices(ctx)
 }
 
 // fetchCurrentPrices queries the Binance ticker API for each open position and
@@ -638,6 +706,24 @@ func (b *SpotBroker) handleUserDataMessage(message []byte) error {
 	}
 
 	return nil
+}
+
+// applyBalanceSnapshot replaces the cached balance map with a fresh,
+// authoritative snapshot (e.g. from a REST resync) and rebuilds the position
+// view. Balances are REPLACED wholesale rather than merged: an asset sold to
+// zero is simply absent from the snapshot, so a merge would leave a stale
+// non-zero balance and a phantom position. Cerebro-internal position metadata
+// (SL/TP/Strategy/CorrelationID/OpenedAt) is preserved by
+// rebuildPositionsLocked for surviving symbols. This recovers state the
+// user-data WS may have missed.
+func (b *SpotBroker) applyBalanceSnapshot(snapshot map[string]spotBalance) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.balances = make(map[string]spotBalance, len(snapshot))
+	for asset, bal := range snapshot {
+		b.balances[strings.ToUpper(asset)] = bal
+	}
+	b.rebuildPositionsLocked()
 }
 
 func (b *SpotBroker) rebuildPositionsLocked() {

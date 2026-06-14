@@ -6,7 +6,7 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/marketdata"
-	"github.com/azhar/cerebro/internal/port"
+	"github.com/azhar/cerebro/internal/uistate"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -48,32 +48,23 @@ type PositionsMsg struct{ Positions []domain.Position }
 type clockTickMsg time.Time
 
 // AgentStep represents the current step in an agent's ReAct loop.
-type AgentStep string
+// Aliased to the neutral uistate type so the TUI and web surfaces share one
+// definition.
+type AgentStep = uistate.AgentStep
 
 const (
-	StepThinking  AgentStep = "THINKING"
-	StepTool      AgentStep = "TOOL"
-	StepObserving AgentStep = "OBSERVING"
-	StepStreaming AgentStep = "STREAMING"
-	StepComplete  AgentStep = "COMPLETE"
-	StepError     AgentStep = "ERROR"
+	StepThinking  = uistate.StepThinking
+	StepTool      = uistate.StepTool
+	StepObserving = uistate.StepObserving
+	StepStreaming = uistate.StepStreaming
+	StepComplete  = uistate.StepComplete
+	StepError     = uistate.StepError
 )
 
 // AgentStateMsg updates the live state of a running agent in the agent panel.
-type AgentStateMsg struct {
-	Agent       string
-	RunID       string
-	Step        AgentStep
-	ToolName    string
-	Provider    string
-	Model       string
-	Content     string // markdown result on COMPLETE, error message on ERROR
-	Description string // human-readable context, e.g. "Analyzing BTCUSDT market conditions"
-	Symbol      string
-	StepNum     int // 1-based step counter in the ReAct loop
-	MaxSteps    int // configured turn limit
-	At          time.Time
-}
+// It is an alias of uistate.AgentState so *tui.Runner satisfies uistate.Sink
+// and the same value doubles as a tea.Msg in the Update loop.
+type AgentStateMsg = uistate.AgentState
 
 // ─── Main tab identifiers ────────────────────────────────────────────────────
 
@@ -255,27 +246,18 @@ type BiasUpdatedMsg struct {
 	Result domain.BiasResult
 }
 
-// MacroSnapshot bundles cross-market macro indicators displayed in the Macro panel.
-// All fields are optional: zero values render as "—".
-type MacroSnapshot struct {
-	FearGreed       domain.FearGreedIndex
-	BTCFundingRate  domain.FundingRate
-	BTCOpenInterest domain.OpenInterest
-	BTCLongShort    domain.LongShortRatio
-	UpdatedAt       time.Time
-}
+// MacroSnapshot bundles cross-market macro indicators displayed in the Macro
+// panel. Aliased to the neutral uistate type shared with the web surface.
+type MacroSnapshot = uistate.MacroSnapshot
 
 // MacroSnapshotMsg pushes a fresh MacroSnapshot into the TUI's Macro panel.
 type MacroSnapshotMsg struct {
 	Snapshot MacroSnapshot
 }
 
-// NewsSnapshot holds the latest headlines pulled by the CryptoPanic ingest
-// goroutine. Items are already sorted newest-first and capped by the caller.
-type NewsSnapshot struct {
-	Items     []port.NewsItem
-	UpdatedAt time.Time
-}
+// NewsSnapshot holds the latest headlines pulled by the news ingest
+// goroutine. Aliased to the neutral uistate type shared with the web surface.
+type NewsSnapshot = uistate.NewsSnapshot
 
 // NewsSnapshotMsg pushes a fresh NewsSnapshot into the TUI's News panel.
 type NewsSnapshotMsg struct {
@@ -283,24 +265,11 @@ type NewsSnapshotMsg struct {
 }
 
 // BudgetProviderUsage is the per-provider breakdown of today's LLM spend.
-// Mirrors agent.ProviderUsage so the TUI doesn't import the agent package.
-type BudgetProviderUsage struct {
-	Tokens  int64
-	CostUSD float64
-}
+type BudgetProviderUsage = uistate.BudgetProviderUsage
 
-// BudgetSnapshot is a point-in-time view of the current day's LLM token
-// and cost usage. Budgets of 0 mean "disabled" and the status bar chip
-// is hidden in that case.
-type BudgetSnapshot struct {
-	Date          string
-	TokensUsed    int64
-	CostUSD       float64
-	TokenBudget   int     // 0 = disabled
-	CostBudgetUSD float64 // 0 = disabled
-	PerProvider   map[string]BudgetProviderUsage
-	At            time.Time
-}
+// BudgetSnapshot is a point-in-time view of the current day's LLM token and
+// cost usage. Aliased to the neutral uistate type shared with the web surface.
+type BudgetSnapshot = uistate.BudgetSnapshot
 
 // BudgetSnapshotMsg pushes a fresh BudgetSnapshot into the TUI's status bar.
 type BudgetSnapshotMsg struct {
