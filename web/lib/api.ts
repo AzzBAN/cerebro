@@ -59,3 +59,27 @@ export async function postCommand(command: string): Promise<string> {
   if (!res.ok) throw new Error(body.error ?? `command ${res.status}`);
   return body.reply ?? "";
 }
+
+// confirmProposal accepts a pending SL/TP adjustment, executing it server-side.
+export async function confirmProposal(id: string): Promise<void> {
+  const res = await fetch(`/api/proposals/${encodeURIComponent(id)}/confirm`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `confirm ${res.status}`);
+  }
+}
+
+// rejectProposal discards a pending SL/TP adjustment without executing it.
+export async function rejectProposal(id: string): Promise<void> {
+  const res = await fetch(`/api/proposals/${encodeURIComponent(id)}/reject`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `reject ${res.status}`);
+  }
+}

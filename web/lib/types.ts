@@ -33,6 +33,19 @@ export interface Position {
   openedAt: number;
 }
 
+export interface Proposal {
+  id: string;
+  symbol: string;
+  venue: string;
+  side: string;
+  currentStop: string;
+  currentTp: string;
+  proposedStop: string;
+  proposedTp: string;
+  reasoning: string;
+  createdAt: number;
+}
+
 export interface LogLine {
   level: string;
   text: string;
@@ -90,6 +103,7 @@ export interface Budget {
 export interface Snapshot {
   quotes: Quote[];
   positions: Position[];
+  proposals: Proposal[];
   logs: LogLine[];
   agentRuns: AgentRun[];
   bias: Bias[];

@@ -1,8 +1,11 @@
 "use client";
 
+import { useState } from "react";
 import { useStore } from "@/lib/store";
 import { Panel, BiasPill, LevelBadge } from "./shared";
 import { fmtPrice, fmtPct, fmtUsdCompact, signClass, fmtAge } from "@/lib/format";
+import { confirmProposal, rejectProposal } from "@/lib/api";
+import type { Proposal } from "@/lib/types";
 
 /** MarketWatch renders the dense quote table with an optional bias column. */
 export function MarketWatch({ withBias = true }: { withBias?: boolean }) {
@@ -56,12 +59,68 @@ export function MarketWatch({ withBias = true }: { withBias?: boolean }) {
   );
 }
 
+/** ProposalBlock renders one pending SL/TP adjustment with confirm/reject. */
+function ProposalBlock({ p }: { p: Proposal }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function act(fn: (id: string) => Promise<void>) {
+    setBusy(true);
+    setErr("");
+    try {
+      await fn(p.id);
+      // On success the backend pushes a fresh "proposals" frame that removes
+      // this block; no local removal needed.
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="border-l-2 border-warn/60 bg-warn/5 pl-2 pr-1 py-1">
+      <div className="flex items-center justify-between">
+        <span className="font-bold text-warn">
+          {p.symbol} · SL/TP ADJUSTMENT
+        </span>
+        <span className="text-2xs text-fg-dim">{fmtAge(p.createdAt)}</span>
+      </div>
+      <div className="text-2xs text-fg-dim">
+        SL {fmtPrice(p.currentStop)} → <span className="text-fg">{fmtPrice(p.proposedStop)}</span>
+        {" · "}TP {fmtPrice(p.currentTp)} → <span className="text-fg">{fmtPrice(p.proposedTp)}</span>
+      </div>
+      {p.reasoning && <div className="mt-0.5 text-2xs text-fg-dim">{p.reasoning}</div>}
+      {err && <div className="mt-0.5 text-2xs text-bear">{err}</div>}
+      <div className="mt-1 flex gap-1.5">
+        <button
+          disabled={busy}
+          onClick={() => act(confirmProposal)}
+          className="px-2 py-0.5 text-2xs font-bold uppercase bg-bull/20 text-bull hover:bg-bull/30 disabled:opacity-40"
+        >
+          Confirm
+        </button>
+        <button
+          disabled={busy}
+          onClick={() => act(rejectProposal)}
+          className="px-2 py-0.5 text-2xs font-bold uppercase bg-bear/20 text-bear hover:bg-bear/30 disabled:opacity-40"
+        >
+          Reject
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Positions renders open positions with PnL/ROI coloring. */
 export function Positions() {
   const positions = useStore((s) => s.positions);
+  const proposals = useStore((s) => s.proposals);
   return (
-    <Panel title="Active Positions" color="bull" scroll right={`${positions.length} open`}>
+    <Panel title="Active Positions" color="bull" scroll right={proposals.length > 0 ? `${positions.length} open · ${proposals.length} pending` : `${positions.length} open`}>
       <div className="space-y-2">
+        {proposals.map((p) => (
+          <ProposalBlock key={p.id} p={p} />
+        ))}
         {positions.map((p, i) => (
           <div key={`${p.symbol}-${i}`} className="border-l-2 border-bull/40 pl-2">
             <div className="flex items-center justify-between">

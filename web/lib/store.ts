@@ -10,6 +10,7 @@ import type {
   Macro,
   NewsItem,
   Position,
+  Proposal,
   Quote,
   Snapshot,
 } from "./types";
@@ -20,6 +21,7 @@ interface State {
   connected: boolean;
   quotes: Record<string, Quote>;
   positions: Position[];
+  proposals: Proposal[];
   logs: LogLine[];
   agentRuns: Record<string, AgentRun>;
   agentOrder: string[];
@@ -39,6 +41,7 @@ export const useStore = create<State>((set) => ({
   connected: false,
   quotes: {},
   positions: [],
+  proposals: [],
   logs: [],
   agentRuns: {},
   agentOrder: [],
@@ -70,6 +73,7 @@ export const useStore = create<State>((set) => ({
       return {
         quotes,
         positions: s.positions ?? [],
+        proposals: s.proposals ?? [],
         logs: s.logs ?? [],
         agentRuns,
         agentOrder,
@@ -95,6 +99,8 @@ export const useStore = create<State>((set) => ({
         }
         case "positions":
           return { positions: data as Position[] };
+        case "proposals":
+          return { proposals: data as Proposal[] };
         case "log": {
           const next = [...st.logs, data as LogLine];
           if (next.length > MAX_LOGS) next.splice(0, next.length - MAX_LOGS);
@@ -143,6 +149,7 @@ function reduceSnapshot(s: Snapshot): Partial<State> {
   return {
     quotes,
     positions: s.positions ?? [],
+    proposals: s.proposals ?? [],
     logs: s.logs ?? [],
     agentRuns,
     agentOrder,
