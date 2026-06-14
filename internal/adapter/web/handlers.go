@@ -14,11 +14,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// webActorID is the actor identity attributed to commands issued from the web
+// ActorID is the actor identity attributed to commands issued from the web
 // dashboard. The chatops dispatcher's allowlist (if configured) is keyed on
 // actor IDs; "web:dashboard" lets operators allowlist the web surface
-// distinctly from telegram users.
-const webActorID = "web:dashboard"
+// distinctly from telegram users. The composition root adds this to the
+// allowlist when the web server is enabled (the bearer-token gate already
+// authenticated the request before it reaches the dispatcher).
+const ActorID = "web:dashboard"
+
+// webActorID is the internal alias used by the command handler.
+const webActorID = ActorID
 
 // Run starts the HTTP server and blocks until ctx is cancelled. Returns nil on
 // a clean (context-driven) shutdown, matching the runtime goroutine contract.
@@ -233,14 +238,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // frontendFS returns the embedded frontend as a sub-filesystem, or ok=false
-// when the export hasn't been built into the binary.
+// when the export hasn't been built into the binary. The presence of
+// index.html is the build marker — the dist/.gitkeep placeholder alone (which
+// `//go:embed all:dist` would otherwise count) does not qualify.
 func frontendFS() (fs.FS, bool) {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		return nil, false
 	}
-	// Treat an empty embed (only the placeholder) as "not built".
-	if entries, err := fs.ReadDir(sub, "."); err != nil || len(entries) == 0 {
+	if _, err := fs.Stat(sub, "index.html"); err != nil {
 		return nil, false
 	}
 	return sub, true

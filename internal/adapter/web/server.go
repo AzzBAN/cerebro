@@ -77,7 +77,8 @@ type TradeReader interface {
 }
 
 // NewServer builds a web dashboard server. hub may be nil (no live quote feed);
-// dispatcher may be nil (command endpoint returns an error).
+// dispatcher may be nil and set later via SetDispatcher (the chatops dispatcher
+// is constructed after the UI sink in the composition root).
 func NewServer(cfg Config, hub *marketdata.Hub, dispatcher Dispatcher, trades TradeReader, maxLogLines int) *Server {
 	if maxLogLines <= 0 {
 		maxLogLines = defaultMaxLogLines
@@ -93,6 +94,17 @@ func NewServer(cfg Config, hub *marketdata.Hub, dispatcher Dispatcher, trades Tr
 		clients:     make(map[*client]struct{}),
 		maxLogLines: maxLogLines,
 	}
+}
+
+// SetDispatcher injects the ChatOps dispatcher used by POST /api/command. Call
+// once during wiring before Run; concurrent calls are not supported.
+func (s *Server) SetDispatcher(d Dispatcher) {
+	s.dispatcher = d
+}
+
+// SetTradeStore injects the trade reader used by GET /api/trades.
+func (s *Server) SetTradeStore(t TradeReader) {
+	s.tradeStore = t
 }
 
 // ─── uistate.Sink implementation ──────────────────────────────────────────────
