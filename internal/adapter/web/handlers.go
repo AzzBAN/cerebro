@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/gorilla/websocket"
 )
 
@@ -88,6 +90,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/state", s.auth(http.HandlerFunc(s.handleState)))
 	mux.Handle("GET /api/trades", s.auth(http.HandlerFunc(s.handleTrades)))
 	mux.Handle("POST /api/command", s.auth(http.HandlerFunc(s.handleCommand)))
+	mux.Handle("POST /api/proposals/{id}/confirm", s.auth(http.HandlerFunc(s.handleProposalAction)))
+	mux.Handle("POST /api/proposals/{id}/reject", s.auth(http.HandlerFunc(s.handleProposalAction)))
 	mux.Handle("GET /ws", s.auth(http.HandlerFunc(s.handleWS)))
 
 	if sub, ok := frontendFS(); ok {
@@ -164,6 +168,34 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	reply := s.dispatcher.Dispatch(r.Context(), webActorID, req.Command)
 	writeJSON(w, http.StatusOK, map[string]string{"reply": reply})
+}
+
+func (s *Server) handleProposalAction(w http.ResponseWriter, r *http.Request) {
+	if s.proposalController == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "proposals not configured"})
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing proposal id"})
+		return
+	}
+	reject := strings.HasSuffix(r.URL.Path, "/reject")
+	var err error
+	if reject {
+		err = s.proposalController.Reject(id)
+	} else {
+		err = s.proposalController.Confirm(r.Context(), id)
+	}
+	if err != nil {
+		if errors.Is(err, positionproposal.ErrUnknownProposal) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // wsUpgrader is configured per-server so the Origin check honours the

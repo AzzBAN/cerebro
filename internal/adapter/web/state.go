@@ -10,6 +10,7 @@ package web
 
 import (
 	"github.com/azhar/cerebro/internal/domain"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/uistate"
 )
 
@@ -188,5 +189,34 @@ func budgetToDTO(s uistate.BudgetSnapshot) BudgetDTO {
 		CostUSD:       s.CostUSD,
 		TokenBudget:   s.TokenBudget,
 		CostBudgetUSD: s.CostBudgetUSD,
+	}
+}
+
+// ProposalDTO is one pending agent SL/TP adjustment awaiting operator action.
+type ProposalDTO struct {
+	ID           string `json:"id"`
+	Symbol       string `json:"symbol"`
+	Venue        string `json:"venue"`
+	Side         string `json:"side"`
+	CurrentStop  string `json:"currentStop"`
+	CurrentTP    string `json:"currentTp"`
+	ProposedStop string `json:"proposedStop"`
+	ProposedTP   string `json:"proposedTp"`
+	Reasoning    string `json:"reasoning"`
+	CreatedAt    int64  `json:"createdAt"` // unix millis
+}
+
+func proposalToDTO(p positionproposal.Proposal) ProposalDTO {
+	return ProposalDTO{
+		ID:           p.ID,
+		Symbol:       string(p.Symbol),
+		Venue:        string(p.Venue),
+		Side:         string(p.Side),
+		CurrentStop:  p.CurrentStop.String(),
+		CurrentTP:    p.CurrentTP.String(),
+		ProposedStop: p.ProposedStop.String(),
+		ProposedTP:   p.ProposedTP.String(),
+		Reasoning:    p.Reasoning,
+		CreatedAt:    p.CreatedAt.UnixMilli(),
 	}
 }

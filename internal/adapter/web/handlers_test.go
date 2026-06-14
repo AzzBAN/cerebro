@@ -1,10 +1,79 @@
 package web
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/azhar/cerebro/internal/positionproposal"
 )
+
+// stubProposalController records confirm/reject calls for handler tests.
+type stubProposalController struct {
+	confirmed  []string
+	rejected   []string
+	confirmErr error
+}
+
+func (s *stubProposalController) Confirm(_ context.Context, id string) error {
+	s.confirmed = append(s.confirmed, id)
+	return s.confirmErr
+}
+
+func (s *stubProposalController) Reject(id string) error {
+	s.rejected = append(s.rejected, id)
+	return nil
+}
+
+func TestHandleProposalConfirm(t *testing.T) {
+	ctrl := &stubProposalController{}
+	srv := newTestServer("", nil)
+	srv.SetProposalController(ctrl)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proposals/abc-123/confirm", nil)
+	req.SetPathValue("id", "abc-123")
+	rec := httptest.NewRecorder()
+	srv.handleProposalAction(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(ctrl.confirmed) != 1 || ctrl.confirmed[0] != "abc-123" {
+		t.Fatalf("confirmed = %v, want [abc-123]", ctrl.confirmed)
+	}
+}
+
+func TestHandleProposalReject(t *testing.T) {
+	ctrl := &stubProposalController{}
+	srv := newTestServer("", nil)
+	srv.SetProposalController(ctrl)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proposals/xyz/reject", nil)
+	req.SetPathValue("id", "xyz")
+	rec := httptest.NewRecorder()
+	srv.handleProposalAction(rec, req)
+
+	if rec.Code != http.StatusOK || len(ctrl.rejected) != 1 {
+		t.Fatalf("reject failed: code=%d rejected=%v", rec.Code, ctrl.rejected)
+	}
+}
+
+func TestHandleProposalUnknownID(t *testing.T) {
+	ctrl := &stubProposalController{confirmErr: fmt.Errorf("%w: x", positionproposal.ErrUnknownProposal)}
+	srv := newTestServer("", nil)
+	srv.SetProposalController(ctrl)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proposals/x/confirm", nil)
+	req.SetPathValue("id", "x")
+	rec := httptest.NewRecorder()
+	srv.handleProposalAction(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
 
 // TestStaticFrontendServed verifies the embedded Next.js export is served at
 // "/" when built into the binary. When the frontend has not been built (the

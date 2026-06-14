@@ -9,6 +9,7 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/marketdata"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/uistate"
 )
 
@@ -28,6 +29,13 @@ type Dispatcher interface {
 	Dispatch(ctx context.Context, actorID, raw string) string
 }
 
+// ProposalController is the subset of positionproposal.Store the web server
+// needs. Confirm executes the adjustment; Reject discards it.
+type ProposalController interface {
+	Confirm(ctx context.Context, id string) error
+	Reject(id string) error
+}
+
 // client is a single connected browser, with a buffered outbound queue so a
 // slow socket never blocks the engine. On overflow the client is dropped.
 type client struct {
@@ -43,9 +51,11 @@ type Server struct {
 	tradeStore TradeReader
 	hub        *marketdata.Hub
 
-	mu        sync.RWMutex
-	quotes    map[string]QuoteDTO
-	positions []PositionDTO
+	mu                 sync.RWMutex
+	quotes             map[string]QuoteDTO
+	positions          []PositionDTO
+	proposals          []ProposalDTO
+	proposalController ProposalController
 	logs      []LogDTO
 	agentRuns map[string]AgentRunDTO
 	runOrder  []string
@@ -107,6 +117,11 @@ func (s *Server) SetTradeStore(t TradeReader) {
 	s.tradeStore = t
 }
 
+// SetProposalController wires the proposal store for confirm/reject handling.
+func (s *Server) SetProposalController(c ProposalController) {
+	s.proposalController = c
+}
+
 // ─── uistate.Sink implementation ──────────────────────────────────────────────
 
 // SendPositions replaces the open-position snapshot.
@@ -119,6 +134,18 @@ func (s *Server) SendPositions(positions []domain.Position) {
 	s.positions = dtos
 	s.mu.Unlock()
 	s.broadcast("positions", dtos)
+}
+
+// SendProposals replaces the pending-proposal snapshot and broadcasts it.
+func (s *Server) SendProposals(proposals []positionproposal.Proposal) {
+	dtos := make([]ProposalDTO, 0, len(proposals))
+	for _, p := range proposals {
+		dtos = append(dtos, proposalToDTO(p))
+	}
+	s.mu.Lock()
+	s.proposals = dtos
+	s.mu.Unlock()
+	s.broadcast("proposals", dtos)
 }
 
 // SendBias records a fresh directional read.
@@ -222,6 +249,7 @@ func (s *Server) appendLog(e LogDTO) {
 type snapshot struct {
 	Quotes    []QuoteDTO    `json:"quotes"`
 	Positions []PositionDTO `json:"positions"`
+	Proposals []ProposalDTO `json:"proposals"`
 	Logs      []LogDTO      `json:"logs"`
 	AgentRuns []AgentRunDTO `json:"agentRuns"`
 	Bias      []BiasDTO     `json:"bias"`
@@ -252,6 +280,7 @@ func (s *Server) Snapshot() snapshot {
 	snap := snapshot{
 		Quotes:    quotes,
 		Positions: append([]PositionDTO(nil), s.positions...),
+		Proposals: append([]ProposalDTO(nil), s.proposals...),
 		Logs:      append([]LogDTO(nil), s.logs...),
 		AgentRuns: runs,
 		Bias:      bias,
