@@ -15,6 +15,7 @@ import (
 	"github.com/azhar/cerebro/internal/adapter/postgres"
 	rediscache "github.com/azhar/cerebro/internal/adapter/redis"
 	"github.com/azhar/cerebro/internal/adapter/telegram"
+	webadapter "github.com/azhar/cerebro/internal/adapter/web"
 	agentpkg "github.com/azhar/cerebro/internal/agent"
 	agenttools "github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/chatops"
@@ -32,6 +33,7 @@ import (
 	"github.com/azhar/cerebro/internal/risk"
 	"github.com/azhar/cerebro/internal/strategy"
 	"github.com/azhar/cerebro/internal/tui"
+	"github.com/azhar/cerebro/internal/uistate"
 	"github.com/azhar/cerebro/internal/watchdog"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -214,11 +216,39 @@ func (a *App) runRuntime(ctx context.Context) error {
 	var tuiRunner *tui.Runner
 	if a.cfg.TUI.MaxAgentLogLines > 0 && hasTTY() {
 		tuiRunner = tui.NewRunner(hub, a.cfg.TUI.MaxAgentLogLines)
-		observability.SetLogSink(tuiRunner)
 		slog.Debug("TUI runner created", "max_log_lines", a.cfg.TUI.MaxAgentLogLines)
 	} else if a.cfg.TUI.MaxAgentLogLines > 0 {
 		slog.Info("no interactive terminal detected — TUI disabled; all output goes to stderr")
 	}
+
+	// ── Web dashboard ──────────────────────────────────────────────────────────
+	// The web server mirrors the TUI's event surface. Its ChatOps dispatcher
+	// and trade store are injected later (both are built further down), so we
+	// construct it here only to register it in the UI fan-out.
+	var webServer *webadapter.Server
+	if a.cfg.Web.Enabled {
+		webServer = webadapter.NewServer(webadapter.Config{
+			ListenAddr:     a.cfg.Web.ListenAddr,
+			AuthToken:      a.cfg.Secrets.WebAuthToken,
+			AllowedOrigins: a.cfg.Web.AllowedOrigins,
+		}, hub, nil, nil, a.cfg.TUI.MaxAgentLogLines)
+		slog.Info("web dashboard enabled", "addr", a.cfg.Web.ListenAddr)
+	}
+
+	// ── UI fan-out ──────────────────────────────────────────────────────────────
+	// Every engine event is sent to this sink, which forwards to all live UI
+	// surfaces. newMultiSink drops nil members so a disabled TUI or web server
+	// is simply absent from the fan-out. Wrapping a typed-nil *tui.Runner would
+	// panic, so only append it when non-nil.
+	var uiSinks []uistate.Sink
+	if tuiRunner != nil {
+		uiSinks = append(uiSinks, tuiRunner)
+	}
+	if webServer != nil {
+		uiSinks = append(uiSinks, webServer)
+	}
+	uiSink := newMultiSink(uiSinks...)
+	observability.SetLogSink(uiSink)
 
 	// ── Ingest feeds ─────────────────────────────────────────────────────────
 	var derivFeed port.DerivativesFeed
@@ -373,7 +403,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 	quoteFallback := buildQuoteFallback(discoveryFeeds)
 	toolReg := buildToolRegistry(
 		a.cfg, hub, cache, trades, agentLog, audit, gate,
-		brokerList, buildRouteOrderFn(router, gate, brokersByVenue, symbolMeta, env, tuiRunner), derivFeed, newsFeed, calFeed, notifiers,
+		brokerList, buildRouteOrderFn(router, gate, brokersByVenue, symbolMeta, env, uiSink), derivFeed, newsFeed, calFeed, notifiers,
 		symbolSource.Symbols, quoteFallback,
 	)
 
@@ -421,14 +451,14 @@ func (a *App) runRuntime(ctx context.Context) error {
 			"daily_token_budget", a.cfg.Agent.LLM.DailyTokenBudget,
 			"daily_cost_budget_usd", a.cfg.Agent.LLM.DailyCostBudgetUSD)
 
-		if tuiRunner != nil {
+		if len(uiSink) > 0 {
 			provider := llmChain.Provider()
 			model := llmChain.ModelID()
 			agentRuntime.SetOnStep(func(agent, runID string, step agentpkg.AgentStep, toolName, description string, stepNum, maxSteps int) {
-				tuiRunner.SendAgentState(tui.AgentStateMsg{
+				uiSink.SendAgentState(uistate.AgentState{
 					Agent:       agent,
 					RunID:       runID,
-					Step:        tui.AgentStep(step),
+					Step:        uistate.AgentStep(step),
 					ToolName:    toolName,
 					Provider:    provider,
 					Model:       model,
@@ -438,6 +468,8 @@ func (a *App) runRuntime(ctx context.Context) error {
 					At:          time.Now(),
 				})
 			})
+		}
+		if tuiRunner != nil {
 			tuiRunner.SetCopilotFn(copilotFn)
 		}
 	} else {
@@ -451,10 +483,16 @@ func (a *App) runRuntime(ctx context.Context) error {
 		confirmTimeout = 30
 	}
 	var allowlistFn func(actorID string) bool
-	if len(a.cfg.Secrets.TelegramAllowlistUserIDs) > 0 {
-		allowed := make(map[string]bool, len(a.cfg.Secrets.TelegramAllowlistUserIDs))
+	if len(a.cfg.Secrets.TelegramAllowlistUserIDs) > 0 || a.cfg.Web.Enabled {
+		allowed := make(map[string]bool, len(a.cfg.Secrets.TelegramAllowlistUserIDs)+1)
 		for _, id := range a.cfg.Secrets.TelegramAllowlistUserIDs {
 			allowed["telegram:"+id] = true
+		}
+		// The web dashboard's command path is already authenticated by the
+		// bearer-token gate (WEB_AUTH_TOKEN) before reaching the dispatcher, so
+		// its actor is trusted whenever the web server is enabled.
+		if a.cfg.Web.Enabled {
+			allowed[webadapter.ActorID] = true
 		}
 		allowlistFn = func(actorID string) bool { return allowed[actorID] }
 	}
@@ -504,6 +542,14 @@ func (a *App) runRuntime(ctx context.Context) error {
 		slog.Debug("ChatOps dispatcher wired (no bot transport)")
 	}
 
+	// Inject the dispatcher + trade store into the web server now that both
+	// exist. The web command endpoint routes through the same guarded
+	// dispatcher as the Telegram bot.
+	if webServer != nil {
+		webServer.SetDispatcher(chatopsDispatcher)
+		webServer.SetTradeStore(trades)
+	}
+
 	// ── errgroup ──────────────────────────────────────────────────────────────
 	g, gctx := errgroup.WithContext(ctx)
 
@@ -525,10 +571,10 @@ func (a *App) runRuntime(ctx context.Context) error {
 	// Market data: synthetic feeder + fill-monitor (paper) or live Binance WS (live)
 	if env == domain.EnvironmentPaper {
 		g.Go(func() error {
-			return runSyntheticFeeder(gctx, hub, a.cfg.Markets, evalInterval, tuiRunner, &metrics)
+			return runSyntheticFeeder(gctx, hub, a.cfg.Markets, evalInterval, uiSink, &metrics)
 		})
 		g.Go(func() error {
-			return runFillMonitor(gctx, hub, matcher, tuiRunner, &metrics)
+			return runFillMonitor(gctx, hub, matcher, uiSink, &metrics)
 		})
 	} else {
 		spawnLiveKlinesWS(g, gctx, a.cfg, hub)
@@ -536,12 +582,12 @@ func (a *App) runRuntime(ctx context.Context) error {
 
 	// Strategy engine
 	g.Go(func() error {
-		return runStrategyEngine(gctx, hub, registry, dedup, gate, brokersByVenue, env, a.cfg.Agent.LLM, router, symbolMeta, tuiRunner, &metrics, kc, a.cfg.Markets, agentRuntime, toolReg, trades)
+		return runStrategyEngine(gctx, hub, registry, dedup, gate, brokersByVenue, env, a.cfg.Agent.LLM, router, symbolMeta, uiSink, &metrics, kc, a.cfg.Markets, agentRuntime, toolReg, trades)
 	})
 
 	// Heartbeat: prints full metrics summary every 10 s
 	g.Go(func() error {
-		return runHeartbeat(gctx, hub, gate, brokersByVenue, tuiRunner, &metrics, costTracker)
+		return runHeartbeat(gctx, hub, gate, brokersByVenue, uiSink, &metrics, costTracker)
 	})
 
 	for _, venue := range activeVenues {
@@ -688,11 +734,12 @@ func (a *App) runRuntime(ctx context.Context) error {
 			screeningAgent.SetPlanner(planner)
 		}
 
-		// When the TUI is mounted, forward each fresh bias into the
-		// Bias / Signals panel. *tui.Runner satisfies BiasPublisher via
-		// its SendBias method.
-		if tuiRunner != nil {
-			screeningAgent.SetBiasPublisher(tuiRunner)
+		// Forward each fresh bias into every live surface's Bias / Signals
+		// panel. multiSink satisfies BiasPublisher via its SendBias method,
+		// so this fans out to both the TUI and the web dashboard (whichever
+		// are mounted) — not only the TUI.
+		if len(uiSink) > 0 {
+			screeningAgent.SetBiasPublisher(uiSink)
 		}
 		g.Go(func() error {
 			slog.Info("screening agent starting",
@@ -757,7 +804,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 	}
 
 	// Ingest scheduled runners
-	startIngestRunners(gctx, g, a.cfg, cache, derivFeed, newsFeed, fjFeed, calFeed, tuiRunner)
+	startIngestRunners(gctx, g, a.cfg, cache, derivFeed, newsFeed, fjFeed, calFeed, uiSink)
 
 	// Log archival (conditional — requires Postgres pool, nil when no database)
 	if logArchiver := buildLogArchiver(pool, a.cfg); logArchiver != nil {
@@ -777,6 +824,16 @@ func (a *App) runRuntime(ctx context.Context) error {
 			}
 			slog.Info("TUI closed by operator — shutting down engine")
 			return fmt.Errorf("operator quit")
+		})
+	}
+
+	// Web dashboard server.
+	if webServer != nil {
+		g.Go(func() error {
+			if err := webServer.Run(gctx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("web server: %w", err)
+			}
+			return nil
 		})
 	}
 
@@ -805,7 +862,7 @@ func runHeartbeat(
 	hub *marketdata.Hub,
 	gate *risk.Gate,
 	brokers map[domain.Venue]port.Broker,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 	metrics *runtimeMetrics,
 	costTracker *agentpkg.CostTracker,
 ) error {
@@ -849,22 +906,22 @@ func runHeartbeat(
 				Timestamp:           time.Now(),
 			}
 
-			if tuiRunner != nil {
-				tuiRunner.SendPositions(positions)
+			if len(uiSink) > 0 {
+				uiSink.SendPositions(positions)
 				summary := fmt.Sprintf(
 					"state=%-8s  halted=%-5v  pos=%-3d  spot=%-2d  futures=%-2d  candles=%-4d  signals=%-4d  orders=%-4d",
 					f.TradingState, f.Halted, f.OpenPositions,
 					spotCount, futuresCount, f.CandlesProduced, f.SignalsFired, f.OrdersRouted,
 				)
-				tuiRunner.SendHeartbeat(summary)
+				uiSink.SendHeartbeat(summary)
 
 				if costTracker != nil {
 					snap := costTracker.Snapshot(ctx)
-					per := make(map[string]tui.BudgetProviderUsage, len(snap.PerProvider))
+					per := make(map[string]uistate.BudgetProviderUsage, len(snap.PerProvider))
 					for provider, u := range snap.PerProvider {
-						per[provider] = tui.BudgetProviderUsage{Tokens: u.Tokens, CostUSD: u.CostUSD}
+						per[provider] = uistate.BudgetProviderUsage{Tokens: u.Tokens, CostUSD: u.CostUSD}
 					}
-					tuiRunner.SendBudget(tui.BudgetSnapshot{
+					uiSink.SendBudget(uistate.BudgetSnapshot{
 						Date:          snap.Date,
 						TokensUsed:    snap.TokensUsed,
 						CostUSD:       snap.CostUSD,
@@ -1124,15 +1181,15 @@ func hasTTY() bool {
 	return true
 }
 
-func pushTUI(runner *tui.Runner, line string) {
-	if runner != nil {
-		runner.Push(tui.AgentLogMsg{Line: line})
+func pushTUI(sink uistate.Sink, line string) {
+	if sink != nil {
+		sink.SendAgentLog(line)
 	}
 }
 
-func pushTUIOrder(runner *tui.Runner, line string) {
-	if runner != nil {
-		runner.Push(tui.OrderMsg{Line: line})
+func pushTUIOrder(sink uistate.Sink, line string) {
+	if sink != nil {
+		sink.SendOrderLog(line)
 	}
 }
 

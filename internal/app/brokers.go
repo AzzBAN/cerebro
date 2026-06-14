@@ -19,7 +19,6 @@ import (
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/azhar/cerebro/internal/risk"
-	"github.com/azhar/cerebro/internal/tui"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -300,7 +299,7 @@ func buildRouteOrderFn(
 	brokers map[domain.Venue]port.Broker,
 	symbolMeta map[domain.Symbol]symbolMeta,
 	env domain.Environment,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 ) func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 	return func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 		meta, resolved, err := resolveRouteSymbol(req.Symbol, symbolMeta)
@@ -333,7 +332,7 @@ func buildRouteOrderFn(
 			if gerr := gate.Check(ctx, sig, positions); gerr != nil {
 				slog.Warn("✗ agent order rejected by risk gate",
 					"symbol", resolved, "side", req.Side, "reason", gerr)
-				pushTUIOrder(tuiRunner, fmt.Sprintf("✗ RISK-REJECT(agent) %s %s — %v",
+				pushTUIOrder(uiSink, fmt.Sprintf("✗ RISK-REJECT(agent) %s %s — %v",
 					resolved, req.Side, gerr))
 				return fmt.Errorf("risk gate: %w", gerr)
 			}
@@ -392,7 +391,7 @@ func buildRouteOrderFn(
 		if !req.TakeProfit1.IsZero() {
 			summary += fmt.Sprintf(" TP=%s", req.TakeProfit1.StringFixed(4))
 		}
-		pushTUIOrder(tuiRunner, summary)
+		pushTUIOrder(uiSink, summary)
 		return nil
 	}
 }
