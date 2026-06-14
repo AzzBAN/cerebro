@@ -2,6 +2,7 @@ package positionproposal
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -13,16 +14,21 @@ type fakeAdjuster struct {
 	placed     []domain.BracketRequest
 	protective map[domain.Symbol]domain.BracketResponse
 	recorded   map[domain.Symbol]domain.BracketResponse
+	cancelErr  error
+	placeErr   error
 }
 
 func (f *fakeAdjuster) PlaceBracket(_ context.Context, req domain.BracketRequest) (domain.BracketResponse, error) {
 	f.placed = append(f.placed, req)
+	if f.placeErr != nil {
+		return domain.BracketResponse{}, f.placeErr
+	}
 	return domain.BracketResponse{Symbol: req.Symbol, StopOrderID: "new-stop"}, nil
 }
 
 func (f *fakeAdjuster) CancelBracket(_ context.Context, resp domain.BracketResponse) error {
 	f.cancelled = append(f.cancelled, resp)
-	return nil
+	return f.cancelErr
 }
 
 func (f *fakeAdjuster) ProtectiveBracket(sym domain.Symbol) (domain.BracketResponse, bool) {
@@ -75,5 +81,42 @@ func TestApplyAdjustment_NoExistingProtection_StillPlaces(t *testing.T) {
 	}
 	if len(fa.placed) != 1 {
 		t.Fatalf("expected bracket placed, got %d", len(fa.placed))
+	}
+}
+
+func TestApplyAdjustment_CancelFails_DoesNotPlace(t *testing.T) {
+	fa := &fakeAdjuster{
+		protective: map[domain.Symbol]domain.BracketResponse{
+			"BTC/USDT-PERP": {Symbol: "BTC/USDT-PERP", StopOrderID: "old-stop"},
+		},
+		cancelErr: errors.New("cancel rejected"),
+	}
+	apply := ApplyAdjustment(fa, fa, fa)
+	p := Proposal{Symbol: "BTC/USDT-PERP", Venue: domain.VenueBinanceFutures, Side: domain.SideBuy,
+		Quantity: decimal.NewFromInt(1), ProposedStop: decimal.NewFromInt(61000)}
+	if err := apply(context.Background(), p); err == nil {
+		t.Fatal("expected error when cancel fails")
+	}
+	if len(fa.placed) != 0 {
+		t.Fatalf("must not place a bracket after cancel failure, got %d", len(fa.placed))
+	}
+	if len(fa.recorded) != 0 {
+		t.Fatal("must not record after cancel failure")
+	}
+}
+
+func TestApplyAdjustment_PlaceFails_DoesNotRecord(t *testing.T) {
+	fa := &fakeAdjuster{
+		protective: map[domain.Symbol]domain.BracketResponse{},
+		placeErr:   errors.New("place rejected"),
+	}
+	apply := ApplyAdjustment(fa, fa, fa)
+	p := Proposal{Symbol: "ETH/USDT", Venue: domain.VenueBinanceSpot, Side: domain.SideBuy,
+		Quantity: decimal.NewFromInt(2), ProposedStop: decimal.NewFromInt(2800)}
+	if err := apply(context.Background(), p); err == nil {
+		t.Fatal("expected error when place fails")
+	}
+	if len(fa.recorded) != 0 {
+		t.Fatal("must not record a bracket after place failure")
 	}
 }

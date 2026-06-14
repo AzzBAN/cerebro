@@ -28,6 +28,10 @@ type Proposal struct {
 	Symbol       domain.Symbol
 	Venue        domain.Venue
 	Side         domain.Side
+	// Quantity is the live position size, carried so ApplyAdjustment can place
+	// the replacement bracket — both broker PlaceBracket paths reject a zero
+	// quantity, and spot OCO cannot use close-position semantics.
+	Quantity     decimal.Decimal
 	CurrentStop  decimal.Decimal
 	CurrentTP    decimal.Decimal
 	ProposedStop decimal.Decimal

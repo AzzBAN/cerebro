@@ -39,6 +39,7 @@ func ApplyAdjustment(b Bracketer, look ProtectiveLookup, rec Recorder) ApplyFunc
 			Symbol:     p.Symbol,
 			Venue:      p.Venue,
 			Side:       p.Side,
+			Quantity:   p.Quantity,
 			StopLoss:   p.ProposedStop,
 			TakeProfit: p.ProposedTP,
 			ClientTag:  "proposal_adjust",
