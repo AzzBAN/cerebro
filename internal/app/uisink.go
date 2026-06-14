@@ -2,6 +2,7 @@ package app
 
 import (
 	"github.com/azhar/cerebro/internal/domain"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/uistate"
 )
 
@@ -28,6 +29,12 @@ func newMultiSink(sinks ...uistate.Sink) multiSink {
 func (m multiSink) SendPositions(p []domain.Position) {
 	for _, s := range m {
 		s.SendPositions(p)
+	}
+}
+
+func (m multiSink) SendProposals(p []positionproposal.Proposal) {
+	for _, s := range m {
+		s.SendProposals(p)
 	}
 }
 

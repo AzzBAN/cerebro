@@ -13,6 +13,7 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/azhar/cerebro/internal/positionproposal"
 )
 
 // AgentStep mirrors agent.AgentStep / the ReAct loop phase of a running agent.
@@ -87,6 +88,9 @@ type BudgetSnapshot struct {
 // block the caller — engine hot paths invoke these.
 type Sink interface {
 	SendPositions(positions []domain.Position)
+	// SendProposals pushes the pending agent SL/TP adjustment proposals
+	// awaiting operator confirmation.
+	SendProposals(proposals []positionproposal.Proposal)
 	SendBias(b domain.BiasResult)
 	SendMacro(s MacroSnapshot)
 	SendNews(s NewsSnapshot)
