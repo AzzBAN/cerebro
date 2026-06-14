@@ -2,6 +2,7 @@ package positionproposal
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -72,5 +73,34 @@ func TestPrunePositionGone(t *testing.T) {
 	s.Prune()
 	if len(s.Pending()) != 0 {
 		t.Fatal("prune should drop proposals whose position is gone")
+	}
+}
+
+// TestConfirmApplyErrorKeepsPending verifies that when the injected ApplyFunc
+// fails, the proposal stays pending (so the operator can retry) and the error
+// propagates to the caller.
+func TestConfirmApplyErrorKeepsPending(t *testing.T) {
+	applyErr := errors.New("broker down")
+	s := NewStore(func(context.Context, Proposal) error { return applyErr }, nil)
+	id := s.Propose(mkProposal("BTC/USDT-PERP"))
+	err := s.Confirm(context.Background(), id)
+	if !errors.Is(err, applyErr) {
+		t.Fatalf("want applyErr, got %v", err)
+	}
+	if len(s.Pending()) != 1 {
+		t.Fatal("proposal must remain pending after apply error")
+	}
+}
+
+// TestConfirmUnknownIDIsSentinel verifies Confirm and Reject return
+// ErrUnknownProposal (matchable via errors.Is) for an unknown id, so the web
+// handler can map it to a 404 without string-matching.
+func TestConfirmUnknownIDIsSentinel(t *testing.T) {
+	s := NewStore(func(context.Context, Proposal) error { return nil }, nil)
+	if err := s.Confirm(context.Background(), "nope"); !errors.Is(err, ErrUnknownProposal) {
+		t.Errorf("Confirm unknown id: want ErrUnknownProposal, got %v", err)
+	}
+	if err := s.Reject("nope"); !errors.Is(err, ErrUnknownProposal) {
+		t.Errorf("Reject unknown id: want ErrUnknownProposal, got %v", err)
 	}
 }

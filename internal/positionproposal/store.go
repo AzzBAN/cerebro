@@ -6,6 +6,7 @@ package positionproposal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -15,6 +16,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
+
+// ErrUnknownProposal is returned by Confirm and Reject when no proposal with
+// the given ID exists. Callers (e.g. the web handler) match it with errors.Is
+// to map the failure to a 404 rather than string-matching the message.
+var ErrUnknownProposal = errors.New("positionproposal: unknown proposal id")
 
 // Proposal is a pending SL/TP adjustment awaiting operator confirmation.
 type Proposal struct {
@@ -42,7 +48,11 @@ type Store struct {
 	byID           map[string]*Proposal
 	apply          ApplyFunc
 	positionExists func(domain.Symbol) bool
-	onChange       func() // notified after any mutation so the UI can refresh
+	// onChange (may be nil) is called outside the store's mutex after every
+	// mutation so the caller can push a fresh snapshot. Implementations may
+	// safely call Pending() or any other Store method from it and must not
+	// block.
+	onChange func()
 }
 
 // NewStore builds a Store. apply executes confirmed proposals; onChange (may be
@@ -105,7 +115,7 @@ func (s *Store) Confirm(ctx context.Context, id string) error {
 	p, ok := s.byID[id]
 	if !ok {
 		s.mu.Unlock()
-		return fmt.Errorf("positionproposal: unknown id %q", id)
+		return fmt.Errorf("%w: %q", ErrUnknownProposal, id)
 	}
 	snapshot := *p
 	guard := s.positionExists
@@ -113,7 +123,7 @@ func (s *Store) Confirm(ctx context.Context, id string) error {
 
 	if guard != nil && !guard(snapshot.Symbol) {
 		s.remove(snapshot.ID, snapshot.Symbol)
-		slog.Info("proposal: dropped on confirm; position gone",
+		slog.InfoContext(ctx, "proposal: dropped on confirm; position gone",
 			"id", id, "symbol", snapshot.Symbol)
 		return nil
 	}
@@ -122,7 +132,7 @@ func (s *Store) Confirm(ctx context.Context, id string) error {
 		return fmt.Errorf("positionproposal: apply %q: %w", id, err)
 	}
 	s.remove(snapshot.ID, snapshot.Symbol)
-	slog.Info("proposal: confirmed and applied", "id", id, "symbol", snapshot.Symbol)
+	slog.InfoContext(ctx, "proposal: confirmed and applied", "id", id, "symbol", snapshot.Symbol)
 	return nil
 }
 
@@ -132,14 +142,12 @@ func (s *Store) Reject(id string) error {
 	p, ok := s.byID[id]
 	if !ok {
 		s.mu.Unlock()
-		return fmt.Errorf("positionproposal: unknown id %q", id)
+		return fmt.Errorf("%w: %q", ErrUnknownProposal, id)
 	}
 	sym := p.Symbol
-	delete(s.byID, id)
-	delete(s.bySymbol, sym)
 	s.mu.Unlock()
+	s.remove(id, sym)
 	slog.Info("proposal: rejected", "id", id, "symbol", sym)
-	s.notify()
 	return nil
 }
 
