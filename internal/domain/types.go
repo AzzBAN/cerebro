@@ -86,6 +86,17 @@ const (
 	MarginCross    MarginType = "cross"
 )
 
+// PositionSide controls one-way vs hedge mode for futures orders.
+// BOTH is the default for one-way mode (spot also uses BOTH).
+// LONG / SHORT are used when the futures account is in hedge mode.
+type PositionSide string
+
+const (
+	PositionSideBoth  PositionSide = "both"
+	PositionSideLong  PositionSide = "long"
+	PositionSideShort PositionSide = "short"
+)
+
 // HaltMode controls what happens when a halt is triggered.
 type HaltMode string
 
@@ -130,8 +141,9 @@ const (
 type AgentRole string
 
 const (
-	AgentScreening AgentRole = "screening"
-	AgentRisk      AgentRole = "risk"
-	AgentCopilot   AgentRole = "copilot"
-	AgentReviewer  AgentRole = "reviewer"
+	AgentScreening       AgentRole = "screening"
+	AgentRisk            AgentRole = "risk"
+	AgentCopilot         AgentRole = "copilot"
+	AgentReviewer        AgentRole = "reviewer"
+	AgentPositionManager AgentRole = "position_manager"
 )
