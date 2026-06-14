@@ -210,3 +210,38 @@ func TestApplyBalanceSnapshot_Resync(t *testing.T) {
 		t.Error("BTC/USDT should be added from the balance snapshot")
 	}
 }
+
+// TestRebuildPositions_CarriesExternallyProtected guards the carry-forward of
+// the ExternallyProtected flag across a balance rebuild. Without it, a
+// user-data balance event between resyncs would leave a position with its SL/TP
+// levels intact but ExternallyProtected=false, causing the reconciler to place
+// a duplicate bracket over the operator's own exchange orders.
+func TestRebuildPositions_CarriesExternallyProtected(t *testing.T) {
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"ETH/USDT"}, nil)
+
+	b.mu.Lock()
+	b.balances["ETH"] = spotBalance{free: decimal.NewFromFloat(2.0), locked: decimal.Zero}
+	b.positions = map[domain.Symbol]domain.Position{
+		"ETH/USDT": {
+			Symbol:              "ETH/USDT",
+			Venue:               domain.VenueBinanceSpot,
+			Side:                domain.SideBuy,
+			Quantity:            decimal.NewFromFloat(2.0),
+			StopLoss:            decimal.NewFromFloat(2800),
+			TakeProfit1:         decimal.NewFromFloat(3500),
+			ExternallyProtected: true,
+		},
+	}
+	// Simulate a user-data balance event: rebuild from the (unchanged) balances
+	// without re-running detection.
+	b.rebuildPositionsLocked()
+	got := b.positions["ETH/USDT"]
+	b.mu.Unlock()
+
+	if !got.ExternallyProtected {
+		t.Error("ExternallyProtected must be carried forward across a balance rebuild")
+	}
+	if !got.StopLoss.Equal(decimal.NewFromFloat(2800)) || !got.TakeProfit1.Equal(decimal.NewFromFloat(3500)) {
+		t.Errorf("SL/TP not preserved: got SL=%s TP=%s", got.StopLoss, got.TakeProfit1)
+	}
+}

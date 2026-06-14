@@ -871,6 +871,10 @@ func (b *SpotBroker) rebuildPositionsLocked() {
 			pos.CurrentPrice = existing.CurrentPrice
 			pos.StopLoss = existing.StopLoss
 			pos.TakeProfit1 = existing.TakeProfit1
+			// Carry the protected flag with its levels: a user-data balance
+			// rebuild between resyncs must not drop it, or the reconciler would
+			// place a duplicate bracket over the operator's exchange orders.
+			pos.ExternallyProtected = existing.ExternallyProtected
 			pos.Strategy = existing.Strategy
 			pos.CorrelationID = existing.CorrelationID
 		}
