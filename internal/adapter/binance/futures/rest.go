@@ -485,6 +485,42 @@ func (b *FuturesBroker) Positions(_ context.Context) ([]domain.Position, error) 
 	return out, nil
 }
 
+// RefreshProtection re-detects exchange-side SL/TP for a single symbol and
+// stamps the cached position when found. It exists so the reconciler can verify
+// ground truth immediately before flattening, closing the window between a
+// user-data position open (no open-orders payload) and the next REST resync.
+// The network call runs outside b.mu; only the cache mutation holds the lock.
+func (b *FuturesBroker) RefreshProtection(ctx context.Context, sym domain.Symbol) (bool, error) {
+	openOrders, err := b.client.NewListOpenOrdersService().Do(ctx)
+	if err != nil {
+		return false, fmt.Errorf("futures open-orders refresh for %s: %w", sym, err)
+	}
+	stops, tps, ids := detectProtectiveLevels(openOrders)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pos, ok := b.positions[sym]
+	if !ok {
+		return false, nil
+	}
+	raw := domain.ToExchangeSymbol(sym)
+	if sl, has := stops[raw]; has {
+		pos.StopLoss = sl
+	}
+	if tp, has := tps[raw]; has {
+		pos.TakeProfit1 = tp
+	}
+	if pos.StopLoss.IsZero() && pos.TakeProfit1.IsZero() {
+		return false, nil
+	}
+	pos.ExternallyProtected = true
+	b.positions[sym] = pos
+	if po, has := ids[raw]; has {
+		b.protective[sym] = po
+	}
+	return true, nil
+}
+
 // applyPositionSnapshot reconciles the in-memory cache against a fresh,
 // authoritative snapshot (e.g. from a REST resync). Positions absent from the
 // snapshot are dropped (closed on the exchange); positions present are taken

@@ -15,6 +15,11 @@ type stubReconBroker struct {
 	placedBrackets  []domain.BracketRequest
 	placedOrders    []domain.OrderIntent
 	cancelled       []domain.BracketResponse
+	// refreshProtected / refreshErr drive the optional ProtectionRefresher
+	// path; zero values (false, nil) preserve the pre-feature flatten behaviour.
+	refreshProtected bool
+	refreshErr       error
+	refreshCalls     int
 }
 
 func (s *stubReconBroker) Connect(context.Context) error { return nil }
@@ -42,6 +47,11 @@ func (s *stubReconBroker) Balance(context.Context) (port.AccountBalance, error) 
 	return port.AccountBalance{}, nil
 }
 func (s *stubReconBroker) Venue() domain.Venue { return domain.VenueBinanceFutures }
+
+func (s *stubReconBroker) RefreshProtection(context.Context, domain.Symbol) (bool, error) {
+	s.refreshCalls++
+	return s.refreshProtected, s.refreshErr
+}
 
 func longPos(sym string) domain.Position {
 	return domain.Position{
@@ -118,6 +128,50 @@ func TestReconciler_FlattensWhenBracketFails(t *testing.T) {
 		t.Errorf("bracket should have failed, got %d placed", len(broker.placedBrackets))
 	}
 	// A reduce-only flatten order should have been routed (drained above).
+}
+
+// zeroProtPos is an open position with no Cerebro SL/TP and the external flag
+// unset — the exact state that reaches the flatten branch.
+func zeroProtPos(sym string) domain.Position {
+	p := longPos(sym)
+	p.StopLoss = decimal.Zero
+	p.TakeProfit1 = decimal.Zero
+	return p
+}
+
+func TestReconciler_RefreshFindsProtection_SkipsFlatten(t *testing.T) {
+	broker := &stubReconBroker{refreshProtected: true}
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: broker, Tracker: NewBracketTracker(),
+		Router: nil, // flatten must NOT be reached (nil router would panic on Route)
+		Env:    domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
+	})
+
+	r.enforceBrackets(context.Background())
+
+	if broker.refreshCalls != 1 {
+		t.Fatalf("expected one protection re-check, got %d", broker.refreshCalls)
+	}
+	if len(broker.placedBrackets) != 0 {
+		t.Errorf("must not attach a bracket when exchange-side protection exists, got %d", len(broker.placedBrackets))
+	}
+}
+
+func TestReconciler_RefreshErrors_DefersFlatten(t *testing.T) {
+	broker := &stubReconBroker{refreshErr: errReconTest}
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: broker, Tracker: NewBracketTracker(),
+		Router: nil, // an inconclusive re-check must fail safe: no flatten this tick
+		Env:    domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
+	})
+
+	r.enforceBrackets(context.Background())
+
+	if broker.refreshCalls != 1 {
+		t.Fatalf("expected one protection re-check, got %d", broker.refreshCalls)
+	}
 }
 
 func TestReconciler_CancelsOrphanBracket(t *testing.T) {

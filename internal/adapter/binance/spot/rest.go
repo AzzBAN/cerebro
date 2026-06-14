@@ -469,6 +469,42 @@ func (b *SpotBroker) Positions(_ context.Context) ([]domain.Position, error) {
 	return out, nil
 }
 
+// RefreshProtection re-detects exchange-side SL/TP (OCO or lone STOP_LOSS_LIMIT)
+// for a single symbol and stamps the cached position when found. The reconciler
+// calls it immediately before flattening, closing the window between a user-data
+// position open and the next REST resync. The network call runs outside b.mu;
+// only the cache mutation holds the lock.
+func (b *SpotBroker) RefreshProtection(ctx context.Context, sym domain.Symbol) (bool, error) {
+	orders, err := b.client.NewListOpenOrdersService().Do(ctx)
+	if err != nil {
+		return false, fmt.Errorf("spot open-orders refresh for %s: %w", sym, err)
+	}
+	stops, tps, ids := detectSpotProtectiveLevels(orders)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pos, ok := b.positions[sym]
+	if !ok {
+		return false, nil
+	}
+	raw := domain.ToExchangeSymbol(sym)
+	if sl, has := stops[raw]; has {
+		pos.StopLoss = sl
+	}
+	if tp, has := tps[raw]; has {
+		pos.TakeProfit1 = tp
+	}
+	if pos.StopLoss.IsZero() && pos.TakeProfit1.IsZero() {
+		return false, nil
+	}
+	pos.ExternallyProtected = true
+	b.positions[sym] = pos
+	if po, has := ids[raw]; has {
+		b.protective[sym] = po
+	}
+	return true, nil
+}
+
 // Balance returns the current spot account balance from the cached user-data stream.
 func (b *SpotBroker) Balance(_ context.Context) (port.AccountBalance, error) {
 	b.mu.RLock()

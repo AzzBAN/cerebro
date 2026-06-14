@@ -18,6 +18,20 @@ type PositionDecider interface {
 	Review(ctx context.Context, review domain.PositionReview) (domain.ManagedAction, error)
 }
 
+// ProtectionRefresher lets the reconciler re-check the exchange for an
+// operator-set SL/TP on a single symbol right before it would flatten a
+// position for "no protective levels". This closes the race where a position
+// opened directly on the exchange arrives via the user-data WS (which carries
+// no open-orders) before the periodic REST resync detects its protection.
+// Implemented by the live futures/spot brokers; the paper matcher does not
+// implement it (and paper positions are never externally protected).
+type ProtectionRefresher interface {
+	// RefreshProtection re-detects exchange-side protection for sym, updating
+	// the broker's cache when found, and reports whether the symbol is now
+	// externally protected.
+	RefreshProtection(ctx context.Context, sym domain.Symbol) (bool, error)
+}
+
 // ReconcilerDeps bundles the reconciler's collaborators.
 type ReconcilerDeps struct {
 	Venue     domain.Venue
@@ -125,6 +139,25 @@ func (r *Reconciler) enforceBrackets(ctx context.Context) {
 			continue
 		}
 		if pos.StopLoss.IsZero() && pos.TakeProfit1.IsZero() {
+			// Before flattening, re-check the exchange directly. A position
+			// opened on the exchange arrives via the user-data WS (no open-
+			// orders payload) ahead of the periodic REST resync that detects
+			// its protection — without this check we'd flatten in that window.
+			if refresher, ok := r.deps.Broker.(ProtectionRefresher); ok {
+				protected, err := refresher.RefreshProtection(ctx, pos.Symbol)
+				if err != nil {
+					// Fail safe: an inconclusive check must not trigger a
+					// destructive flatten. Skip this tick; retry next one.
+					slog.WarnContext(ctx, "reconciler: protection re-check failed; deferring flatten",
+						"symbol", pos.Symbol, "err", err)
+					continue
+				}
+				if protected {
+					slog.InfoContext(ctx, "reconciler: exchange-side SL/TP found on re-check; keeping position",
+						"symbol", pos.Symbol)
+					continue
+				}
+			}
 			slog.Warn("reconciler: position has no SL/TP levels to attach; flattening",
 				"symbol", pos.Symbol)
 			r.flatten(ctx, pos, "no_protective_levels")
