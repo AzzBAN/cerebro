@@ -8,11 +8,26 @@ import (
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
-// Monitor subscribes to price events and manages trailing stops and partial take-profits
-// for open positions. It never bypasses the execution router.
+// Monitor subscribes to price events and manages the client-side risk
+// operations that server-side brackets cannot express on Binance:
+//
+//   - trailing stops (per-strategy trail_trigger_pct / trail_step_pct — WIP)
+//   - partial take-profits with SL-to-breakeven on TP1 (WIP)
+//   - safety-net hard SL if a server bracket failed to attach (fallback)
+//
+// With brackets live at the broker, the hard SL/TP checks here are a
+// belt-and-braces fallback. In the common case the exchange fires the
+// bracket first and the position disappears from the broker's cache before
+// this monitor's next tick, so no duplicate close is submitted. The
+// (rare) race where the monitor fires first is still safe for spot —
+// there is no position left to close — and for futures a duplicate close
+// is harmlessly rejected as reduce-only against zero quantity.
+//
+// It never bypasses the execution router.
 // PRD §10.3.
 type Monitor struct {
 	router    *Router
@@ -39,11 +54,15 @@ func NewMonitor(router *Router, venue domain.Venue, store port.TradeStore, env d
 func (m *Monitor) Run(ctx context.Context, hub *marketdata.Hub) error {
 	quotes, _ := hub.Subscribe()
 	slog.Info("order monitor started", "venue", m.venue)
+	// Symmetric exit logging: regardless of whether we exit because ctx
+	// was cancelled or the quote channel was closed, emit a single
+	// "stopping" line. Required for the `started == stopping` invariant
+	// log analysis depends on.
+	defer slog.Info("order monitor stopping", "venue", m.venue)
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("order monitor stopping")
 			return nil
 		case evt, ok := <-quotes:
 			if !ok {
@@ -122,15 +141,20 @@ func (m *Monitor) submitClose(ctx context.Context, pos domain.Position, price de
 	}
 
 	intent := domain.OrderIntent{
-		ID:            newUUID(),
+		ID:            uuid.New().String(),
 		CorrelationID: pos.CorrelationID,
 		Symbol:        pos.Symbol,
 		Venue:         m.venue,
 		Side:          closeSide,
+		OrderType:     domain.OrderTypeMarket,
 		Quantity:      pos.Quantity,
 		Strategy:      pos.Strategy,
 		Environment:   m.env,
 		CreatedAt:     time.Now().UTC(),
+		// ReduceOnly is honoured by the futures adapter; it's a no-op on
+		// spot but carries the semantic intent and prevents an accidental
+		// over-close if the position was already flattened by the bracket.
+		ReduceOnly: true,
 	}
 
 	slog.Info("monitor submitting close",
@@ -140,8 +164,4 @@ func (m *Monitor) submitClose(ctx context.Context, pos domain.Position, price de
 	if err != nil {
 		slog.Error("monitor: close order failed", "symbol", pos.Symbol, "error", err)
 	}
-}
-
-func newUUID() string {
-	return time.Now().Format("20060102150405.999999999")
 }

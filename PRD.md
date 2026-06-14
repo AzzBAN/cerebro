@@ -53,7 +53,7 @@ A **tool policy table** in `app.yaml` gates which agents may invoke which tools.
 **Screening Agent Skills (Read-Only):**
 
 * `fetch_latest_news(asset string)`: Triggers the Go scraper to pull the last 10 headlines for a specific asset from FinancialJuice or Marketaux.
-* `get_economic_events(timeframe string)`: Queries the parsed Myfxbook calendar to see if high-volatility events (like NFP or CPI) are happening soon.
+* `get_economic_events(timeframe string)`: Queries the parsed FairEconomy/ForexFactory calendar to see if high-volatility events (like NFP or CPI) are happening soon.
 * `get_social_sentiment(asset string)`: Pings the CryptoPanic API for recent sentiment metrics.
 * `get_derivatives_data(symbol string)`: Queries the CoinGlass API for a snapshot of on-chain derivatives state — open interest, funding rate, long/short ratio, recent liquidations, and fear & greed index. Returns a structured `DerivativesSnapshot` that the Screening Agent uses to calibrate its bias score (e.g., extreme funding + crowded longs → bearish tilt even if price action looks bullish).
 
@@ -112,7 +112,7 @@ To provide the "Screening Agent" with context, the bot will pull data from the f
 | Source Type | Provider / Website | Integration Method | Purpose in Bot |
 | :---- | :---- | :---- | :---- |
 | **Global Breaking News** | **FinancialJuice** | Headless Scraping (chromedp via Go) | Up-to-the-second market squawks; catches sudden geopolitical or macro shifts. |
-| **Economic Calendar** | **ForexFactory / Myfxbook** | RSS Feed / XML Parsing | High-impact macro events (CPI, NFP, FOMC). Parsed to know *when* not to trade. |
+| **Economic Calendar** | **FairEconomy / ForexFactory** | Free keyless JSON feed | High-impact macro events (CPI, NFP, FOMC). Parsed to know *when* not to trade. |
 | **Crypto Sentiment** | **CryptoPanic API** | REST API (JSON) | Crypto-specific news aggregator; structured JSON of trending headlines fed to LLM. |
 | **Derivatives Intelligence** | **CoinGlass API v4** | REST API (`CG-API-KEY` header) | The primary quantitative sentiment layer. Polled every 5 minutes; data cached in Redis with 5-min TTL. See §3.3 for full data taxonomy. |
 

@@ -7,18 +7,26 @@ You will receive the current bias scores for all monitored symbols from Phase 1 
 ## Tool Usage Strategy
 
 ### Step 1: get_all_market_data (ALWAYS call this first)
-Get real-time prices and 24h changes for ALL symbols at once. Use this to:
+Get real-time prices and 24h changes for ALL configured symbols at once. Use this to:
 - Rank relative strength (which symbols are outperforming/underperforming?)
 - Compare volume across symbols
 - Identify correlated moves vs. idiosyncratic ones
 
-### Step 2: get_derivatives_data (if available)
+### Step 2: get_discovery_candidates (if available)
+Returns dynamically discovered symbols outside the configured watchlist —
+top movers and new listings the discovery scanner surfaced this cycle.
+Each row carries `price_change_pct_24h`, `quote_volume_24h`, `is_new_listing`,
+and `tags` (e.g. `new_listing`, `top_mover_up`). You MAY propose these
+symbols in your output, but they cannot be auto-executed: tag any such
+opportunity with `[unconfigured]` in the `correlations[].note` field.
+
+### Step 3: get_derivatives_data (if available)
 Call for top candidates to check funding rates and open interest.
 
-### Step 3: fetch_latest_news (if available)
+### Step 4: fetch_latest_news (if available)
 Call for the top 2-3 candidates to verify no contrary catalysts exist.
 
-### Step 4: get_economic_events (if available)
+### Step 5: get_economic_events (if available)
 Call with hours=48. If high-impact events are imminent, mark affected opportunities as avoided.
 
 ## Cross-Symbol Analysis Rules

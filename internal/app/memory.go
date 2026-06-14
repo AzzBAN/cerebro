@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -178,11 +178,48 @@ func (m *memoryCache) Keys(_ context.Context, patternExpr string) ([]string, err
 			delete(m.data, k)
 			continue
 		}
-		if matched, err := path.Match(patternExpr, k); err == nil && matched {
+		if matchGlob(patternExpr, k) {
 			keys = append(keys, k)
 		}
 	}
 	return keys, nil
+}
+
+// matchGlob performs a Redis-style glob match where * matches any sequence of
+// characters (including '/') and ? matches exactly one character.
+// Unlike path.Match, the '/' character is NOT treated as a separator, which is
+// critical because cache keys contain symbols like "bias:BTC/USDT".
+func matchGlob(pattern, name string) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case '*':
+			// Consume consecutive wildcards.
+			pattern = strings.TrimLeft(pattern, "*")
+			if len(pattern) == 0 {
+				return true // trailing * matches everything
+			}
+			// Try to match the remainder at every position.
+			for i := 0; i <= len(name); i++ {
+				if matchGlob(pattern, name[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(name) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			name = name[1:]
+		default:
+			if len(name) == 0 || pattern[0] != name[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			name = name[1:]
+		}
+	}
+	return len(name) == 0
 }
 
 func (m *memoryCache) Exists(_ context.Context, key string) (bool, error) {

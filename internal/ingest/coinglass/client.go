@@ -11,6 +11,16 @@ import (
 
 const baseURL = "https://open-api-v4.coinglass.com"
 
+// baseURLOverride is set by tests via httptest. Empty means "use baseURL".
+var baseURLOverride = ""
+
+func currentBaseURL() string {
+	if baseURLOverride != "" {
+		return baseURLOverride
+	}
+	return baseURL
+}
+
 // Client is the CoinGlass v4 HTTP client.
 // All requests carry the CG-API-KEY header.
 // Retry policy: 3 attempts with exponential backoff (100ms, 200ms, 400ms).
@@ -29,7 +39,7 @@ func New(apiKey string) *Client {
 
 // get performs a GET request to the given path and decodes the JSON body into v.
 func (c *Client) get(ctx context.Context, path string, params map[string]string, v any) error {
-	url := baseURL + path
+	url := currentBaseURL() + path
 	if len(params) > 0 {
 		url += "?"
 		first := true

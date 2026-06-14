@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
+	"github.com/azhar/cerebro/internal/agent"
 	"github.com/azhar/cerebro/internal/port"
 )
 
@@ -28,7 +30,7 @@ func NewGemini(apiKey, modelID string, temperature float64, maxOutputTokens int)
 		modelID: modelID,
 		temp:    temperature,
 		maxToks: maxOutputTokens,
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: defaultHTTPTimeout},
 	}
 }
 
@@ -78,6 +80,16 @@ type geminiResponse struct {
 		Content      geminiContent `json:"content"`
 		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
+	UsageMetadata geminiUsage `json:"usageMetadata"`
+}
+
+// geminiUsage matches Gemini's per-response token accounting.
+// CachedContentTokenCount is the portion served from context cache (when
+// enabled); we surface it so cost estimation can apply the cached rate.
+type geminiUsage struct {
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
 }
 
 // Complete runs a Gemini function-calling loop.
@@ -87,6 +99,9 @@ func (g *GeminiAdapter) Complete(
 	userMessage string,
 	tools map[string]port.Tool,
 ) (string, error) {
+	const defaultMaxTurns = 12
+	maxTurns := agent.MaxTurnsFromCtx(ctx, defaultMaxTurns)
+
 	contents := []geminiContent{
 		{Role: "user", Parts: []geminiPart{{Text: userMessage}}},
 	}
@@ -98,7 +113,10 @@ func (g *GeminiAdapter) Complete(
 		g.modelID, g.apiKey,
 	)
 
-	for {
+	turnTimeout := agent.TurnTimeoutFromCtx(ctx)
+	maxToks := agent.MaxTokensFromCtx(ctx, g.maxToks)
+
+	for turn := 0; turn < maxTurns; turn++ {
 		reqBody := geminiRequest{
 			Contents: contents,
 			SystemInstruction: &geminiContent{
@@ -107,35 +125,31 @@ func (g *GeminiAdapter) Complete(
 			Tools: geminiTools,
 			GenerationConfig: map[string]any{
 				"temperature":     g.temp,
-				"maxOutputTokens": g.maxToks,
+				"maxOutputTokens": maxToks,
 			},
 		}
 
 		body, _ := json.Marshal(reqBody)
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(body))
+		rawBody, status, err := g.doTurn(ctx, turnTimeout, baseURL, body)
 		if err != nil {
-			return "", fmt.Errorf("%w: gemini: build request: %v", ErrLLMCall, err)
+			return "", fmt.Errorf("%w: gemini: %w", ErrLLMCall, err)
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := g.client.Do(httpReq)
-		if err != nil {
-			return "", fmt.Errorf("%w: gemini: http: %v", ErrLLMCall, err)
-		}
-
-		rawBody, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return "", fmt.Errorf("%w: gemini: read body: %v", ErrLLMCall, readErr)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("%w: gemini: status %d: %s", ErrLLMCall, resp.StatusCode, string(rawBody))
+		if status != http.StatusOK {
+			return "", fmt.Errorf("%w: gemini: status %d: %s", ErrLLMCall, status, string(rawBody))
 		}
 
 		var apiResp geminiResponse
 		if err := json.Unmarshal(rawBody, &apiResp); err != nil {
 			return "", fmt.Errorf("%w: gemini: decode: %v", ErrLLMCall, err)
+		}
+
+		// Record per-turn usage. CachedContentTokenCount is a subset of
+		// PromptTokenCount — the cached portion — so it feeds the cached
+		// bucket and the uncached rate applies to the remainder.
+		if u := agent.UsageFromCtx(ctx); u != nil {
+			u.Add(apiResp.UsageMetadata.PromptTokenCount,
+				apiResp.UsageMetadata.CandidatesTokenCount,
+				apiResp.UsageMetadata.CachedContentTokenCount)
 		}
 
 		if len(apiResp.Candidates) == 0 {
@@ -157,7 +171,7 @@ func (g *GeminiAdapter) Complete(
 		}
 
 		if len(functionCalls) == 0 {
-			return textContent, nil
+			return stripReasoning(textContent), nil
 		}
 
 		// Dispatch function calls.
@@ -184,6 +198,42 @@ func (g *GeminiAdapter) Complete(
 		}
 		contents = append(contents, geminiContent{Role: "function", Parts: responseParts})
 	}
+	return "", fmt.Errorf("%w: gemini: exceeded max turns (%d)", ErrLLMCall, maxTurns)
+}
+
+// doTurn performs a single Gemini API request under an optional per-turn
+// deadline. Pulled out of the main loop so the per-turn cancel runs
+// immediately at the end of each iteration rather than stacking via defer.
+func (g *GeminiAdapter) doTurn(
+	ctx context.Context,
+	turnTimeout time.Duration,
+	url string,
+	body []byte,
+) ([]byte, int, error) {
+	callCtx := ctx
+	var cancel context.CancelFunc
+	if turnTimeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, turnTimeout)
+		defer cancel()
+	}
+
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := g.client.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
+	return raw, resp.StatusCode, nil
 }
 
 func buildGeminiTools(tools map[string]port.Tool) []geminiTool {

@@ -30,7 +30,7 @@ type AgentMessage struct {
 	CreatedAt time.Time
 }
 
-// EconomicEvent is a parsed calendar entry from Myfxbook / ForexFactory.
+// EconomicEvent is a parsed entry from the economic calendar (Finnhub).
 type EconomicEvent struct {
 	Title       string
 	Impact      string // low | medium | high

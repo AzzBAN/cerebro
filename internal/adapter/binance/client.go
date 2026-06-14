@@ -5,17 +5,12 @@ import (
 	"github.com/adshao/go-binance/v2/futures"
 )
 
-// Spot Demo REST endpoint (launched 2026-01-29 per Binance changelog).
+// Demo Trading REST endpoints (Spot + Futures).
 // Orders are routed to a virtual matching engine that executes at real market
 // prices. API keys are provisioned at https://demo.binance.com.
 //
-// Futures Demo: Binance does not publish a separate USDT-M demo endpoint
-// analogous to demo-api.binance.com. The library (go-binance v2) maps
-// futures "demo" to the testnet (https://testnet.binancefuture.com), which
-// has its own virtual balances and simulated (not live) prices. Use the
-// testnet URL below when targeting futures in demo mode; accept that futures
-// prices will not mirror mainnet. Real futures order execution requires the
-// live environment.
+// Spot  Demo: https://demo-api.binance.com   (launched 2026-01-29)
+// Futures Demo: https://demo-fapi.binance.com (USDT-M perpetuals)
 //
 // WebSocket market data is intentionally NOT overridden for either venue —
 // kline streams always connect to mainnet (stream.binance.com /
@@ -26,11 +21,10 @@ const (
 	// DemoSpotBaseURL is the Spot Demo REST endpoint launched 2026-01-29.
 	DemoSpotBaseURL = "https://demo-api.binance.com"
 
-	// DemoFuturesBaseURL points to the Binance Futures testnet.
-	// Binance has no public USDT-M demo endpoint analogous to the Spot demo;
-	// the testnet is the closest sandbox available. Prices are simulated, not
-	// live — futures demo execution will not reflect real market conditions.
-	DemoFuturesBaseURL = "https://testnet.binancefuture.com"
+	// DemoFuturesBaseURL is the USDT-M Futures Demo REST endpoint.
+	// Like the Spot demo, orders route to a virtual matching engine with
+	// real market prices. API keys are provisioned at https://demo.binance.com.
+	DemoFuturesBaseURL = "https://demo-fapi.binance.com"
 )
 
 // NewSpotClient builds a Binance Spot REST client.
@@ -63,10 +57,9 @@ func NewDemoSpotClient(apiKey, secret string) *binance.Client {
 }
 
 // NewDemoFuturesClient builds a Binance USDT-M Futures REST client pointed at
-// the futures testnet (https://testnet.binancefuture.com), which is the closest
-// available sandbox for futures order execution. Prices on the testnet are
-// simulated and will differ from mainnet. WS kline streams still use mainnet
-// because we do not set futures.UseTestnet globally.
+// the Futures Demo endpoint (https://demo-fapi.binance.com). Orders execute
+// against real market prices in a virtual matching engine. WS kline streams
+// still use mainnet because we do not set futures.UseTestnet globally.
 func NewDemoFuturesClient(apiKey, secret string) *futures.Client {
 	c := futures.NewClient(apiKey, secret)
 	c.BaseURL = DemoFuturesBaseURL

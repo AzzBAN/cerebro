@@ -22,12 +22,19 @@ func newBacktestCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "backtest",
-		Short: "Run a strategy against historical CSV data",
-		Long: `Loads historical candle data from a CSV file and drives it through the
-strategy engine and paper execution pipeline using a simulated clock.
-LLM agents are mocked using fixture files for deterministic results.
+		Short: "Run a strategy against historical CSV data (Phase 8 — not yet implemented)",
+		Long: `Run a strategy against historical OHLCV data in CSV form.
 
-Example:
+STATUS: scaffold only. The CLI validates its flags, loads and validates
+configuration in paper mode, and exits. The backtest engine itself
+(candle replay, simulated clock, deterministic agent fixtures, JSON
+report output) is planned for Phase 8.
+
+Once implemented the command will drive historical candles through the
+strategy engine and paper execution pipeline under a simulated clock,
+with LLM agents replaced by fixture files for deterministic runs.
+
+Example (future):
   cerebro backtest --strategy=trend_following --data=testdata/fixtures/btc_1m.csv \
     --from=2024-01-01 --to=2024-12-31 --output=report.json`,
 		RunE: func(cmd *cobra.Command, args []string) error {

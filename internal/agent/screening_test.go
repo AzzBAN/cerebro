@@ -53,6 +53,36 @@ func TestParseOpportunitiesOutput(t *testing.T) {
 			wantLen: 0,
 			wantErr: false,
 		},
+		{
+			name: "truncated mid-string in last entry recovers earlier complete entries",
+			input: `{"opportunities": [` +
+				`{"symbol": "BTCUSDT", "venue": "binance_spot", "side": "BUY", "confidence": 0.8, "reasoning": "first complete", "correlations": [], "avoided": false},` +
+				`{"symbol": "ETHUSDT", "venue": "binance_futures", "side": "SELL", "confidence": 0.6, "reasoning": "second complete", "correlations": [], "avoided": false},` +
+				`{"symbol": "SOLUSDT", "venue": "binance_futures", "side": "BUY", "confidence": 0.7, "reasoning": "third entry cut off mid-stri`,
+			wantLen: 2,
+			wantErr: false,
+		},
+		{
+			name: "truncated mid-object after first complete entry",
+			input: `{"opportunities": [` +
+				`{"symbol": "BTCUSDT", "venue": "binance_spot", "side": "BUY", "confidence": 0.8, "reasoning": "first", "correlations": [], "avoided": false},` +
+				`{"symbol": "ETH`,
+			wantLen: 1,
+			wantErr: false,
+		},
+		{
+			name: "truncation before any complete entry returns error",
+			input: `{"opportunities": [{"symbol": "BTC`,
+			wantErr: true,
+		},
+		{
+			name: "string with escaped quote inside reasoning is parsed correctly",
+			input: `{"opportunities": [` +
+				`{"symbol": "BTCUSDT", "venue": "binance_spot", "side": "BUY", "confidence": 0.9, "reasoning": "broke \"key\" resistance", "correlations": [], "avoided": false}` +
+				`]}`,
+			wantLen: 1,
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {

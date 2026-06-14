@@ -3,6 +3,7 @@ package scrape
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,14 @@ import (
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
 )
+
+// ErrSymbolNotCovered is returned when Coinglass simply does not list the
+// requested coin in its derivatives table (e.g. XAU is a precious-metals
+// perp on Binance but doesn't appear on Coinglass). This is a structural
+// "not supported here" rather than a transient failure, so callers
+// (Snapshot, screening) should treat it as INFO/DEBUG, not WARN, and
+// avoid retrying.
+var ErrSymbolNotCovered = errors.New("coinglass scraper: symbol not covered")
 
 const stealthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -49,7 +58,8 @@ type CoinglassScraper struct {
 	allocCtx   context.Context
 	cancel     context.CancelFunc
 	timeout    time.Duration
-	mu         sync.Mutex
+	mu         sync.Mutex    // guards tableCache reads/writes
+	scrapeMu   sync.Mutex    // serializes homepage scrapes to prevent concurrent tab stampede
 	tableCache *cachedTable
 	cacheTTL   time.Duration
 }
@@ -100,7 +110,7 @@ func (s *CoinglassScraper) FundingRate(ctx context.Context, symbol domain.Symbol
 
 	entry, ok := entries[coin]
 	if !ok {
-		return nil, fmt.Errorf("coinglass scraper: funding rate: coin %s not found in table", coin)
+		return nil, fmt.Errorf("coinglass scraper: funding rate: coin %s: %w", coin, ErrSymbolNotCovered)
 	}
 
 	return &domain.FundingRate{
@@ -119,7 +129,7 @@ func (s *CoinglassScraper) OpenInterest(ctx context.Context, symbol domain.Symbo
 
 	entry, ok := entries[coin]
 	if !ok {
-		return nil, fmt.Errorf("coinglass scraper: open interest: coin %s not found in table", coin)
+		return nil, fmt.Errorf("coinglass scraper: open interest: coin %s: %w", coin, ErrSymbolNotCovered)
 	}
 
 	return &domain.OpenInterest{
@@ -226,11 +236,24 @@ func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (
 		ls *domain.LongShortRatio
 	)
 
+	// logSnapshotErr demotes a structurally-unsupported-symbol error to
+	// DEBUG so unsupported assets (e.g. XAU/USDT-PERP, which Binance lists
+	// but Coinglass does not) don't spam WARN every cycle. Real failures
+	// (network timeouts, parse errors, table-not-found) stay WARN.
+	logSnapshotErr := func(msg string, err error) {
+		if errors.Is(err, ErrSymbolNotCovered) {
+			slog.Debug(msg+" (symbol not covered by Coinglass)",
+				"symbol", symbol, "error", err)
+			return
+		}
+		slog.Warn(msg, "symbol", symbol, "error", err)
+	}
+
 	g.Go(func() error {
 		if r, err := s.FundingRate(gctx, symbol); err == nil {
 			fr = r
 		} else {
-			slog.Warn("coinglass scraper: snapshot: funding rate failed", "symbol", symbol, "error", err)
+			logSnapshotErr("coinglass scraper: snapshot: funding rate failed", err)
 		}
 		return nil
 	})
@@ -239,7 +262,7 @@ func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (
 		if r, err := s.OpenInterest(gctx, symbol); err == nil {
 			oi = r
 		} else {
-			slog.Warn("coinglass scraper: snapshot: open interest failed", "symbol", symbol, "error", err)
+			logSnapshotErr("coinglass scraper: snapshot: open interest failed", err)
 		}
 		return nil
 	})
@@ -257,7 +280,7 @@ func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (
 		if r, err := s.fetchLongShortRatio(gctx, symbol); err == nil {
 			ls = r
 		} else {
-			slog.Warn("coinglass scraper: snapshot: long/short ratio failed", "symbol", symbol, "error", err)
+			logSnapshotErr("coinglass scraper: snapshot: long/short ratio failed", err)
 		}
 		return nil
 	})
@@ -290,6 +313,26 @@ func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (
 
 func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domain.Symbol) (*domain.LongShortRatio, error) {
 	coin := coinGlassSymbol(symbol)
+
+	// Fast-path: skip non-crypto tickers (e.g. XAU, the gold synthetic)
+	// outright — Coinglass does not list them and the per-symbol page
+	// just returns an empty shell.
+	if !isCoinglassSupportedCoin(coin) {
+		return nil, fmt.Errorf("coinglass scraper: long/short %s: %w", coin, ErrSymbolNotCovered)
+	}
+
+	// Fast-path: if the coin isn't on the homepage derivatives table, the
+	// per-symbol /LongShortRatio/<coin> page will 404 or hang. Short-circuit
+	// before spending ~6s of Chromium time on a doomed navigation. We
+	// tolerate a derivatives-table fetch error here (transient Coinglass
+	// outage) and fall through to attempt the navigation anyway, which
+	// preserves prior behaviour.
+	if entries, err := s.fetchDerivativesTable(ctx); err == nil {
+		if _, ok := entries[coin]; !ok {
+			return nil, fmt.Errorf("coinglass scraper: long/short %s: %w", coin, ErrSymbolNotCovered)
+		}
+	}
+
 	url := coinglassBaseURL + "/LongShortRatio/" + coin
 
 	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
@@ -298,6 +341,19 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
 	defer timeoutCancel()
 
+	// DOM scan: as of 2026 the LongShortRatio page serves a compact
+	// summary table with columns roughly shaped like:
+	//
+	//     Type  | Long/Short | Sentiment
+	//     1h    | 0.98       | Neutral
+	//     4h    | 1.12       | Bullish
+	//     24h   | 0.85       | Bearish
+	//
+	// There is no longer an Exchange column, so the old 6-column +
+	// hasExchange gate is dropped. The scan now accepts any table whose
+	// headers include a "Long/Short" (or "Long / Short") column, and
+	// additionally surfaces all table layouts found on the page so the
+	// operator can diagnose future redesigns from the log.
 	var raw string
 	if err := chromedp.Run(tabCtx,
 		network.Enable(),
@@ -307,23 +363,23 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 		chromedp.Sleep(6*time.Second),
 		chromedp.Evaluate(`
 			(() => {
-				const tables = document.querySelectorAll('table');
-				for (const table of tables) {
+				const allTables = [];
+				for (const table of document.querySelectorAll('table')) {
 					const ths = Array.from(table.querySelectorAll('thead th'));
 					const headers = ths.map(th => th.textContent.trim());
-					if (headers.length < 6) continue;
-					const hasExchange = headers.some(h => /exchange/i.test(h));
-					const hasLongShort = headers.some(h => /long/i.test(h) && /short/i.test(h));
-					if (!hasExchange || !hasLongShort) continue;
 					const rows = table.querySelectorAll('tbody tr');
 					const entries = [];
 					for (const row of rows) {
 						const cells = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
 						entries.push(cells);
 					}
-					return JSON.stringify({headers, entries});
+					allTables.push({headers, entries});
+					const hasLongShort = headers.some(h => /long\s*\/\s*short/i.test(h) || (/long/i.test(h) && /short/i.test(h)));
+					if (hasLongShort && entries.length > 0) {
+						return JSON.stringify({headers, entries});
+					}
 				}
-				return JSON.stringify({error: 'long/short table not found'});
+				return JSON.stringify({error: 'long/short table not found', seen: allTables});
 			})()
 		`, &raw),
 	); err != nil {
@@ -333,21 +389,38 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 	return parseLongShortDOM(raw, symbol), nil
 }
 
+// isCoinglassSupportedCoin filters obvious non-crypto symbols out of the
+// Coinglass pipeline. The Coinglass universe is crypto derivatives only
+// (BTC, ETH, SOL, …) — synthetic/commodity tickers such as XAU (gold)
+// route through Binance but have no Coinglass equivalent and would waste
+// a full Chromium navigation on every snapshot tick.
+func isCoinglassSupportedCoin(coin string) bool {
+	switch strings.ToUpper(strings.TrimSpace(coin)) {
+	case "", "XAU", "XAG", "XAUUSD", "XAGUSD":
+		return false
+	}
+	return true
+}
+
 // fetchDerivativesTable scrapes the Coinglass homepage derivatives table via
 // DOM extraction. Returns a map keyed by coin symbol (e.g. "BTC", "ETH").
 // Results are cached for 2 minutes.
 func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[string]coinTableEntry, error) {
-	// Fast path: check cache under lock.
-	s.mu.Lock()
-	if s.tableCache != nil && time.Since(s.tableCache.fetched) < s.cacheTTL {
-		entries := s.tableCache.entries
-		s.mu.Unlock()
-		return entries, nil
+	// Fast path: check cache under read lock.
+	if cached := s.getCachedTable(); cached != nil {
+		return cached, nil
 	}
-	s.mu.Unlock()
 
-	// Slow path: scrape outside the lock so concurrent calls (e.g. from
-	// Snapshot) are not serialized by the browser operation.
+	// Slow path: serialize scrapes so concurrent callers (e.g. FundingRate +
+	// OpenInterest fired from the same Snapshot) don't each open a browser tab.
+	s.scrapeMu.Lock()
+	defer s.scrapeMu.Unlock()
+
+	// Double-check: another goroutine may have populated the cache while we waited.
+	if cached := s.getCachedTable(); cached != nil {
+		return cached, nil
+	}
+
 	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
 	defer tabCancel()
 
@@ -360,7 +433,19 @@ func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[strin
 		emulation.SetUserAgentOverride(stealthUserAgent),
 		chromedp.Navigate(coinglassBaseURL+"/"),
 		chromedp.WaitReady("body", chromedp.ByQuery),
-		chromedp.Sleep(5*time.Second),
+		// Wait for the derivatives table to appear in the DOM before extracting.
+		// Falls back to a fixed sleep if the selector doesn't appear in time
+		// (Coinglass sometimes renders via client-side hydration).
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			waitCtx, waitCancel := context.WithTimeout(ctx, 8*time.Second)
+			defer waitCancel()
+			err := chromedp.WaitVisible("table tbody tr", chromedp.ByQuery).Do(waitCtx)
+			if err != nil {
+				slog.Debug("coinglass scraper: WaitVisible timed out; falling back to sleep", "error", err)
+				chromedp.Sleep(5 * time.Second).Do(ctx)
+			}
+			return nil
+		}),
 
 		// Extract table[1] rows (the derivatives table with data rows).
 		// Columns: 0=fav, 1=rank, 2=symbol, 3=price, 4=price24h%,
@@ -409,8 +494,29 @@ func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[strin
 	return entries, nil
 }
 
+// getCachedTable returns the cached entries if still valid, or nil.
+func (s *CoinglassScraper) getCachedTable() map[string]coinTableEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tableCache != nil && time.Since(s.tableCache.fetched) < s.cacheTTL {
+		return s.tableCache.entries
+	}
+	return nil
+}
+
 // parseDerivativesTableJSON converts the raw JS-extracted JSON into a map.
 func parseDerivativesTableJSON(raw string) (map[string]coinTableEntry, error) {
+	// The JS extractor returns an error object when the table is not found
+	// (e.g. page didn't fully render). Detect this before attempting array
+	// unmarshal so we get a clear error message.
+	var errObj struct {
+		Error string `json:"error"`
+		Count int    `json:"count"`
+	}
+	if json.Unmarshal([]byte(raw), &errObj) == nil && errObj.Error != "" {
+		return nil, fmt.Errorf("DOM extraction failed: %s (tables found: %d)", errObj.Error, errObj.Count)
+	}
+
 	var items []struct {
 		Symbol       string `json:"symbol"`
 		FundingRate  string `json:"fundingRate"`
@@ -548,60 +654,184 @@ func parseLongShortDOM(raw string, symbol domain.Symbol) *domain.LongShortRatio 
 		Headers []string   `json:"headers"`
 		Entries [][]string `json:"entries"`
 		Error   string     `json:"error"`
+		// `seen` is populated by the DOM scanner only when no matching
+		// table was found. It carries every table shape encountered on
+		// the page so the operator can diagnose selector drift from the
+		// log without re-running the scraper.
+		Seen []struct {
+			Headers []string   `json:"headers"`
+			Entries [][]string `json:"entries"`
+		} `json:"seen"`
 	}
-	if err := json.Unmarshal([]byte(raw), &table); err != nil || table.Error != "" {
-		slog.Warn("coinglass scraper: parse long/short DOM", "raw_error", err, "msg", table.Error)
+	if err := json.Unmarshal([]byte(raw), &table); err != nil {
+		slog.Warn("coinglass scraper: parse long/short DOM",
+			"symbol", symbol, "raw_error", err, "preview", firstN(raw, 200))
+		return result
+	}
+	if table.Error != "" {
+		// Downgrade to Debug — missing long/short data is expected for
+		// less popular coins and for Coinglass page rebuilds. Include
+		// the first seen-table shape so operators can update the selector.
+		var firstHeaders []string
+		if len(table.Seen) > 0 {
+			firstHeaders = table.Seen[0].Headers
+		}
+		slog.Debug("coinglass scraper: long/short table not found",
+			"symbol", symbol, "msg", table.Error,
+			"tables_on_page", len(table.Seen),
+			"first_headers", firstHeaders)
 		return result
 	}
 
-	// Find the Long/Short column for the shortest timeframe (prefer 1h, then 4h, then 24h).
-	colIdx := -1
-	for _, keyword := range []string{"1h", "4h", "24h"} {
-		for i, h := range table.Headers {
-			hLower := strings.ToLower(h)
-			if strings.Contains(hLower, keyword) &&
-				(strings.Contains(hLower, "long") || strings.Contains(hLower, "/")) {
-				colIdx = i
-				break
+	// Resolve the "Long/Short" column. Prefer an explicit combined
+	// column ("Long/Short", "Long / Short") and fall back to any header
+	// that mentions both "long" and "short" (covers historical layouts
+	// like "Long/Short 1h").
+	colIdx := findLongShortColumn(table.Headers)
+	if colIdx < 0 {
+		slog.Debug("coinglass scraper: long/short column not found",
+			"symbol", symbol, "headers", table.Headers)
+		return result
+	}
+
+	// Prefer the 1h row when the Type column is present; otherwise
+	// average across whatever rows we got (legacy per-exchange layouts).
+	typeIdx := findTypeColumn(table.Headers)
+	if v, ok := extractPreferredRatio(table.Entries, typeIdx, colIdx); ok {
+		result.GlobalRatio = v
+	} else {
+		result.GlobalRatio = averageRatio(table.Entries, colIdx)
+	}
+
+	if result.GlobalRatio > 0 {
+		result.TopShortPct = 100 / (1 + result.GlobalRatio)
+		result.TopLongPct = 100 - result.TopShortPct
+		slog.Info("coinglass scraper: long/short parsed",
+			"symbol", symbol, "global_ratio", result.GlobalRatio)
+	} else {
+		slog.Debug("coinglass scraper: long/short DOM yielded no numeric ratio",
+			"symbol", symbol, "headers", table.Headers, "rows", len(table.Entries))
+	}
+	return result
+}
+
+// findLongShortColumn returns the index of the header that represents the
+// long/short ratio cell. -1 when absent.
+//
+// Search order:
+//  1. Per-timeframe headers in preference order (1h → 4h → 24h) — legacy
+//     per-exchange layout that embeds the timeframe in the header, e.g.
+//     "Long/Short 1h".
+//  2. A bare "Long/Short" / "Long / Short" header — current summary
+//     layout where the timeframe is a separate `Type` column.
+//  3. Any header containing both "long" and "short" as a last resort.
+func findLongShortColumn(headers []string) int {
+	lowered := make([]string, len(headers))
+	for i, h := range headers {
+		lowered[i] = strings.ToLower(h)
+	}
+
+	// Pass 1: "Long/Short <tf>" with preferred timeframes.
+	for _, tf := range []string{"1h", "4h", "24h"} {
+		for i, h := range lowered {
+			if (strings.Contains(h, "long/short") || strings.Contains(h, "long / short")) &&
+				strings.Contains(h, tf) {
+				return i
 			}
 		}
-		if colIdx >= 0 {
-			break
+	}
+	// Pass 2: bare "Long/Short" column (no timeframe embedded).
+	for i, h := range lowered {
+		if strings.Contains(h, "long/short") || strings.Contains(h, "long / short") {
+			return i
 		}
 	}
-	if colIdx < 0 {
-		slog.Warn("coinglass scraper: long/short column not found", "headers", table.Headers)
-		return result
+	// Pass 3: any single header mentioning both words.
+	for i, h := range lowered {
+		if strings.Contains(h, "long") && strings.Contains(h, "short") {
+			return i
+		}
 	}
+	return -1
+}
 
-	// Average the ratio values across exchanges.
+// findTypeColumn locates a "Type" / "Timeframe" column. -1 when absent.
+func findTypeColumn(headers []string) int {
+	for i, h := range headers {
+		lower := strings.ToLower(strings.TrimSpace(h))
+		if lower == "type" || lower == "timeframe" || lower == "interval" {
+			return i
+		}
+	}
+	return -1
+}
+
+// extractPreferredRatio pulls the ratio from the first row whose Type
+// column matches one of the preferred timeframes, in order of preference.
+// Returns (value, true) on success.
+func extractPreferredRatio(entries [][]string, typeIdx, colIdx int) (float64, bool) {
+	if typeIdx < 0 {
+		return 0, false
+	}
+	for _, want := range []string{"1h", "4h", "24h"} {
+		for _, cells := range entries {
+			if typeIdx >= len(cells) || colIdx >= len(cells) {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(cells[typeIdx]), want) {
+				if v, ok := parseLongShortCell(cells[colIdx]); ok && v > 0 {
+					return v, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// averageRatio averages the numeric values of the long/short column
+// across all entries. Non-numeric or non-positive cells are skipped.
+func averageRatio(entries [][]string, colIdx int) float64 {
 	var sum float64
 	var count int
-	for _, cells := range table.Entries {
+	for _, cells := range entries {
 		if colIdx >= len(cells) {
 			continue
 		}
-		cell := cells[colIdx]
-		if v, err := strconv.ParseFloat(cell, 64); err == nil && v > 0 {
+		if v, ok := parseLongShortCell(cells[colIdx]); ok && v > 0 {
 			sum += v
 			count++
-			continue
-		}
-		if v := parsePercentage(cell); v > 0 {
-			sum += v / (100 - v)
-			count++
 		}
 	}
-
-	if count > 0 {
-		result.GlobalRatio = sum / float64(count)
-		result.TopShortPct = 100 / (1 + result.GlobalRatio)
-		result.TopLongPct = 100 - result.TopShortPct
+	if count == 0 {
+		return 0
 	}
+	return sum / float64(count)
+}
 
-	slog.Info("coinglass scraper: long/short parsed",
-		"symbol", symbol, "global_ratio", result.GlobalRatio)
-	return result
+// parseLongShortCell accepts both absolute ratio values ("1.25") and
+// percentage pairs ("55.5%" meaning "55.5% long"), converting the latter
+// to the canonical ratio long/short = pct / (100 - pct).
+func parseLongShortCell(cell string) (float64, bool) {
+	cell = strings.TrimSpace(cell)
+	if cell == "" {
+		return 0, false
+	}
+	if v, err := strconv.ParseFloat(cell, 64); err == nil {
+		return v, true
+	}
+	if v := parsePercentage(cell); v > 0 && v < 100 {
+		return v / (100 - v), true
+	}
+	return 0, false
+}
+
+// firstN returns s truncated to n runes for log previews.
+func firstN(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }
 
 func parseLiquidationDOM(raw string, symbol domain.Symbol, refPrice decimal.Decimal, pricePct float64) []domain.LiquidationZone {

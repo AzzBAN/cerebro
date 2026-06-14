@@ -3,6 +3,7 @@ package calendar
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,9 +11,12 @@ import (
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
+	"github.com/azhar/cerebro/internal/observability"
 )
 
-const finnhubBaseURL = "https://finnhub.io/api/v1/calendar/economic"
+// finnhubBaseURL is a var (not const) so tests can point the client at an
+// httptest server. Production code never mutates it.
+var finnhubBaseURL = "https://finnhub.io/api/v1/calendar/economic"
 
 // FinnhubCalendar implements port.CalendarFeed using the Finnhub economic calendar API.
 // Free tier: 60 calls/minute. Requires FINNHUB_API_KEY.
@@ -57,7 +61,20 @@ func (f *FinnhubCalendar) UpcomingEvents(ctx context.Context, hours int) ([]doma
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("finnhub calendar: http: %w", err)
+		// The stdlib *url.Error contains the full request URL — including the
+		// `token=...` query param — so its .Error() string would leak the
+		// secret to any logger. Build a redacted error string but preserve
+		// context.DeadlineExceeded / context.Canceled sentinels so callers can
+		// still classify the failure with errors.Is.
+		redacted := observability.RedactErrorString(err.Error())
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, fmt.Errorf("finnhub calendar: http: %s: %w", redacted, context.DeadlineExceeded)
+		case errors.Is(err, context.Canceled):
+			return nil, fmt.Errorf("finnhub calendar: http: %s: %w", redacted, context.Canceled)
+		default:
+			return nil, fmt.Errorf("finnhub calendar: http: %s", redacted)
+		}
 	}
 	defer resp.Body.Close()
 

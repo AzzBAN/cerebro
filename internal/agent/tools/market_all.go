@@ -9,9 +9,18 @@ import (
 	"github.com/azhar/cerebro/internal/port"
 )
 
+// SymbolsProvider returns the current screening universe. It is resolved
+// on each tool call so discovery-surfaced symbols are visible to the LLM
+// without requiring a restart.
+type SymbolsProvider func(ctx context.Context) []domain.Symbol
+
 // GetAllMarketData returns real-time quotes for all monitored symbols at once.
 // Use this for cross-symbol comparison and relative strength analysis.
-func GetAllMarketData(lookup QuoteProvider, symbols []domain.Symbol) port.Tool {
+//
+// The symbol set is resolved lazily on each invocation via SymbolsProvider,
+// so discovery-surfaced symbols (Phase 0) appear alongside the static
+// markets.yaml universe automatically.
+func GetAllMarketData(lookup QuoteProvider, symbolsFn SymbolsProvider) port.Tool {
 	return port.Tool{
 		Handler: func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
 			type quoteEntry struct {
@@ -25,6 +34,7 @@ func GetAllMarketData(lookup QuoteProvider, symbols []domain.Symbol) port.Tool {
 				Available        bool   `json:"available"`
 			}
 
+			symbols := symbolsFn(ctx)
 			entries := make([]quoteEntry, 0, len(symbols))
 			for _, sym := range symbols {
 				q, ok := lookup(sym)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/azhar/cerebro/internal/agent"
 	"github.com/azhar/cerebro/internal/port"
@@ -22,6 +24,15 @@ type OpenAIAdapter struct {
 	maxToks  int
 }
 
+// defaultHTTPTimeout is a generous outer-bound HTTP timeout for OpenAI-compatible
+// calls. It exists only as a last-ditch guard against a wedged TCP connection
+// that somehow ignores context cancellation; it must NEVER be smaller than the
+// agent's per-turn context deadline, otherwise it silently shadows the configured
+// timeout. Reasoning models routed through OpenRouter (e.g. minimax-m2.5) can
+// legitimately need ~100s for a single turn, so we set this well above any
+// plausible per-turn budget and let the per-turn context govern in practice.
+const defaultHTTPTimeout = 10 * time.Minute
+
 // NewOpenAI creates an OpenAI-compatible LLM adapter.
 // Set baseURL="" to use the standard OpenAI API.
 func NewOpenAI(apiKey, baseURL, modelID string, temperature float64, maxOutputTokens int) *OpenAIAdapter {
@@ -29,6 +40,7 @@ func NewOpenAI(apiKey, baseURL, modelID string, temperature float64, maxOutputTo
 	if baseURL != "" {
 		cfg.BaseURL = baseURL
 	}
+	cfg.HTTPClient = &http.Client{Timeout: defaultHTTPTimeout}
 	return &OpenAIAdapter{
 		client:   openai.NewClientWithConfig(cfg),
 		modelID:  modelID,
@@ -60,20 +72,32 @@ func (a *OpenAIAdapter) Complete(
 
 	openaiTools := buildOpenAITools(tools)
 
+	turnTimeout := agent.TurnTimeoutFromCtx(ctx)
+	maxToks := agent.MaxTokensFromCtx(ctx, a.maxToks)
+
 	for turn := 0; turn < maxTurns; turn++ {
 		req := openai.ChatCompletionRequest{
 			Model:       a.modelID,
 			Messages:    msgs,
 			Temperature: a.temp,
-			MaxTokens:   a.maxToks,
+			MaxTokens:   maxToks,
 		}
 		if len(openaiTools) > 0 {
 			req.Tools = openaiTools
 		}
 
-		resp, err := a.client.CreateChatCompletion(ctx, req)
+		resp, err := a.callWithTurnTimeout(ctx, turnTimeout, req)
 		if err != nil {
-			return "", fmt.Errorf("%w: openai: %v", ErrLLMCall, err)
+			// Multi-wrap: ErrLLMCall lets the agent runtime classify the
+			// error as transient; preserving err lets errors.Is detect
+			// context.DeadlineExceeded for retry decisions.
+			return "", fmt.Errorf("%w: openai: %w", ErrLLMCall, err)
+		}
+		// Record per-turn usage so the CostTracker sees cumulative cost
+		// across the ReAct loop, not just the last turn. OpenAI-compatible
+		// endpoints that omit the usage block will simply contribute 0.
+		if u := agent.UsageFromCtx(ctx); u != nil {
+			u.Add(resp.Usage.PromptTokens, resp.Usage.CompletionTokens, 0)
 		}
 		if len(resp.Choices) == 0 {
 			return "", fmt.Errorf("openai: empty response")
@@ -139,7 +163,7 @@ func (a *OpenAIAdapter) Complete(
 		}
 
 		// If no tool directives, treat as final answer.
-		return choice.Message.Content, nil
+		return stripReasoning(choice.Message.Content), nil
 	}
 	return "", fmt.Errorf("%w: exceeded max turns (%d)", ErrLLMCall, maxTurns)
 }
@@ -199,6 +223,24 @@ func buildInvokesFromMatches(matches [][]string) []compatInvoke {
 		out = append(out, compatInvoke{Name: name, Args: args})
 	}
 	return out
+}
+
+// callWithTurnTimeout dispatches a single ChatCompletion API call under a
+// per-turn deadline if one is configured. Extracting this avoids the
+// "defer cancel inside a for loop" anti-pattern, which would otherwise stack
+// up cancels until the outer Complete returns.
+func (a *OpenAIAdapter) callWithTurnTimeout(
+	ctx context.Context,
+	turnTimeout time.Duration,
+	req openai.ChatCompletionRequest,
+) (openai.ChatCompletionResponse, error) {
+	callCtx := ctx
+	var cancel context.CancelFunc
+	if turnTimeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, turnTimeout)
+		defer cancel()
+	}
+	return a.client.CreateChatCompletion(callCtx, req)
 }
 
 func buildOpenAITools(tools map[string]port.Tool) []openai.Tool {

@@ -28,7 +28,7 @@
 flowchart LR
   subgraph ingress [Ingress]
     WS[WebSocket feeds\nBinance Spot · Binance Futures\nCrypto + XAUUSDT Gold]
-    NAP[News & Calendar APIs\nCryptoPanic · FMP · Myfxbook]
+    NAP[News & Calendar APIs\nCryptoPanic · FMP · FairEconomy]
     SCR[Scrapers\nFinancialJuice · chromedp]
   end
 
@@ -218,7 +218,7 @@ cerebro/
 │   │   ├── news/
 │   │   │   └── cryptopanic.go
 │   │   ├── calendar/
-│   │   │   └── myfxbook.go            # RSS / XML → domain.EconomicEvent
+│   │   │   └── faireconomy.go         # FairEconomy JSON → domain.EconomicEvent
 │   │   ├── scrape/
 │   │   │   ├── financialjuice.go      # chromedp headless job
 │   │   │   └── runner.go              # schedule + retry scrape jobs

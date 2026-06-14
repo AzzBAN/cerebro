@@ -12,11 +12,13 @@ import (
 	binanceadapter "github.com/azhar/cerebro/internal/adapter/binance"
 	"github.com/azhar/cerebro/internal/adapter/binance/futures"
 	"github.com/azhar/cerebro/internal/adapter/binance/spot"
+	agenttools "github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/config"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/execution"
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/azhar/cerebro/internal/risk"
 	"github.com/azhar/cerebro/internal/tui"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -38,8 +40,9 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 	unique := make([]port.Broker, 0, len(venues))
 	var kc klineClients
 
-	// Collect configured spot symbols for position filtering.
+	// Collect configured spot symbols and their min lot sizes for position/dust filtering.
 	spotSymbols := collectSymbolsForVenue(cfg.Markets, domain.VenueBinanceSpot)
+	spotMinLots := collectMinLotsForVenue(cfg.Markets, domain.VenueBinanceSpot)
 
 	for _, venue := range venues {
 		var broker port.Broker
@@ -51,7 +54,7 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 					cfg.Secrets.BinanceDemoAPIKey,
 					cfg.Secrets.BinanceDemoAPISecret,
 				)
-				broker = spot.NewSpotBroker(spotClient, "demo", spotSymbols)
+				broker = spot.NewSpotBroker(spotClient, "demo", spotSymbols, spotMinLots)
 				kc.spotClient = spotClient
 			case domain.EnvironmentLive:
 				isTestnet := cfg.Secrets.BinanceTestnetAPIKey != ""
@@ -66,7 +69,7 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 					mode = "testnet"
 				}
 				spotClient := binanceadapter.NewSpotClient(apiKey, apiSecret, isTestnet)
-				broker = spot.NewSpotBroker(spotClient, mode, spotSymbols)
+				broker = spot.NewSpotBroker(spotClient, mode, spotSymbols, spotMinLots)
 				kc.spotClient = spotClient
 			}
 		case domain.VenueBinanceFutures:
@@ -269,38 +272,169 @@ func countPositionsByVenue(positions []domain.Position, venue domain.Venue) int 
 	return n
 }
 
+// buildRouteOrderFn returns the function the agent tools invoke when the
+// risk agent decides to route an order. The caller supplies an
+// AgentOrderRequest carrying every optional field (OrderType, LimitPrice,
+// StopPrice, TIF, StopLoss, TakeProfit1, ScaleOutPct, ReduceOnly,
+// PositionSide, Leverage). Zero values fall back to the deterministic
+// defaults:
+//   - OrderType defaults to MARKET
+//   - TIF defaults to GTC
+//   - Leverage on futures inherits meta.cfg.Leverage
+//   - When StopLoss is set, the Worker attaches a broker-side bracket
+//     (OCO on spot, STOP_MARKET + TAKE_PROFIT_MARKET on futures).
 func buildRouteOrderFn(
 	router *execution.Router,
+	gate *risk.Gate,
+	brokers map[domain.Venue]port.Broker,
 	symbolMeta map[domain.Symbol]symbolMeta,
 	env domain.Environment,
 	tuiRunner *tui.Runner,
-) func(ctx context.Context, symbol domain.Symbol, side domain.Side, size float64) error {
-	return func(ctx context.Context, symbol domain.Symbol, side domain.Side, size float64) error {
-		meta, resolved, err := resolveRouteSymbol(symbol, symbolMeta)
+) func(ctx context.Context, req agenttools.AgentOrderRequest) error {
+	return func(ctx context.Context, req agenttools.AgentOrderRequest) error {
+		meta, resolved, err := resolveRouteSymbol(req.Symbol, symbolMeta)
 		if err != nil {
 			return err
 		}
 
-		qty := decimal.NewFromFloat(size)
+		// ── Risk gate: single chokepoint for the AGENT entry path ───────────
+		// The agent (approve_and_route_order / resize_and_route_order) reaches
+		// the broker through this function only. The strategy path gates at
+		// strategies.go *before* routing through the same Router/Worker, and
+		// the Router/Worker themselves are intentionally NOT gated — so the
+		// check here is the agent path's one and only gate and does NOT
+		// double-gate strategy orders.
+		//
+		// Reduce-only orders are position EXITS: they must never be blocked on
+		// position / notional / drawdown limits (same rule as ChatOps /close),
+		// so they skip the gate here. Everything else opens new risk and must
+		// clear the full gate, which also rejects while the kill-switch / halt
+		// is active.
+		if !req.ReduceOnly {
+			sig := domain.Signal{
+				CorrelationID: req.CorrelationID,
+				Strategy:      domain.StrategyName("risk_agent"),
+				Symbol:        resolved,
+				Side:          req.Side,
+				GeneratedAt:   time.Now().UTC(),
+			}
+			positions := collectPositions(ctx, brokers)
+			if gerr := gate.Check(ctx, sig, positions); gerr != nil {
+				slog.Warn("✗ agent order rejected by risk gate",
+					"symbol", resolved, "side", req.Side, "reason", gerr)
+				pushTUIOrder(tuiRunner, fmt.Sprintf("✗ RISK-REJECT(agent) %s %s — %v",
+					resolved, req.Side, gerr))
+				return fmt.Errorf("risk gate: %w", gerr)
+			}
+		}
+
+		qty := decimal.NewFromFloat(req.Size)
 		if !meta.cfg.LotSize.IsZero() {
 			qty = qty.Div(meta.cfg.LotSize).Floor().Mul(meta.cfg.LotSize)
 		}
 
+		orderType := req.OrderType
+		if orderType == "" {
+			orderType = domain.OrderTypeMarket
+		}
+		tif := req.TIF
+		if tif == "" {
+			tif = domain.TIFGTC
+		}
+		leverage := req.Leverage
+		if leverage == 0 && meta.venue == domain.VenueBinanceFutures {
+			leverage = meta.cfg.Leverage
+		}
+
 		intent := domain.OrderIntent{
-			ID:          uuid.New().String(),
-			Symbol:      resolved,
-			Venue:       meta.venue,
-			Side:        side,
-			Quantity:    qty,
-			Strategy:    domain.StrategyName("risk_agent"),
-			Environment: env,
-			CreatedAt:   time.Now().UTC(),
+			ID:            uuid.New().String(),
+			CorrelationID: req.CorrelationID,
+			Symbol:        resolved,
+			Venue:         meta.venue,
+			Side:          req.Side,
+			OrderType:     orderType,
+			Quantity:      qty,
+			LimitPrice:    req.LimitPrice,
+			StopPrice:     req.StopPrice,
+			TIF:           tif,
+			StopLoss:      req.StopLoss,
+			TakeProfit1:   req.TakeProfit1,
+			ScaleOutPct:   req.ScaleOutPct,
+			ReduceOnly:    req.ReduceOnly,
+			PositionSide:  req.PositionSide,
+			Leverage:      leverage,
+			Strategy:      domain.StrategyName("risk_agent"),
+			Environment:   env,
+			CreatedAt:     time.Now().UTC(),
 		}
 		if _, err := router.Route(ctx, intent, meta.venue); err != nil {
 			return err
 		}
-		pushTUIOrder(tuiRunner, fmt.Sprintf("✓ AGENT ORDER %s %s %.6f {%s}", side, resolved, size, meta.venue))
+
+		// TUI summary line. Include the order type and bracket info when
+		// present so operators can see what the agent actually did.
+		summary := fmt.Sprintf("AGENT %s %s %s %.6f {%s}",
+			orderType, req.Side, resolved, req.Size, meta.venue)
+		if !req.StopLoss.IsZero() {
+			summary += fmt.Sprintf(" SL=%s", req.StopLoss.StringFixed(4))
+		}
+		if !req.TakeProfit1.IsZero() {
+			summary += fmt.Sprintf(" TP=%s", req.TakeProfit1.StringFixed(4))
+		}
+		pushTUIOrder(tuiRunner, summary)
 		return nil
+	}
+}
+
+// buildCloseFn returns a ClosePositionFn the chatops dispatcher can use to
+// close a single position via the execution router. The close is a
+// reduce-only MARKET order for the full position quantity and goes through
+// the normal Router → Worker → broker path, which preserves the single-
+// writer invariant and captures the close in the audit trail.
+//
+// Brackets attached to the position are intentionally NOT cancelled here —
+// the server-side OCO or STOP_MARKET + TAKE_PROFIT_MARKET pair will fire
+// naturally when the market-close reduces the position to zero, or can be
+// cleaned up by the next periodic reconcile.
+func buildCloseFn(
+	router *execution.Router,
+	env domain.Environment,
+) func(ctx context.Context, pos domain.Position) (string, error) {
+	return func(ctx context.Context, pos domain.Position) (string, error) {
+		if pos.Symbol == "" {
+			return "", fmt.Errorf("close: position has no symbol")
+		}
+		if pos.Quantity.IsZero() {
+			return "", fmt.Errorf("close: position has zero quantity")
+		}
+
+		closeSide := domain.SideSell
+		if pos.Side == domain.SideSell {
+			closeSide = domain.SideBuy
+		}
+
+		intent := domain.OrderIntent{
+			ID:            uuid.New().String(),
+			CorrelationID: pos.CorrelationID,
+			Symbol:        pos.Symbol,
+			Venue:         pos.Venue,
+			Side:          closeSide,
+			OrderType:     domain.OrderTypeMarket,
+			Quantity:      pos.Quantity,
+			Strategy:      domain.StrategyName("chatops_close"),
+			Environment:   env,
+			CreatedAt:     time.Now().UTC(),
+			// ReduceOnly is honoured on futures; it's a safety-net on spot
+			// because spot doesn't over-fill anyway. It prevents a race
+			// where the server-side bracket fires between our positions
+			// snapshot and this close submission.
+			ReduceOnly: true,
+		}
+		resp, err := router.Route(ctx, intent, pos.Venue)
+		if err != nil {
+			return "", err
+		}
+		return resp.BrokerOrderID, nil
 	}
 }
 
@@ -343,4 +477,20 @@ func collectSymbolsForVenue(venues []config.VenueConfig, target domain.Venue) []
 		}
 	}
 	return syms
+}
+
+// collectMinLotsForVenue returns a map of symbol → minimum lot size for dust filtering.
+func collectMinLotsForVenue(venues []config.VenueConfig, target domain.Venue) map[domain.Symbol]decimal.Decimal {
+	out := make(map[domain.Symbol]decimal.Decimal)
+	for _, vc := range venues {
+		if vc.Venue != target {
+			continue
+		}
+		for _, s := range vc.Symbols {
+			if s.Enabled && !s.LotSize.IsZero() {
+				out[domain.Symbol(s.Symbol)] = s.LotSize
+			}
+		}
+	}
+	return out
 }

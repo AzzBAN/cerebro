@@ -77,6 +77,37 @@ func TestGate_Check_AllowsValidSignal(t *testing.T) {
 	}
 }
 
+func TestGate_Check_AllowList_Configured(t *testing.T) {
+	g := NewGate(config.RiskConfig{}, newStubCache(), NewCalendarBlackout())
+	g.SetAllowedSymbols([]domain.Symbol{"BTC/USDT", "ETH/USDT"})
+
+	if err := g.Check(context.Background(), makeSignal("BTC/USDT"), nil); err != nil {
+		t.Fatalf("BTC/USDT should pass allow-list, got %v", err)
+	}
+
+	err := g.Check(context.Background(), makeSignal("PEPE/USDT-PERP"), nil)
+	if err == nil {
+		t.Fatal("PEPE/USDT-PERP should be rejected: not in allow-list")
+	}
+}
+
+func TestGate_Check_AllowList_Empty_Disables_Check(t *testing.T) {
+	g := NewGate(config.RiskConfig{}, newStubCache(), NewCalendarBlackout())
+	// No SetAllowedSymbols call → empty set → check disabled.
+	if err := g.Check(context.Background(), makeSignal("PEPE/USDT-PERP"), nil); err != nil {
+		t.Fatalf("expected pass when allow-list is empty, got %v", err)
+	}
+}
+
+func TestGate_SetAllowedSymbols_NilClearsList(t *testing.T) {
+	g := NewGate(config.RiskConfig{}, newStubCache(), NewCalendarBlackout())
+	g.SetAllowedSymbols([]domain.Symbol{"BTC/USDT"})
+	g.SetAllowedSymbols(nil)
+	if err := g.Check(context.Background(), makeSignal("PEPE/USDT-PERP"), nil); err != nil {
+		t.Fatalf("expected pass after clearing allow-list, got %v", err)
+	}
+}
+
 func TestGate_Check_HaltActive(t *testing.T) {
 	g := NewGate(config.RiskConfig{}, newStubCache(), NewCalendarBlackout())
 	g.SetHalt(domain.HaltModePause)
@@ -200,6 +231,57 @@ func TestGate_UpdatePnL(t *testing.T) {
 
 	// Internal state is not exported, but we can verify no panic occurred.
 	// If daily loss checks were enforced, they would read these values.
+}
+
+func TestGate_Check_MaxDrawdown(t *testing.T) {
+	cfg := config.RiskConfig{MaxDrawdownPct: 5.0}
+	g := NewGate(cfg, newStubCache(), NewCalendarBlackout())
+	g.SetStartingEquity(decimal.NewFromInt(10000))
+
+	// Session loss of 4% — should pass.
+	g.UpdatePnL(decimal.NewFromInt(-400))
+	err := g.Check(context.Background(), makeSignal("BTC/USDT"), nil)
+	if err != nil {
+		t.Fatalf("4%% drawdown should pass (limit 5%%), got %v", err)
+	}
+
+	// Push to 6% — should reject.
+	g.UpdatePnL(decimal.NewFromInt(-200))
+	err = g.Check(context.Background(), makeSignal("BTC/USDT"), nil)
+	if err == nil {
+		t.Fatal("6% drawdown should be rejected (limit 5%)")
+	}
+}
+
+func TestGate_Check_MaxDrawdown_NoEquity(t *testing.T) {
+	// Without SetStartingEquity, drawdown check is a no-op (safe default).
+	cfg := config.RiskConfig{MaxDrawdownPct: 5.0}
+	g := NewGate(cfg, newStubCache(), NewCalendarBlackout())
+	g.UpdatePnL(decimal.NewFromInt(-9999))
+	err := g.Check(context.Background(), makeSignal("BTC/USDT"), nil)
+	if err != nil {
+		t.Fatalf("without equity, drawdown should be skipped, got %v", err)
+	}
+}
+
+func TestGate_Check_MaxDailyLoss(t *testing.T) {
+	cfg := config.RiskConfig{MaxDailyLossPct: 2.0}
+	g := NewGate(cfg, newStubCache(), NewCalendarBlackout())
+	g.SetStartingEquity(decimal.NewFromInt(10000))
+
+	// 1.5% daily loss — should pass.
+	g.UpdatePnL(decimal.NewFromInt(-150))
+	err := g.Check(context.Background(), makeSignal("BTC/USDT"), nil)
+	if err != nil {
+		t.Fatalf("1.5%% daily loss should pass (limit 2%%), got %v", err)
+	}
+
+	// Push to 2.5% — should reject.
+	g.UpdatePnL(decimal.NewFromInt(-100))
+	err = g.Check(context.Background(), makeSignal("BTC/USDT"), nil)
+	if err == nil {
+		t.Fatal("2.5% daily loss should be rejected (limit 2%)")
+	}
 }
 
 func TestGate_Check_ContextCancellation(t *testing.T) {

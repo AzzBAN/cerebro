@@ -40,7 +40,7 @@ func TestGetAllMarketData(t *testing.T) {
 		return domain.Quote{}, false
 	}
 
-	tool := GetAllMarketData(lookup, symbols)
+	tool := GetAllMarketData(lookup, func(_ context.Context) []domain.Symbol { return symbols })
 	result, err := tool.Handler(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -85,7 +85,7 @@ func TestGetAllMarketData_EmptySymbols(t *testing.T) {
 		return domain.Quote{}, false
 	}
 
-	tool := GetAllMarketData(lookup, nil)
+	tool := GetAllMarketData(lookup, func(_ context.Context) []domain.Symbol { return nil })
 	result, err := tool.Handler(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

@@ -9,7 +9,7 @@ import (
 )
 
 func TestHandleUserDataMessage_BalanceUpdateRemovesPosition(t *testing.T) {
-	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"})
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"}, nil)
 
 	// Pre-populate a BTC position.
 	b.mu.Lock()
@@ -44,7 +44,7 @@ func TestHandleUserDataMessage_BalanceUpdateRemovesPosition(t *testing.T) {
 }
 
 func TestHandleUserDataMessage_BalanceUpdateKeepsPosition(t *testing.T) {
-	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"})
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"}, nil)
 
 	// Pre-populate.
 	b.mu.Lock()
@@ -84,8 +84,58 @@ func TestHandleUserDataMessage_BalanceUpdateKeepsPosition(t *testing.T) {
 	}
 }
 
+func TestRebuildPositions_DustFiltered(t *testing.T) {
+	minLots := map[domain.Symbol]decimal.Decimal{
+		"BTC/USDT": decimal.NewFromFloat(0.00001),
+	}
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"}, minLots)
+
+	// Simulate a dust balance below the lot size.
+	b.mu.Lock()
+	b.balances["BTC"] = spotBalance{
+		free:   decimal.NewFromFloat(0.00000814), // below lot_size 0.00001
+		locked: decimal.Zero,
+	}
+	b.rebuildPositionsLocked()
+	b.mu.Unlock()
+
+	positions, _ := b.Positions(context.Background())
+	for _, p := range positions {
+		if p.Symbol == "BTC/USDT" {
+			t.Errorf("BTC/USDT dust balance should have been filtered out, got qty=%s", p.Quantity)
+		}
+	}
+}
+
+func TestRebuildPositions_AboveLotSizeKept(t *testing.T) {
+	minLots := map[domain.Symbol]decimal.Decimal{
+		"BTC/USDT": decimal.NewFromFloat(0.00001),
+	}
+	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"}, minLots)
+
+	// Balance above the lot size should be kept.
+	b.mu.Lock()
+	b.balances["BTC"] = spotBalance{
+		free:   decimal.NewFromFloat(0.001),
+		locked: decimal.Zero,
+	}
+	b.rebuildPositionsLocked()
+	b.mu.Unlock()
+
+	positions, _ := b.Positions(context.Background())
+	found := false
+	for _, p := range positions {
+		if p.Symbol == "BTC/USDT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("BTC/USDT position above lot size should be kept")
+	}
+}
+
 func TestHandleUserDataMessage_AckMessage(t *testing.T) {
-	b := NewSpotBroker(nil, "mainnet", nil)
+	b := NewSpotBroker(nil, "mainnet", nil, nil)
 	// Subscription ack should be silently ignored.
 	msg := `{"id":"sub-1","status":200,"result":null}`
 	if err := b.handleUserDataMessage([]byte(msg)); err != nil {

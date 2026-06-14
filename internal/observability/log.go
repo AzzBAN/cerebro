@@ -237,7 +237,12 @@ func (h *prettyHandler) Handle(_ context.Context, r slog.Record) error {
 	if h.sink == nil {
 		_, _ = io.WriteString(h.w, line)
 	}
-	if h.sink != nil {
+	// Only forward INFO and above to the TUI panel. DEBUG records are
+	// developer-facing noise (raw LLM request/response bodies, per-turn
+	// dumps, etc.) that flood the operator-facing Activity & Log panel.
+	// They still reach the rotating file handler when one is configured,
+	// so nothing is lost for post-hoc debugging.
+	if h.sink != nil && r.Level >= slog.LevelInfo {
 		levelStr := r.Level.String()
 		h.sink.SendSysLog(levelStr, plainLine)
 	}

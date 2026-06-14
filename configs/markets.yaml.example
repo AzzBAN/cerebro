@@ -2,87 +2,109 @@
 # Project Cerebro — Markets Configuration Example
 # =============================================================================
 # Copy this file to configs/markets.yaml and adjust to your trading universe.
+#
 # Symbols must use Cerebro's canonical internal format:
-#   Spot             -> BTC/USDT
-#   Futures perpetual-> BTC/USDT-PERP
+#   Spot              -> BTC/USDT
+#   Futures perpetual -> BTC/USDT-PERP
+#
+# -----------------------------------------------------------------------------
+# How to add a new watch
+# -----------------------------------------------------------------------------
+# Each venue has a `defaults:` block. Every symbol in that venue inherits all
+# fields from `defaults:` unless the symbol explicitly overrides them. To add
+# a new watch with venue defaults, just append:
+#
+#   - symbol: BNB/USDT
+#
+# To override a single field (e.g. lot size for a coin with bigger steps):
+#
+#   - symbol: SOL/USDT
+#     lot_size: 0.01
+#     max_order_notional: 20000.0
+#
+# -----------------------------------------------------------------------------
+# Per-symbol strategy assignment
+# -----------------------------------------------------------------------------
+# By default, every symbol runs the strategies listed under
+# `default_strategies:` in strategies.yaml.
+#
+# To run a *different* set of strategies on a specific coin, add a
+# `strategies:` field on that symbol — it fully replaces the defaults:
+#
+#   - symbol: SOL/USDT
+#     strategies: [mean_reversion]            # SOL only runs mean_reversion
+#
+# To opt a symbol out of all strategies (data-only watch), set `strategies: []`.
 # =============================================================================
 
 venues:
+  # ---------------------------------------------------------------------------
+  # SPOT — Binance Spot
+  # ---------------------------------------------------------------------------
   - venue: binance_spot
+    defaults:
+      contract_type: spot
+      leverage: 1
+      margin_type: isolated
+      tick_size: 0.01
+      lot_size: 0.0001
+      min_notional: 5.0
+      max_order_notional: 50000.0
+      max_position_size_pct: 5.0
+      timeframes: [1m, 5m, 15m, 1h]
+      primary_timeframe: 5m
+      trend_timeframe: 1h
+      max_spread_pct: 0.05
+      enabled: true
     symbols:
       - symbol: BTC/USDT
-        contract_type: spot
-        leverage: 1
-        margin_type: isolated
-        tick_size: 0.01
+        # BTC has tighter lot sizing; everything else inherited.
         lot_size: 0.00001
-        min_notional: 5.0
         max_order_notional: 100000.0
-        max_position_size_pct: 5.0
-        timeframes: [1m, 5m, 15m, 1h]
-        primary_timeframe: 5m
-        trend_timeframe: 1h
-        max_spread_pct: 0.05
-        enabled: true
 
       - symbol: ETH/USDT
-        contract_type: spot
-        leverage: 1
-        margin_type: isolated
-        tick_size: 0.01
-        lot_size: 0.0001
-        min_notional: 5.0
-        max_order_notional: 50000.0
-        max_position_size_pct: 5.0
-        timeframes: [1m, 5m, 15m, 1h]
-        primary_timeframe: 5m
-        trend_timeframe: 1h
-        max_spread_pct: 0.05
-        enabled: true
+        # All fields inherited from defaults.
 
       - symbol: SOL/USDT
-        contract_type: spot
-        leverage: 1
-        margin_type: isolated
-        tick_size: 0.01
+        # Different lot/notional profile and run only mean_reversion on SOL.
         lot_size: 0.01
-        min_notional: 5.0
         max_order_notional: 20000.0
         max_position_size_pct: 3.0
-        timeframes: [1m, 5m, 15m, 1h]
-        primary_timeframe: 5m
-        trend_timeframe: 1h
         max_spread_pct: 0.1
-        enabled: true
+        strategies: [mean_reversion]
 
+      # To add another spot watch with all defaults, just uncomment:
+      # - symbol: BNB/USDT
+      # - symbol: XRP/USDT
+
+  # ---------------------------------------------------------------------------
+  # FUTURES — Binance USDT-M Perpetuals
+  # ---------------------------------------------------------------------------
   - venue: binance_futures
+    defaults:
+      contract_type: futures_perpetual
+      leverage: 5
+      margin_type: isolated
+      tick_size: 0.10
+      lot_size: 0.001
+      min_notional: 5.0
+      max_order_notional: 50000.0
+      max_position_size_pct: 3.0
+      timeframes: [1m, 5m, 15m, 1h]
+      primary_timeframe: 5m
+      trend_timeframe: 1h
+      max_spread_pct: 0.05
+      enabled: true
     symbols:
       - symbol: BTC/USDT-PERP
-        contract_type: futures_perpetual
-        leverage: 5
-        margin_type: isolated
-        tick_size: 0.10
-        lot_size: 0.001
-        min_notional: 5.0
-        max_order_notional: 50000.0
-        max_position_size_pct: 3.0
-        timeframes: [1m, 5m, 15m, 1h]
-        primary_timeframe: 5m
-        trend_timeframe: 1h
-        max_spread_pct: 0.05
-        enabled: false
+        enabled: false   # disable until live broker keys are wired
 
       - symbol: XAU/USDT-PERP
-        contract_type: futures_perpetual
-        leverage: 5
-        margin_type: isolated
+        # Gold runs on slower timeframes and only the breakout/swing strategies.
         tick_size: 0.01
         lot_size: 0.1
-        min_notional: 5.0
-        max_order_notional: 50000.0
-        max_position_size_pct: 3.0
         timeframes: [5m, 15m, 1h, 4h]
         primary_timeframe: 15m
         trend_timeframe: 4h
         max_spread_pct: 0.02
-        enabled: true
+        strategies: [volatility_breakout, swing]

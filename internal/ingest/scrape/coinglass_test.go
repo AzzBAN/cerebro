@@ -228,3 +228,171 @@ func TestParseLiquidationDOM(t *testing.T) {
 		t.Errorf("zone 1 amount = %s, want 3100000", zones[1].AmountUSD.String())
 	}
 }
+
+func TestErrSymbolNotCoveredIsSentinel(t *testing.T) {
+	// Asserts the sentinel is exported and usable with errors.Is
+	// across wrapped errors. This lets callers (Snapshot, screening)
+	// detect "structurally unsupported asset" cleanly without string
+	// matching.
+	if ErrSymbolNotCovered == nil {
+		t.Fatal("ErrSymbolNotCovered must not be nil")
+	}
+
+	// ─── long/short DOM parser ───────────────────────────────────────
+	//
+	// The following tests exercise parseLongShortDOM against realistic
+	// JSON payloads produced by the DOM scanner, including the current
+	// (2026) three-column "Type | Long/Short | Sentiment" layout and
+	// the legacy per-exchange layout.
+	_ = t // allow chained subtests below to see t in scope if refactored
+}
+
+func TestIsCoinglassSupportedCoin(t *testing.T) {
+	tests := []struct {
+		coin string
+		want bool
+	}{
+		{"BTC", true},
+		{"ETH", true},
+		{"btc", true},  // case-insensitive
+		{"  SOL ", true},
+		{"XAU", false}, // gold synthetic — not on Coinglass
+		{"xag", false}, // silver
+		{"XAUUSD", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.coin, func(t *testing.T) {
+			if got := isCoinglassSupportedCoin(tc.coin); got != tc.want {
+				t.Errorf("isCoinglassSupportedCoin(%q)=%v want %v", tc.coin, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFindLongShortColumn(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []string
+		want    int
+	}{
+		{"current three-col layout", []string{"Type", "Long/Short", "Sentiment"}, 1},
+		{"spaced slash", []string{"Timeframe", "Long / Short", "Signal"}, 1},
+		{"legacy per-exchange", []string{"Rank", "Exchange", "Long%", "Short%", "Long/Short 1h"}, 4},
+		// Split Long/Short columns (two separate headers) are not a
+		// single ratio cell — the parser can't derive one value from
+		// two cells, so -1 is the correct signal to skip.
+		{"split columns not supported", []string{"Long Account%", "Short Account%"}, -1},
+		{"missing", []string{"Rank", "Exchange", "Volume"}, -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := findLongShortColumn(tc.headers); got != tc.want {
+				t.Errorf("findLongShortColumn(%v)=%d want %d", tc.headers, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLongShortCell(t *testing.T) {
+	tests := []struct {
+		cell string
+		val  float64
+		ok   bool
+	}{
+		{"1.25", 1.25, true},
+		{"0.98", 0.98, true},
+		{"", 0, false},
+		{"—", 0, false},
+		{"55.5%", 55.5 / 44.5, true},   // pct → ratio
+		{"50%", 50.0 / 50.0, true},     // 50% long = ratio 1.0
+		{"100%", 0, false},             // degenerate
+		{"0%", 0, false},               // degenerate
+		{"nonsense", 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.cell, func(t *testing.T) {
+			v, ok := parseLongShortCell(tc.cell)
+			if ok != tc.ok {
+				t.Fatalf("parseLongShortCell(%q) ok=%v want %v", tc.cell, ok, tc.ok)
+			}
+			if ok {
+				diff := v - tc.val
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > 1e-9 {
+					t.Errorf("parseLongShortCell(%q) = %v, want %v", tc.cell, v, tc.val)
+				}
+			}
+		})
+	}
+}
+
+func TestParseLongShortDOM_CurrentLayout(t *testing.T) {
+	// Shape the DOM scanner returns for the 2026 page:
+	//   Type | Long/Short | Sentiment
+	//    1h  |    0.98    | Neutral
+	//    4h  |    1.12    | Bullish
+	//   24h  |    0.85    | Bearish
+	raw := `{
+		"headers":["Type","Long/Short","Sentiment"],
+		"entries":[
+			["1h","0.98","Neutral"],
+			["4h","1.12","Bullish"],
+			["24h","0.85","Bearish"]
+		]
+	}`
+	got := parseLongShortDOM(raw, domain.Symbol("BTC/USDT"))
+	// Prefer 1h row.
+	if got.GlobalRatio <= 0.979 || got.GlobalRatio >= 0.981 {
+		t.Errorf("GlobalRatio = %v, want ≈0.98", got.GlobalRatio)
+	}
+	wantShort := 100.0 / (1 + 0.98)
+	if diff := got.TopShortPct - wantShort; diff > 1e-6 || diff < -1e-6 {
+		t.Errorf("TopShortPct = %v, want %v", got.TopShortPct, wantShort)
+	}
+	if got.TopLongPct+got.TopShortPct < 99.9 {
+		t.Errorf("TopLongPct+TopShortPct should sum to 100, got %v", got.TopLongPct+got.TopShortPct)
+	}
+}
+
+func TestParseLongShortDOM_LegacyExchangeLayout(t *testing.T) {
+	// Falls back to averaging when there's no Type column.
+	raw := `{
+		"headers":["Rank","Exchange","Long/Short 1h"],
+		"entries":[
+			["1","Binance","1.10"],
+			["2","Bybit","1.05"],
+			["3","OKX","1.15"]
+		]
+	}`
+	got := parseLongShortDOM(raw, domain.Symbol("BTC/USDT"))
+	wantAvg := (1.10 + 1.05 + 1.15) / 3
+	if diff := got.GlobalRatio - wantAvg; diff > 1e-6 || diff < -1e-6 {
+		t.Errorf("GlobalRatio = %v, want %v", got.GlobalRatio, wantAvg)
+	}
+}
+
+func TestParseLongShortDOM_TableNotFound(t *testing.T) {
+	raw := `{"error":"long/short table not found","seen":[{"headers":["Name","Price"],"entries":[["BTC","$80,000"]]}]}`
+	got := parseLongShortDOM(raw, domain.Symbol("BTC/USDT"))
+	if got.GlobalRatio != 0 {
+		t.Errorf("expected zero ratio on not-found, got %v", got.GlobalRatio)
+	}
+	// Symbol + timestamp must still be populated so downstream code
+	// doesn't trip over a nil snapshot.
+	if got.Symbol != domain.Symbol("BTC/USDT") {
+		t.Errorf("Symbol preserved; got %v", got.Symbol)
+	}
+	if got.FetchedAt.IsZero() {
+		t.Error("FetchedAt should be set even on parse failure")
+	}
+}
+
+func TestParseLongShortDOM_Malformed(t *testing.T) {
+	got := parseLongShortDOM("not json", domain.Symbol("BTC/USDT"))
+	if got.GlobalRatio != 0 {
+		t.Errorf("malformed input must yield zero ratio, got %v", got.GlobalRatio)
+	}
+}

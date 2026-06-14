@@ -23,9 +23,15 @@ type Gate struct {
 	cache          port.Cache
 	calendar       *CalendarBlackout
 	haltMode       *domain.HaltMode
+	startingEquity decimal.Decimal
 	sessionPnL     decimal.Decimal
 	dailyPnL       decimal.Decimal
 	dailyResetDate time.Time
+
+	// allowedSymbols is the closed universe of executable symbols (taken
+	// from markets.yaml at startup). When non-empty, signals on symbols
+	// outside this set are rejected. Empty = no allow-list (e.g. tests).
+	allowedSymbols map[domain.Symbol]struct{}
 }
 
 // NewGate creates a Gate with the given risk configuration.
@@ -38,40 +44,80 @@ func NewGate(cfg config.RiskConfig, cache port.Cache, cal *CalendarBlackout) *Ga
 	}
 }
 
+// SetAllowedSymbols installs the executable-symbol allow-list. Signals on
+// symbols not in this set will be rejected with ErrSignalRejected. Pass
+// nil/empty to disable the check (used by tests and discovery-disabled
+// deployments where the markets.yaml universe is the only source).
+//
+// Safe to call once at startup; not safe to call concurrently with Check.
+func (g *Gate) SetAllowedSymbols(syms []domain.Symbol) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(syms) == 0 {
+		g.allowedSymbols = nil
+		return
+	}
+	set := make(map[domain.Symbol]struct{}, len(syms))
+	for _, s := range syms {
+		set[s] = struct{}{}
+	}
+	g.allowedSymbols = set
+}
+
+// SetStartingEquity records the account equity at session start so that
+// drawdown and daily-loss percentages can be calculated.
+func (g *Gate) SetStartingEquity(equity decimal.Decimal) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.startingEquity = equity
+	slog.Info("risk gate: starting equity set", "equity", equity.StringFixed(2))
+}
+
 // Check validates a signal against all active risk limits.
 // Returns nil if the signal may proceed, or a wrapped domain error if rejected.
 func (g *Gate) Check(ctx context.Context, sig domain.Signal, positions []domain.Position) error {
+	// 1. Daily PnL reset at midnight UTC — done under write lock *before*
+	//    taking the read lock to avoid the RLock→Lock promotion race.
+	g.maybeResetDailyPnL()
+
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	// 1. Global halt
+	// 2. Global halt
 	if g.haltMode != nil {
 		return fmt.Errorf("%w: mode=%s", domain.ErrHaltActive, *g.haltMode)
 	}
 
-	// 2. Engine kill switch check is handled in app.go before signals reach the gate.
-
-	// 3. Daily PnL reset at midnight UTC.
-	if time.Now().UTC().After(g.dailyResetDate) {
-		g.mu.RUnlock()
-		g.mu.Lock()
-		g.dailyPnL = decimal.Zero
-		g.dailyResetDate = midnightUTC()
-		g.mu.Unlock()
-		g.mu.RLock()
+	// 2a. Symbol allow-list. Rejects discovery-surfaced symbols that have
+	// not been promoted into markets.yaml — execution is gated to the
+	// configured universe, even when the LLM proposes something else.
+	if len(g.allowedSymbols) > 0 {
+		if _, ok := g.allowedSymbols[sig.Symbol]; !ok {
+			return fmt.Errorf("%w: symbol %s is not in markets.yaml allow-list (discovery-only)",
+				domain.ErrSignalRejected, sig.Symbol)
+		}
 	}
 
-	// 4. Drawdown check.
-	if g.cfg.MaxDrawdownPct > 0 && g.sessionPnL.IsNegative() {
-		drawdown := g.sessionPnL.Abs()
-		// We store PnL as an absolute value relative to starting equity.
-		// Phase 4 will track equity properly; this is a structural placeholder.
-		_ = drawdown
+	// 3. Engine kill switch check is handled in app.go before signals reach the gate.
+
+	// 4. Drawdown check — reject if session loss exceeds configured max.
+	if g.cfg.MaxDrawdownPct > 0 && g.sessionPnL.IsNegative() && g.startingEquity.IsPositive() {
+		drawdownPct := g.sessionPnL.Abs().Div(g.startingEquity).Mul(decimal.NewFromInt(100))
+		limit := decimal.NewFromFloat(g.cfg.MaxDrawdownPct)
+		if drawdownPct.GreaterThanOrEqual(limit) {
+			return fmt.Errorf("%w: session drawdown %.2f%% >= max %.2f%%",
+				domain.ErrSignalRejected, drawdownPct.InexactFloat64(), g.cfg.MaxDrawdownPct)
+		}
 	}
 
-	// 5. Daily loss check.
-	if g.cfg.MaxDailyLossPct > 0 && g.dailyPnL.IsNegative() {
-		_ = g.dailyPnL
+	// 5. Daily loss check — reject if today's realised loss exceeds configured max.
+	if g.cfg.MaxDailyLossPct > 0 && g.dailyPnL.IsNegative() && g.startingEquity.IsPositive() {
+		dailyLossPct := g.dailyPnL.Abs().Div(g.startingEquity).Mul(decimal.NewFromInt(100))
+		limit := decimal.NewFromFloat(g.cfg.MaxDailyLossPct)
+		if dailyLossPct.GreaterThanOrEqual(limit) {
+			return fmt.Errorf("%w: daily loss %.2f%% >= max %.2f%%",
+				domain.ErrSignalRejected, dailyLossPct.InexactFloat64(), g.cfg.MaxDailyLossPct)
+		}
 	}
 
 	// 6. Max open positions.
@@ -174,6 +220,26 @@ func (g *Gate) UpdatePnL(pnl decimal.Decimal) {
 	defer g.mu.Unlock()
 	g.sessionPnL = g.sessionPnL.Add(pnl)
 	g.dailyPnL = g.dailyPnL.Add(pnl)
+}
+
+// maybeResetDailyPnL resets daily PnL at midnight UTC using a proper
+// double-check pattern under a write lock (avoiding the RLock→Lock race).
+func (g *Gate) maybeResetDailyPnL() {
+	g.mu.RLock()
+	needsReset := time.Now().UTC().After(g.dailyResetDate)
+	g.mu.RUnlock()
+	if !needsReset {
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// Double-check under write lock.
+	if time.Now().UTC().After(g.dailyResetDate) {
+		g.dailyPnL = decimal.Zero
+		g.dailyResetDate = midnightUTC()
+		slog.Info("risk gate: daily PnL reset at midnight UTC")
+	}
 }
 
 func midnightUTC() time.Time {

@@ -14,4 +14,16 @@ var (
 	ErrDuplicateSignal  = errors.New("signal deduplicated within window")
 	ErrIPBanned         = errors.New("IP banned by broker (HTTP 418); halting all operations")
 	ErrRateLimitWeight  = errors.New("Binance request weight limit approached; backing off")
+	// ErrCircuitOpen signals that an LLM circuit breaker is short-circuiting
+	// calls to a failing provider. Distinct from ErrAgentTimeout so callers
+	// can fail fast (do NOT retry) — the breaker exists precisely for that.
+	ErrCircuitOpen = errors.New("circuit breaker open")
+
+	// Exchange filter violations — returned by SymbolFilter.Validate before
+	// an order is submitted to the broker, so we fail fast locally rather
+	// than burn weight and audit noise on a guaranteed -1013 rejection.
+	ErrOrderBelowMinQty      = errors.New("order quantity below symbol minQty filter")
+	ErrOrderAboveMaxQty      = errors.New("order quantity above symbol maxQty filter")
+	ErrOrderBelowMinNotional = errors.New("order notional below symbol minNotional filter")
+	ErrSymbolFilterUnknown   = errors.New("no exchange filter loaded for symbol")
 )

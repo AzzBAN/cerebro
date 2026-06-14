@@ -30,12 +30,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	slog.Info("scrape runner started", "name", r.name, "interval", r.interval)
+	defer slog.Info("scrape runner stopping", "name", r.name)
 	r.execute(ctx) // run immediately
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("scrape runner stopping", "name", r.name)
 			return nil
 		case <-ticker.C:
 			r.execute(ctx)

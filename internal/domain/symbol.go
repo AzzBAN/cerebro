@@ -69,3 +69,16 @@ func ToExchangeSymbol(sym Symbol) string {
 	s = strings.ReplaceAll(s, "/", "")
 	return s
 }
+
+// QuoteAsset returns the quote currency of a canonical symbol
+// (e.g. "USDT" for "BTC/USDT" or "BTC/USDT-PERP"). Returns "" if the
+// symbol is malformed.
+func (s Symbol) QuoteAsset() string {
+	raw := strings.ToUpper(strings.TrimSpace(string(s)))
+	raw = strings.TrimSuffix(raw, "-PERP")
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[1]
+}

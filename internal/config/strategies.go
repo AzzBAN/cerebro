@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/shopspring/decimal"
@@ -12,6 +13,11 @@ import (
 
 // StrategiesConfig wraps all named strategy presets.
 type StrategiesConfig struct {
+	// DefaultStrategies is the global fallback list applied to every market
+	// in markets.yaml that doesn't specify its own `strategies:` override.
+	// Strategy names must match a defined strategy preset (e.g. mean_reversion).
+	DefaultStrategies []domain.StrategyName `yaml:"default_strategies"`
+
 	Strategies []StrategyConfig `yaml:"strategies"`
 }
 
@@ -128,12 +134,28 @@ type SymbolConfig struct {
 	PrimaryTimeframe   domain.Timeframe    `yaml:"primary_timeframe"`
 	TrendTimeframe     domain.Timeframe    `yaml:"trend_timeframe"`
 	Enabled            bool                `yaml:"enabled"`
+
+	// Strategies is an optional per-symbol override of which strategies fire
+	// on this market. When unset (nil), the symbol falls back to
+	// StrategiesConfig.DefaultStrategies. When set (even as an empty list),
+	// that exact list wins — pass [] to opt the symbol out of all strategies.
+	Strategies []domain.StrategyName `yaml:"strategies,omitempty"`
 }
 
 // VenueConfig holds all symbol configs for a single broker venue.
+//
+// Defaults is an optional template merged into every Symbol entry below it
+// before the symbol is decoded. Per-symbol fields always win over defaults.
+// This lets users add a new watch with just `- symbol: BTC/USDT` while
+// inheriting timeframes, leverage, lot/tick sizes, etc. from the venue.
+//
+// Defaults is preserved as a yaml.Node (not a typed SymbolConfig) so that
+// numeric precision for tick/lot sizes survives the round-trip — go-yaml
+// would otherwise parse them as float64 via map[string]any.
 type VenueConfig struct {
-	Venue   domain.Venue   `yaml:"venue"`
-	Symbols []SymbolConfig `yaml:"symbols"`
+	Venue    domain.Venue   `yaml:"venue"`
+	Defaults yaml.Node      `yaml:"defaults"`
+	Symbols  []SymbolConfig `yaml:"symbols"`
 }
 
 // loadStrategies supports both supported schema variants:
@@ -165,10 +187,29 @@ func loadStrategies(path string) (StrategiesConfig, error) {
 		defaults = d
 	}
 
+	// `default_strategies:` is the top-level fallback list applied to symbols
+	// that don't define their own `strategies:` override in markets.yaml.
+	var defaultStrategies []domain.StrategyName
+	if rawDefaults, ok := top["default_strategies"]; ok {
+		if list, ok := rawDefaults.([]any); ok {
+			for _, v := range list {
+				if s, ok := v.(string); ok {
+					defaultStrategies = append(defaultStrategies, domain.StrategyName(s))
+				}
+			}
+		}
+	}
+
+	// Reserved keys that aren't strategy presets.
+	reserved := map[string]bool{
+		"defaults":           true,
+		"default_strategies": true,
+	}
+
 	out := make([]StrategyConfig, 0, len(top))
 	names := make([]string, 0, len(top))
 	for key := range top {
-		if key == "defaults" {
+		if reserved[key] {
 			continue
 		}
 		names = append(names, key)
@@ -197,7 +238,10 @@ func loadStrategies(path string) (StrategiesConfig, error) {
 		out = append(out, sc)
 	}
 
-	return StrategiesConfig{Strategies: out}, nil
+	return StrategiesConfig{
+		DefaultStrategies: defaultStrategies,
+		Strategies:        out,
+	}, nil
 }
 
 func asMap(v any) (map[string]any, bool) {
@@ -261,6 +305,148 @@ func normalizeSymbols(cfg *Config) error {
 	}
 
 	return nil
+}
+
+// loadMarkets reads markets.yaml and applies per-venue `defaults:` to every
+// symbol within that venue. Per-symbol fields always win over venue defaults.
+//
+// We operate on yaml.Node rather than map[string]any so numeric precision
+// for tick/lot sizes (decimal.Decimal) survives the merge step.
+func loadMarkets(path string) ([]VenueConfig, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// rawMarkets keeps each symbol as a yaml.Node so we can splice in the
+	// venue defaults map without losing precision.
+	type rawVenue struct {
+		Venue    domain.Venue `yaml:"venue"`
+		Defaults yaml.Node    `yaml:"defaults"`
+		Symbols  []yaml.Node  `yaml:"symbols"`
+	}
+	var rawFile struct {
+		Venues []rawVenue `yaml:"venues"`
+	}
+	if err := yaml.Unmarshal(raw, &rawFile); err != nil {
+		return nil, err
+	}
+
+	out := make([]VenueConfig, 0, len(rawFile.Venues))
+	for vi, rv := range rawFile.Venues {
+		v := VenueConfig{Venue: rv.Venue, Defaults: rv.Defaults}
+		v.Symbols = make([]SymbolConfig, 0, len(rv.Symbols))
+
+		for si, symNode := range rv.Symbols {
+			merged := symNode
+			if rv.Defaults.Kind == yaml.MappingNode {
+				merged = mergeMappingDefaults(symNode, rv.Defaults)
+			}
+
+			var sc SymbolConfig
+			if err := merged.Decode(&sc); err != nil {
+				return nil, fmt.Errorf("venue[%d] symbol[%d]: %w", vi, si, err)
+			}
+			v.Symbols = append(v.Symbols, sc)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// mergeMappingDefaults returns a copy of `target` with any keys present in
+// `defaults` (but missing from `target`) appended. This is a shallow merge —
+// nested maps are taken whole-cloth from defaults if the target lacks the key,
+// which is the expected behaviour for per-symbol overrides.
+func mergeMappingDefaults(target, defaults yaml.Node) yaml.Node {
+	if target.Kind != yaml.MappingNode {
+		return target
+	}
+
+	// Build a set of keys already defined on the target.
+	existing := make(map[string]struct{}, len(target.Content)/2)
+	for i := 0; i+1 < len(target.Content); i += 2 {
+		existing[target.Content[i].Value] = struct{}{}
+	}
+
+	// Copy the target node and append missing key/value pairs from defaults.
+	merged := target
+	merged.Content = append([]*yaml.Node(nil), target.Content...)
+	for i := 0; i+1 < len(defaults.Content); i += 2 {
+		k := defaults.Content[i]
+		v := defaults.Content[i+1]
+		if _, has := existing[k.Value]; has {
+			continue
+		}
+		merged.Content = append(merged.Content, k, v)
+	}
+	return merged
+}
+
+// resolveStrategyAssignments rebuilds each strategy's Markets list from the
+// union of:
+//  1. its explicit `markets:` field (if any),
+//  2. symbols whose per-symbol `strategies:` includes the strategy, and
+//  3. symbols with no `strategies:` field, falling back to default_strategies.
+//
+// Strategy and symbol names are matched case-insensitively. Symbols still
+// must be enabled in markets.yaml to be considered.
+func resolveStrategyAssignments(cfg *Config) {
+	if len(cfg.Markets) == 0 {
+		return
+	}
+
+	// Collect each strategy's union of opted-in symbols. Seed with explicit
+	// `markets:` from strategies.yaml so we never *narrow* an existing list.
+	assignments := make(map[string]map[string]struct{}, len(cfg.Strategies.Strategies))
+	for _, s := range cfg.Strategies.Strategies {
+		key := strings.ToLower(string(s.Name))
+		set := make(map[string]struct{}, len(s.Markets))
+		for _, m := range s.Markets {
+			set[m] = struct{}{}
+		}
+		assignments[key] = set
+	}
+
+	defaults := cfg.Strategies.DefaultStrategies
+
+	for _, venue := range cfg.Markets {
+		for _, sym := range venue.Symbols {
+			if !sym.Enabled {
+				continue
+			}
+			// `strategies:` set explicitly (even to []) wins; nil = inherit defaults.
+			active := sym.Strategies
+			if active == nil {
+				active = defaults
+			}
+			for _, sn := range active {
+				name := strings.ToLower(string(sn))
+				set, ok := assignments[name]
+				if !ok {
+					// Strategy referenced but not defined; the validator will
+					// surface this. Nothing to assign.
+					continue
+				}
+				set[sym.Symbol] = struct{}{}
+			}
+		}
+	}
+
+	// Write resolved sets back into the strategies, sorted for stability.
+	for i := range cfg.Strategies.Strategies {
+		s := &cfg.Strategies.Strategies[i]
+		set := assignments[strings.ToLower(string(s.Name))]
+		if set == nil {
+			continue
+		}
+		markets := make([]string, 0, len(set))
+		for m := range set {
+			markets = append(markets, m)
+		}
+		sort.Strings(markets)
+		s.Markets = markets
+	}
 }
 
 func resolveStrategySymbol(raw string, known map[domain.Symbol]bool) (domain.Symbol, error) {

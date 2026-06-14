@@ -16,7 +16,11 @@ import (
 
 type contextKey string
 
-const maxTurnsKey contextKey = "max_turns"
+const (
+	maxTurnsKey       contextKey = "max_turns"
+	turnTimeoutKey    contextKey = "turn_timeout"
+	maxTokensKey      contextKey = "max_tokens"
+)
 
 // WithMaxTurns stores the configured turn limit in the context for LLM adapters.
 func WithMaxTurns(ctx context.Context, n int) context.Context {
@@ -26,6 +30,39 @@ func WithMaxTurns(ctx context.Context, n int) context.Context {
 // MaxTurnsFromCtx returns the turn limit stored in ctx, or the given default.
 func MaxTurnsFromCtx(ctx context.Context, defaultVal int) int {
 	if v, ok := ctx.Value(maxTurnsKey).(int); ok && v > 0 {
+		return v
+	}
+	return defaultVal
+}
+
+// WithTurnTimeout stores the per-turn deadline for LLM adapters.
+func WithTurnTimeout(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, turnTimeoutKey, d)
+}
+
+// TurnTimeoutFromCtx returns the per-turn timeout stored in ctx, or zero (no per-turn limit).
+func TurnTimeoutFromCtx(ctx context.Context) time.Duration {
+	if v, ok := ctx.Value(turnTimeoutKey).(time.Duration); ok && v > 0 {
+		return v
+	}
+	return 0
+}
+
+// WithMaxTokens stores a per-invocation override for the LLM `max_tokens`
+// (output-token cap) parameter. Callers use this when a specific agent
+// phase legitimately needs a larger output budget than the global default
+// configured via `agent.llm.models.<provider>.max_output_tokens` — e.g. the
+// cross-symbol screening Phase 2 emits a multi-entry JSON array that does
+// not fit within the bias-score-calibrated default. Adapters fall back to
+// their configured default when no override is set.
+func WithMaxTokens(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, maxTokensKey, n)
+}
+
+// MaxTokensFromCtx returns the per-invocation max_tokens override stored in
+// ctx, or the given default when none was set or it was non-positive.
+func MaxTokensFromCtx(ctx context.Context, defaultVal int) int {
+	if v, ok := ctx.Value(maxTokensKey).(int); ok && v > 0 {
 		return v
 	}
 	return defaultVal
@@ -56,6 +93,7 @@ type Runtime struct {
 	logStore port.AgentLogStore
 	cfg      config.AgentConfig
 	onStep   StepNotifyFunc
+	cost     *CostTracker // optional; when non-nil, every invocation records its usage
 }
 
 // NewRuntime creates an agent Runtime.
@@ -65,6 +103,11 @@ func NewRuntime(llm port.LLM, logStore port.AgentLogStore, cfg config.AgentConfi
 
 // SetOnStep registers a callback that fires on every ReAct step transition.
 func (r *Runtime) SetOnStep(fn StepNotifyFunc) { r.onStep = fn }
+
+// SetCostTracker wires a CostTracker that receives every invocation's token
+// counts and estimated cost. Pass nil to disable. Safe to call once during
+// composition; not safe to call after the first Invoke.
+func (r *Runtime) SetCostTracker(c *CostTracker) { r.cost = c }
 
 func (r *Runtime) notifyStep(agent, runID string, step AgentStep, toolName, content string, stepNum, maxSteps int) {
 	if r.onStep != nil {
@@ -110,12 +153,27 @@ func (r *Runtime) Invoke(
 	defer cancel()
 	invokeCtx = WithMaxTurns(invokeCtx, maxSteps)
 
+	// Attach a per-invocation Usage accumulator so LLM adapters can report
+	// token counts as they complete each API turn. We read the totals
+	// after Complete returns to record them in the CostTracker.
+	usage := &Usage{}
+	invokeCtx = WithUsage(invokeCtx, usage)
+
+	// Store per-turn timeout in context so LLM adapters can apply it to each
+	// individual API call. This prevents a single slow turn from consuming
+	// the entire invocation budget.
+	if r.cfg.TimeoutPerTurnSeconds > 0 {
+		invokeCtx = WithTurnTimeout(invokeCtx, time.Duration(r.cfg.TimeoutPerTurnSeconds)*time.Second)
+	}
+
 	// Wrap tools to emit TOOL/OBSERVING step transitions.
 	stepCounter := 1 // THINKING is step 1
 	notifyingTools := r.wrapToolsWithNotify(agentName, runID, tools, &stepCounter, maxSteps)
 
-	// Apply per-turn timeout via the LLM context (tool loop enforces max turns internally).
-	// Retry transient errors (timeout/connection) with exponential backoff.
+	// Retry transient errors (per-turn timeout / connection) with exponential
+	// backoff. Errors are deemed transient when the underlying chain unwraps
+	// to context.DeadlineExceeded — adapters now use %w to preserve the chain
+	// across the FallbackChain wrap, so this finally fires as intended.
 	maxRetries := max(r.cfg.RetryOnTransient, 0)
 
 	var output string
@@ -129,6 +187,10 @@ retryLoop:
 		if !isTransient(err) || attempt == maxRetries {
 			break
 		}
+		// Don't bother retrying if the parent invocation budget is gone.
+		if invokeCtx.Err() != nil {
+			break
+		}
 		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		slog.Warn("agent invocation transient error; retrying",
 			"agent", agent, "run_id", runID, "attempt", attempt+1, "backoff", backoff, "error", err)
@@ -140,6 +202,11 @@ retryLoop:
 	}
 
 	latencyMS := int(time.Since(start).Milliseconds())
+
+	// Read token counters populated by the LLM adapters and forward to the
+	// CostTracker (best-effort; tracker errors are logged, not fatal).
+	inTok, outTok, cachedTok := usage.Snapshot()
+	r.recordUsage(ctx, inTok, outTok, cachedTok)
 
 	run := domain.AgentRun{
 		ID:        runID,
@@ -155,20 +222,43 @@ retryLoop:
 		run.Error = err.Error()
 		r.notifyStep(agentName, runID, StepError, "", err.Error(), stepCounter, maxSteps)
 		slog.Error("agent invocation failed",
-			"agent", agent, "run_id", runID, "error", err, "latency_ms", latencyMS)
+			"agent", agent, "run_id", runID, "error", err, "latency_ms", latencyMS,
+			"input_tokens", inTok, "output_tokens", outTok, "cached_input_tokens", cachedTok)
 		_ = r.logStore.SaveRun(ctx, run)
-		return InvokeResult{
-			RunID: runID,
-			Err:   fmt.Errorf("%w: %v", domain.ErrAgentTimeout, err),
-		}
+		return InvokeResult{RunID: runID, Err: wrapAgentTimeout(err)}
 	}
 
 	r.notifyStep(agentName, runID, StepComplete, "", output, stepCounter, maxSteps)
 	slog.Info("agent invocation complete",
-		"agent", agent, "run_id", runID, "latency_ms", latencyMS)
+		"agent", agent, "run_id", runID, "latency_ms", latencyMS,
+		"input_tokens", inTok, "output_tokens", outTok, "cached_input_tokens", cachedTok)
 	_ = r.logStore.SaveRun(ctx, run)
 
 	return InvokeResult{RunID: runID, Output: output, Outcome: outcome}
+}
+
+// recordUsage forwards observed token counts to the CostTracker when one is
+// configured. Price estimation is best-effort: unknown models record 0 cost
+// (CostTracker's token budget still fires independently).
+//
+// We use a background context for the Record call so budget writes survive
+// cancellation of the parent invocation; the Redis write is tiny and worth
+// completing even when the agent itself timed out.
+func (r *Runtime) recordUsage(parent context.Context, inputTokens, outputTokens, cachedInputTokens int) {
+	if r.cost == nil || (inputTokens == 0 && outputTokens == 0) {
+		return
+	}
+	pricing := LookupPricing(r.llm.ModelID())
+	costMicroUSD := pricing.EstimateCostMicroUSD(inputTokens, outputTokens, cachedInputTokens)
+
+	// Detach from parent deadline; use a short timeout so a stuck Redis
+	// never blocks the caller. parent may already be cancelled.
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 2*time.Second)
+	defer cancel()
+	if err := r.cost.Record(recordCtx, r.llm.Provider(), inputTokens, outputTokens, costMicroUSD); err != nil {
+		slog.Warn("llm cost record failed",
+			"provider", r.llm.Provider(), "error", err)
+	}
 }
 
 func (r *Runtime) wrapToolsWithNotify(agent, runID string, tools map[string]port.Tool, stepCounter *int, maxSteps int) map[string]port.Tool {
@@ -213,6 +303,32 @@ func describeTool(name string) string {
 	}
 }
 
+// isTransient reports whether err represents a transient LLM error that may
+// succeed on a retry. Deadline / cancellation errors are retryable; circuit
+// breaker open errors are explicitly NOT — the breaker exists to fail fast,
+// and re-trying a tripped breaker is pointless and just wastes the parent
+// invocation budget.
 func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, domain.ErrCircuitOpen) {
+		return false
+	}
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// wrapAgentTimeout tags err with domain.ErrAgentTimeout exactly once so that
+// callers can use errors.Is(..., ErrAgentTimeout) to fail closed. If err is
+// already wrapped by ErrAgentTimeout (e.g. returned from the LLM fallback
+// chain) we pass it through instead of double-wrapping, which would produce
+// log noise like "deadline: deadline: all LLM providers failed".
+func wrapAgentTimeout(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, domain.ErrAgentTimeout) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", domain.ErrAgentTimeout, err)
 }

@@ -120,6 +120,30 @@ func (r *Runner) SendAgentState(msg AgentStateMsg) {
 	r.Push(msg)
 }
 
+// SendBias pushes a fresh bias result into the TUI's Bias / Signals panel.
+// Safe to call from any goroutine.
+func (r *Runner) SendBias(b domain.BiasResult) {
+	r.Push(BiasUpdatedMsg{Result: b})
+}
+
+// SendMacro pushes a fresh macro snapshot (Fear & Greed, funding, OI, L/S)
+// into the TUI's Macro panel. Safe to call from any goroutine.
+func (r *Runner) SendMacro(s MacroSnapshot) {
+	r.Push(MacroSnapshotMsg{Snapshot: s})
+}
+
+// SendNews pushes a fresh news snapshot (CryptoPanic headlines) into the
+// TUI's News panel. Safe to call from any goroutine.
+func (r *Runner) SendNews(s NewsSnapshot) {
+	r.Push(NewsSnapshotMsg{Snapshot: s})
+}
+
+// SendBudget pushes a fresh LLM daily-budget snapshot to the TUI status
+// bar. Safe to call from any goroutine.
+func (r *Runner) SendBudget(s BudgetSnapshot) {
+	r.Push(BudgetSnapshotMsg{Snapshot: s})
+}
+
 // SetCopilotFn injects the copilot ask function into the TUI model.
 func (r *Runner) SetCopilotFn(fn func(ctx context.Context, query string) (string, error)) {
 	r.model.SetCopilotFn(fn)

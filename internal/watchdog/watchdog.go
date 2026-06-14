@@ -10,6 +10,7 @@ import (
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // Watchdog runs once at startup — before any WebSocket is opened — to reconcile
@@ -17,14 +18,16 @@ import (
 // Any mismatch is logged to audit_events and the discrepant position is handed
 // to the Order Monitor before normal trading resumes.
 type Watchdog struct {
-	brokers []port.Broker
-	cache   port.Cache
-	audit   port.AuditStore
+	brokers           []port.Broker
+	cache             port.Cache
+	audit             port.AuditStore
+	minOrphanNotional decimal.Decimal // skip orphan import below this notional value
 }
 
-// New creates a Watchdog.
-func New(brokers []port.Broker, cache port.Cache, audit port.AuditStore) *Watchdog {
-	return &Watchdog{brokers: brokers, cache: cache, audit: audit}
+// New creates a Watchdog. minOrphanNotional filters out dust-level orphaned
+// positions whose notional value (qty * price) falls below the threshold.
+func New(brokers []port.Broker, cache port.Cache, audit port.AuditStore, minOrphanNotional decimal.Decimal) *Watchdog {
+	return &Watchdog{brokers: brokers, cache: cache, audit: audit, minOrphanNotional: minOrphanNotional}
 }
 
 // Reconcile performs the startup state reconciliation.
@@ -107,6 +110,18 @@ func (w *Watchdog) reconcileVenue(ctx context.Context, broker port.Broker) error
 	// Positions at broker but NOT in Redis — orphaned.
 	for sym, brokerPos := range brokerMap {
 		if _, ok := localPositions[sym]; !ok {
+			// Compute notional value to filter dust / pre-loaded demo balances.
+			notional := brokerPos.Quantity.Mul(brokerPos.CurrentPrice)
+			if brokerPos.CurrentPrice.IsZero() {
+				notional = brokerPos.Quantity.Mul(brokerPos.EntryPrice)
+			}
+			if !w.minOrphanNotional.IsZero() && notional.LessThan(w.minOrphanNotional) {
+				slog.Info("watchdog: skipping sub-notional orphan position (dust)",
+					"symbol", sym, "venue", venue, "qty", brokerPos.Quantity,
+					"notional_usd", notional, "min_notional", w.minOrphanNotional)
+				continue
+			}
+
 			slog.Warn("watchdog: orphaned position at broker; importing to Redis",
 				"symbol", sym, "venue", venue, "qty", brokerPos.Quantity)
 			w.upsertRedis(ctx, brokerPos)

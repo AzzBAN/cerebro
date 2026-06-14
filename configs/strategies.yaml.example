@@ -16,6 +16,26 @@
 # =============================================================================
 
 # =============================================================================
+# DEFAULT STRATEGIES
+# =============================================================================
+# Strategies applied to every market in markets.yaml that does NOT define its
+# own `strategies:` override. Each strategy listed here must also be enabled
+# (`enabled: true`) below to actually fire on a symbol.
+#
+# Per-symbol overrides live in markets.yaml — for example:
+#
+#   - symbol: SOL/USDT
+#     strategies: [mean_reversion]   # overrides the defaults below for SOL
+#
+# To opt a coin out of all strategies (data-only watch), set `strategies: []`
+# on that symbol in markets.yaml.
+# =============================================================================
+default_strategies:
+  - mean_reversion
+  - trend_following
+  - volatility_breakout
+
+# =============================================================================
 # GLOBAL STRATEGY DEFAULTS
 # Values here are inherited by every strategy unless overridden at strategy
 # or market level. Explicit overrides always win.
@@ -120,7 +140,7 @@ defaults:
   session_filter: all
 
   # Block new entries N minutes before and after high-impact economic events
-  # (sourced from the Myfxbook calendar feed).
+  # (sourced from the Finnhub economic calendar feed).
   news_blackout_before_minutes: 15
   news_blackout_after_minutes: 15
 
@@ -180,10 +200,10 @@ defaults:
 scalping:
   enabled: true
 
-  markets:
-    - BTC/USDT
-    - ETH/USDT
-    - SOL/USDT
+  # markets list is now resolved from markets.yaml (see `strategies:` per
+  # symbol there + `default_strategies:` above). To pin this preset to a
+  # specific subset of coins instead, uncomment and list canonical symbols:
+  #   markets: [BTC/USDT, ETH/USDT]
 
   # Override the primary and trend timeframes for scalping.
   primary_timeframe: 1m
@@ -271,10 +291,11 @@ session_filter: overlap         # NY+Asian overlap; peak crypto + gold liquidity
 swing:
   enabled: false                  # enable when ready
 
-  markets:
-    - BTC/USDT
-    - ETH/USDT
-    - XAU/USDT-PERP
+  # markets list is now resolved from markets.yaml (see `strategies:` per
+  # symbol there + `default_strategies:` above). To pin this preset to a
+  # specific subset of coins instead, uncomment and list canonical symbols:
+  #   markets: [BTC/USDT, ETH/USDT]
+
   primary_timeframe: 4h
   trend_timeframe: 1d
 
@@ -355,10 +376,11 @@ swing:
 mean_reversion:
   enabled: true
 
-  markets:
-    - XAU/USDT-PERP
-    - BTC/USDT
-    - ETH/USDT
+  # markets list is now resolved from markets.yaml (see `strategies:` per
+  # symbol there + `default_strategies:` above). To pin this preset to a
+  # specific subset of coins instead, uncomment and list canonical symbols:
+  #   markets: [BTC/USDT, ETH/USDT]
+
   primary_timeframe: 15m
   trend_timeframe: 1h
 
@@ -452,10 +474,11 @@ mean_reversion:
 trend_following:
   enabled: true
 
-  markets:
-    - BTC/USDT
-    - ETH/USDT
-    - XAU/USDT-PERP
+  # markets list is now resolved from markets.yaml (see `strategies:` per
+  # symbol there + `default_strategies:` above). To pin this preset to a
+  # specific subset of coins instead, uncomment and list canonical symbols:
+  #   markets: [BTC/USDT, ETH/USDT]
+
   primary_timeframe: 1h           # cross detected on 1H
   trend_timeframe: 4h             # direction confirmed on 4H
 
@@ -539,10 +562,11 @@ trend_following:
 volatility_breakout:
   enabled: true
 
-  markets:
-    - XAU/USDT-PERP
-    - BTC/USDT
-    - ETH/USDT
+  # markets list is now resolved from markets.yaml (see `strategies:` per
+  # symbol there + `default_strategies:` above). To pin this preset to a
+  # specific subset of coins instead, uncomment and list canonical symbols:
+  #   markets: [BTC/USDT, ETH/USDT]
+
   primary_timeframe: 15m          # breakout detected on 15m
   trend_timeframe: 1h
 

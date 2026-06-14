@@ -43,7 +43,9 @@ var knownStablecoins = map[string]bool{
 type SpotBroker struct {
 	client   *gobinance.Client
 	mode     spotMode
-	symbols  map[domain.Symbol]bool // allowed trading pairs from config
+	symbols  map[domain.Symbol]bool            // allowed trading pairs from config
+	minLots  map[domain.Symbol]decimal.Decimal // minimum tradeable qty per symbol (dust filter)
+	filters  *SpotExchangeInfo                 // symbol filter cache (PRICE/LOT/NOTIONAL)
 
 	mu        sync.RWMutex
 	balances  map[string]spotBalance
@@ -53,26 +55,46 @@ type SpotBroker struct {
 // NewSpotBroker creates a SpotBroker wrapping the provided client.
 // symbols is the set of canonical symbols configured for spot trading;
 // only balances matching these symbols are promoted to positions.
-func NewSpotBroker(client *gobinance.Client, mode string, symbols []domain.Symbol) *SpotBroker {
+// minLots maps each symbol to its minimum lot size; balances below this
+// threshold are treated as dust and excluded from the position list.
+func NewSpotBroker(client *gobinance.Client, mode string, symbols []domain.Symbol, minLots map[domain.Symbol]decimal.Decimal) *SpotBroker {
 	symSet := make(map[domain.Symbol]bool, len(symbols))
 	for _, s := range symbols {
 		symSet[s] = true
+	}
+	if minLots == nil {
+		minLots = make(map[domain.Symbol]decimal.Decimal)
 	}
 	return &SpotBroker{
 		client:    client,
 		mode:      spotMode(mode),
 		symbols:   symSet,
+		minLots:   minLots,
+		filters:   NewSpotExchangeInfo(client),
 		balances:  make(map[string]spotBalance),
 		positions: make(map[domain.Symbol]domain.Position),
 	}
 }
 
+// ExchangeInfo returns the filter store — useful to satisfy
+// port.ExchangeInfoStore via the broker when the app wiring wants a single
+// entry point per venue.
+func (b *SpotBroker) ExchangeInfo() *SpotExchangeInfo { return b.filters }
+
 // Venue identifies this broker.
 func (b *SpotBroker) Venue() domain.Venue { return domain.VenueBinanceSpot }
 
 // Connect bootstraps positions once, then maintains a local position cache from
-// the private user-data websocket stream.
+// the private user-data websocket stream. It also loads the exchangeInfo
+// filter cache so subsequent order placements can quantise qty/price to
+// each symbol's tickSize and stepSize without an extra round-trip.
 func (b *SpotBroker) Connect(ctx context.Context) error {
+	if err := b.filters.Refresh(ctx); err != nil {
+		// Soft-fail: we still want to come up even if exchangeInfo is
+		// temporarily slow. PlaceOrder will return ErrSymbolFilterUnknown
+		// until a later Refresh succeeds.
+		slog.Warn("spot: exchange info refresh failed on connect; orders will reject until recovered", "error", err)
+	}
 	if err := b.bootstrapPositions(ctx); err != nil {
 		return err
 	}
@@ -85,46 +107,301 @@ func (b *SpotBroker) StreamQuotes(_ context.Context, _ []domain.Symbol) (<-chan 
 	return nil, fmt.Errorf("StreamQuotes: use KlinesWS for market data")
 }
 
-// PlaceOrder submits a new order to Binance Spot REST API.
+// PlaceOrder submits a new entry order to Binance Spot REST API, respecting
+// intent.OrderType. Quantity is quantised to stepSize and price (where
+// applicable) to tickSize using the cached exchangeInfo. Filter violations
+// are returned as domain.ErrOrderBelowMinNotional etc. without hitting the
+// exchange.
 func (b *SpotBroker) PlaceOrder(ctx context.Context, intent domain.OrderIntent) (string, error) {
 	side := gobinance.SideTypeBuy
 	if intent.Side == domain.SideSell {
 		side = gobinance.SideTypeSell
 	}
 
-	var orderType gobinance.OrderType
-	switch intent.Strategy {
-	default:
-		orderType = gobinance.OrderTypeMarket
+	filter, err := b.filters.Filter(intent.Symbol)
+	if err != nil {
+		return "", err
+	}
+
+	qty := filter.QuantiseQty(intent.Quantity)
+	if qty.IsZero() {
+		return "", fmt.Errorf("spot: quantity rounded to zero after stepSize (%s); raw=%s",
+			filter.StepSize, intent.Quantity)
 	}
 
 	svc := b.client.NewCreateOrderService().
 		Symbol(domain.ToExchangeSymbol(intent.Symbol)).
 		Side(side).
-		Type(orderType).
 		NewClientOrderID(intent.ID).
-		Quantity(intent.Quantity.String())
+		Quantity(qty.String())
+
+	switch intent.OrderTypeOrDefault() {
+	case domain.OrderTypeMarket:
+		// For MARKET entries we cannot pre-check notional locally because
+		// we don't know the fill price; Binance will accept and fill.
+		svc = svc.Type(gobinance.OrderTypeMarket)
+
+	case domain.OrderTypeLimit:
+		if intent.LimitPrice.IsZero() {
+			return "", fmt.Errorf("spot: limit order missing LimitPrice")
+		}
+		limitPx := filter.QuantisePrice(intent.LimitPrice, intent.Side)
+		if err := filter.Validate(qty, limitPx); err != nil {
+			return "", fmt.Errorf("spot: limit order filter: %w", err)
+		}
+		svc = svc.Type(gobinance.OrderTypeLimit).
+			TimeInForce(toGoBinanceTIF(intent.TIF)).
+			Price(limitPx.String())
+
+	case domain.OrderTypeStopLimit:
+		if intent.LimitPrice.IsZero() || intent.StopPrice.IsZero() {
+			return "", fmt.Errorf("spot: stop-limit order requires both StopPrice and LimitPrice")
+		}
+		limitPx := filter.QuantisePrice(intent.LimitPrice, intent.Side)
+		stopPx := filter.QuantisePrice(intent.StopPrice, intent.Side)
+		if err := filter.Validate(qty, limitPx); err != nil {
+			return "", fmt.Errorf("spot: stop-limit filter: %w", err)
+		}
+		svc = svc.Type(gobinance.OrderTypeStopLossLimit).
+			TimeInForce(toGoBinanceTIF(intent.TIF)).
+			Price(limitPx.String()).
+			StopPrice(stopPx.String())
+
+	default:
+		return "", fmt.Errorf("spot: unsupported order type %q", intent.OrderType)
+	}
 
 	resp, err := svc.Do(ctx)
 	if err != nil {
 		return "", fmt.Errorf("binance spot place order: %w", err)
 	}
-
 	return strconv.FormatInt(resp.OrderID, 10), nil
 }
 
-// CancelOrder cancels a pending Binance Spot order by broker order ID.
-func (b *SpotBroker) CancelOrder(ctx context.Context, brokerOrderID string) error {
-	orderID, err := strconv.ParseInt(brokerOrderID, 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid broker order ID %q: %w", brokerOrderID, err)
+// PlaceBracket attaches a protective OCO order to an open spot position.
+// The OCO consists of a STOP_LOSS_LIMIT leg (triggered at req.StopLoss) and
+// a LIMIT_MAKER leg (at req.TakeProfit). Whichever fills first cancels the
+// other.
+//
+// Cerebro never runs a position without a stop, so a missing StopLoss is an
+// error. TakeProfit is optional — when zero we fall back to a single
+// STOP_LOSS_LIMIT order rather than an OCO, since Binance OCO requires both
+// legs.
+func (b *SpotBroker) PlaceBracket(ctx context.Context, req domain.BracketRequest) (domain.BracketResponse, error) {
+	if req.StopLoss.IsZero() {
+		return domain.BracketResponse{}, fmt.Errorf("spot bracket: missing StopLoss")
+	}
+	if req.Quantity.IsZero() {
+		return domain.BracketResponse{}, fmt.Errorf("spot bracket: missing quantity")
 	}
 
-	_, err = b.client.NewCancelOrderService().
-		Symbol("").
-		OrderID(orderID).
+	filter, err := b.filters.Filter(req.Symbol)
+	if err != nil {
+		return domain.BracketResponse{}, err
+	}
+	qty := filter.QuantiseQty(req.Quantity)
+	if qty.IsZero() {
+		return domain.BracketResponse{}, fmt.Errorf("spot bracket: quantity zeroed by stepSize")
+	}
+
+	// Exit side is opposite the entry side.
+	exitSide := gobinance.SideTypeSell
+	if req.Side == domain.SideSell {
+		exitSide = gobinance.SideTypeBuy
+	}
+
+	// Quantise prices. For an exit, SellSide wants prices rounded up and
+	// BuySide rounded down (same rule as QuantisePrice).
+	exitDomainSide := domain.SideSell
+	if req.Side == domain.SideSell {
+		exitDomainSide = domain.SideBuy
+	}
+	stopPx := filter.QuantisePrice(req.StopLoss, exitDomainSide)
+	// The STOP_LOSS_LIMIT "price" leg is the worst price we'll accept after
+	// the stop triggers. For longs exiting via sell: limit = stop * 0.99
+	// gives us a 1% slippage budget. For shorts exiting via buy: 1.01×.
+	// Callers may pre-set limitBufferedStopPx via req.TakeProfit when they
+	// want a tighter bound; for now we hard-code a 0.5% buffer.
+	stopLimitPx := applyStopLimitBuffer(stopPx, exitDomainSide, decimal.NewFromFloat(0.005))
+	stopLimitPx = filter.QuantisePrice(stopLimitPx, exitDomainSide)
+
+	sym := domain.ToExchangeSymbol(req.Symbol)
+	tag := req.ClientTag
+	if tag == "" {
+		tag = "br"
+	}
+	stopCID := shortClientID(tag+"S", req.ParentIntentID)
+	tpCID := shortClientID(tag+"T", req.ParentIntentID)
+	listCID := shortClientID(tag+"L", req.ParentIntentID)
+
+	// If TakeProfit is set, use OCO.
+	if !req.TakeProfit.IsZero() {
+		tpPx := filter.QuantisePrice(req.TakeProfit, exitDomainSide)
+		if err := filter.Validate(qty, tpPx); err != nil {
+			return domain.BracketResponse{}, fmt.Errorf("spot bracket TP filter: %w", err)
+		}
+
+		resp, err := b.client.NewCreateOCOService().
+			Symbol(sym).
+			Side(exitSide).
+			Quantity(qty.String()).
+			ListClientOrderID(listCID).
+			LimitClientOrderID(tpCID).
+			Price(tpPx.String()).
+			StopClientOrderID(stopCID).
+			StopPrice(stopPx.String()).
+			StopLimitPrice(stopLimitPx.String()).
+			StopLimitTimeInForce(gobinance.TimeInForceTypeGTC).
+			Do(ctx)
+		if err != nil {
+			return domain.BracketResponse{}, fmt.Errorf("spot OCO: %w", err)
+		}
+
+		br := domain.BracketResponse{
+			ListID: strconv.FormatInt(resp.OrderListID, 10),
+			Symbol: req.Symbol,
+		}
+		for _, r := range resp.Orders {
+			switch r.ClientOrderID {
+			case stopCID:
+				br.StopOrderID = strconv.FormatInt(r.OrderID, 10)
+			case tpCID:
+				br.TakeProfitOrderID = strconv.FormatInt(r.OrderID, 10)
+			}
+		}
+		return br, nil
+	}
+
+	// SL-only fallback: a single STOP_LOSS_LIMIT order.
+	if err := filter.Validate(qty, stopLimitPx); err != nil {
+		return domain.BracketResponse{}, fmt.Errorf("spot bracket SL filter: %w", err)
+	}
+	resp, err := b.client.NewCreateOrderService().
+		Symbol(sym).
+		Side(exitSide).
+		Type(gobinance.OrderTypeStopLossLimit).
+		TimeInForce(gobinance.TimeInForceTypeGTC).
+		NewClientOrderID(stopCID).
+		Quantity(qty.String()).
+		Price(stopLimitPx.String()).
+		StopPrice(stopPx.String()).
 		Do(ctx)
+	if err != nil {
+		return domain.BracketResponse{}, fmt.Errorf("spot stop-loss-limit: %w", err)
+	}
+	return domain.BracketResponse{
+		StopOrderID: strconv.FormatInt(resp.OrderID, 10),
+		Symbol:      req.Symbol,
+	}, nil
+}
+
+// CancelBracket cancels both legs of a previously placed bracket.
+// For OCO (ListID != "") one cancel cancels the whole list; for the
+// SL-only fallback we cancel the single stop order directly.
+func (b *SpotBroker) CancelBracket(ctx context.Context, resp domain.BracketResponse) error {
+	if resp.Symbol == "" {
+		return fmt.Errorf("spot: CancelBracket requires symbol")
+	}
+	sym := domain.ToExchangeSymbol(resp.Symbol)
+
+	if resp.ListID != "" {
+		listID, err := strconv.ParseInt(resp.ListID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("spot: invalid bracket listID %q: %w", resp.ListID, err)
+		}
+		_, err = b.client.NewCancelOCOService().
+			Symbol(sym).
+			OrderListID(listID).
+			Do(ctx)
+		return err
+	}
+
+	// SL-only: cancel each leg that exists, tolerating per-leg failures.
+	var firstErr error
+	for _, id := range []string{resp.StopOrderID, resp.TakeProfitOrderID} {
+		if id == "" {
+			continue
+		}
+		if err := b.cancelSpotByID(ctx, sym, id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// CancelOrder cancels a pending Binance Spot order by (symbol, brokerOrderID).
+// The old single-arg form was a latent bug: Binance requires symbol on every
+// cancel. The new domain.CancelRequest type makes this explicit.
+func (b *SpotBroker) CancelOrder(ctx context.Context, req domain.CancelRequest) error {
+	if req.Symbol == "" {
+		return fmt.Errorf("spot: CancelOrder requires Symbol")
+	}
+	if req.BrokerOrderID == "" && req.ClientOrderID == "" {
+		return fmt.Errorf("spot: CancelOrder requires BrokerOrderID or ClientOrderID")
+	}
+	sym := domain.ToExchangeSymbol(req.Symbol)
+
+	svc := b.client.NewCancelOrderService().Symbol(sym)
+	if req.BrokerOrderID != "" {
+		orderID, err := strconv.ParseInt(req.BrokerOrderID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("spot: invalid broker order ID %q: %w", req.BrokerOrderID, err)
+		}
+		svc = svc.OrderID(orderID)
+	} else {
+		svc = svc.OrigClientOrderID(req.ClientOrderID)
+	}
+	_, err := svc.Do(ctx)
 	return err
+}
+
+// cancelSpotByID cancels by broker order ID; helper for CancelBracket's
+// SL-only branch. brokerOrderID must be a numeric string.
+func (b *SpotBroker) cancelSpotByID(ctx context.Context, sym, brokerOrderID string) error {
+	orderID, err := strconv.ParseInt(brokerOrderID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("spot: invalid broker order ID %q: %w", brokerOrderID, err)
+	}
+	_, err = b.client.NewCancelOrderService().Symbol(sym).OrderID(orderID).Do(ctx)
+	return err
+}
+
+// toGoBinanceTIF maps our domain.TimeInForce to go-binance's type. Falls
+// back to GTC when unset or unrecognised — matches Binance's default.
+func toGoBinanceTIF(tif domain.TimeInForce) gobinance.TimeInForceType {
+	switch tif {
+	case domain.TIFIOC:
+		return gobinance.TimeInForceTypeIOC
+	case domain.TIFFOK:
+		return gobinance.TimeInForceTypeFOK
+	default:
+		return gobinance.TimeInForceTypeGTC
+	}
+}
+
+// applyStopLimitBuffer moves a stop-trigger price outward by bufferPct on
+// the exit side so that the STOP_LOSS_LIMIT's price leg is executable
+// after the trigger fires. Buffer is expressed as a fraction (0.005 = 0.5%).
+// For a long exiting via sell: price = stop × (1 − buffer).
+// For a short exiting via buy:  price = stop × (1 + buffer).
+func applyStopLimitBuffer(stop decimal.Decimal, exitSide domain.Side, bufferPct decimal.Decimal) decimal.Decimal {
+	one := decimal.NewFromInt(1)
+	if exitSide == domain.SideSell {
+		return stop.Mul(one.Sub(bufferPct))
+	}
+	return stop.Mul(one.Add(bufferPct))
+}
+
+// shortClientID produces a Binance newClientOrderID <= 36 chars combining a
+// 2-3 char prefix and a truncated parent ID. This keeps bracket legs
+// traceable back to their parent intent in audit logs and cancel flows.
+func shortClientID(prefix, parent string) string {
+	const maxLen = 36
+	s := prefix + "-" + parent
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return s
 }
 
 // Positions returns the locally cached position view maintained by the user-data stream.
@@ -377,6 +654,10 @@ func (b *SpotBroker) rebuildPositionsLocked() {
 		sym := domain.Symbol(asset + "/USDT")
 		// Only promote to position if this symbol is in the configured trading universe.
 		if !b.symbols[sym] {
+			continue
+		}
+		// Filter dust: skip balances below the minimum lot size for this symbol.
+		if minLot, ok := b.minLots[sym]; ok && !minLot.IsZero() && total.LessThan(minLot) {
 			continue
 		}
 		pos := domain.Position{
