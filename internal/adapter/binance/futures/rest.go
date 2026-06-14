@@ -195,31 +195,16 @@ func (b *FuturesBroker) PlaceBracket(ctx context.Context, req domain.BracketRequ
 	sym := domain.ToExchangeSymbol(req.Symbol)
 	stopCID := shortFuturesClientID(tag+"S", req.ParentIntentID)
 
-	// STOP_MARKET with closePosition=true.
-	// Notes:
-	//   - closePosition exits the full position regardless of our quantity
-	//     field, which is what we want for a protective bracket.
-	//   - reduceOnly is mutually exclusive with closePosition on the API;
-	//     we intentionally omit reduceOnly here.
-	//   - Hedge mode requires PositionSide; one-way mode requires BOTH.
-	stopSvc := b.client.NewCreateOrderService().
-		Symbol(sym).
-		Side(exitSide).
-		Type(gobinancefutures.OrderType("STOP_MARKET")).
-		StopPrice(stopPx.String()).
-		ClosePosition(true).
-		WorkingType(gobinancefutures.WorkingTypeMarkPrice).
-		PriceProtect(true).
-		NewClientOrderID(stopCID)
-	if req.PositionSide != "" {
-		stopSvc = stopSvc.PositionSide(toFuturesPositionSide(req.PositionSide))
-	}
-	stopResp, err := stopSvc.Do(ctx)
+	// Protective stop leg (STOP_MARKET, closePosition=true). On the Demo
+	// endpoint these conditional types are rejected by the standard order
+	// endpoint (code -4120) and must go through the Algo Order API; see
+	// placeProtectiveLeg.
+	stopID, err := b.placeProtectiveLeg(ctx, sym, exitSide, "STOP_MARKET", stopPx.String(), stopCID, req.PositionSide)
 	if err != nil {
 		return domain.BracketResponse{}, fmt.Errorf("futures STOP_MARKET: %w", err)
 	}
 	br := domain.BracketResponse{
-		StopOrderID: strconv.FormatInt(stopResp.OrderID, 10),
+		StopOrderID: stopID,
 		Symbol:      req.Symbol,
 	}
 
@@ -227,19 +212,7 @@ func (b *FuturesBroker) PlaceBracket(ctx context.Context, req domain.BracketRequ
 	if !req.TakeProfit.IsZero() {
 		tpPx := filter.QuantisePrice(req.TakeProfit, exitDomainSide)
 		tpCID := shortFuturesClientID(tag+"T", req.ParentIntentID)
-		tpSvc := b.client.NewCreateOrderService().
-			Symbol(sym).
-			Side(exitSide).
-			Type(gobinancefutures.OrderType("TAKE_PROFIT_MARKET")).
-			StopPrice(tpPx.String()).
-			ClosePosition(true).
-			WorkingType(gobinancefutures.WorkingTypeMarkPrice).
-			PriceProtect(true).
-			NewClientOrderID(tpCID)
-		if req.PositionSide != "" {
-			tpSvc = tpSvc.PositionSide(toFuturesPositionSide(req.PositionSide))
-		}
-		tpResp, tperr := tpSvc.Do(ctx)
+		tpID, tperr := b.placeProtectiveLeg(ctx, sym, exitSide, "TAKE_PROFIT_MARKET", tpPx.String(), tpCID, req.PositionSide)
 		if tperr != nil {
 			// Partial bracket: stop is live, TP failed. Surface the error
 			// to the caller; they own the retry / unwind decision.
@@ -248,13 +221,72 @@ func (b *FuturesBroker) PlaceBracket(ctx context.Context, req domain.BracketRequ
 				"stop_order_id", br.StopOrderID)
 			return br, fmt.Errorf("futures TAKE_PROFIT_MARKET (stop placed OK): %w", tperr)
 		}
-		br.TakeProfitOrderID = strconv.FormatInt(tpResp.OrderID, 10)
+		br.TakeProfitOrderID = tpID
 	}
 
 	return br, nil
 }
 
-// CancelBracket cancels both legs of a previously placed futures bracket.
+// placeProtectiveLeg submits one conditional close-position leg (STOP_MARKET or
+// TAKE_PROFIT_MARKET, closePosition=true, anchored to the mark price).
+//
+// The Demo endpoint (demo-fapi.binance.com) rejects these conditional types on
+// the standard /fapi/v1/order endpoint with code -4120 and requires the Algo
+// Order API (/fapi/v1/algoOrder, algoType=CONDITIONAL). Mainnet and testnet
+// accept them on the standard endpoint, so we branch on mode and keep the
+// proven standard path for live trading. Returns the leg's order ID as a
+// string (the algo id on demo, the order id otherwise).
+func (b *FuturesBroker) placeProtectiveLeg(
+	ctx context.Context,
+	sym string,
+	exitSide gobinancefutures.SideType,
+	orderType string,
+	triggerPx string,
+	clientID string,
+	positionSide domain.PositionSide,
+) (string, error) {
+	if b.mode == futuresModeDemo {
+		svc := b.client.NewCreateAlgoOrderService().
+			AlgoType(gobinancefutures.OrderAlgoTypeConditional).
+			Symbol(sym).
+			Side(exitSide).
+			Type(gobinancefutures.AlgoOrderType(orderType)).
+			TriggerPrice(triggerPx).
+			ClosePosition(true).
+			WorkingType(gobinancefutures.WorkingTypeMarkPrice).
+			PriceProtect(true).
+			ClientAlgoId(clientID)
+		if positionSide != "" {
+			svc = svc.PositionSide(toFuturesPositionSide(positionSide))
+		}
+		resp, err := svc.Do(ctx)
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(resp.AlgoId, 10), nil
+	}
+
+	// Mainnet / testnet: standard order endpoint.
+	//   - closePosition exits the full position regardless of quantity.
+	//   - reduceOnly is mutually exclusive with closePosition; omitted here.
+	svc := b.client.NewCreateOrderService().
+		Symbol(sym).
+		Side(exitSide).
+		Type(gobinancefutures.OrderType(orderType)).
+		StopPrice(triggerPx).
+		ClosePosition(true).
+		WorkingType(gobinancefutures.WorkingTypeMarkPrice).
+		PriceProtect(true).
+		NewClientOrderID(clientID)
+	if positionSide != "" {
+		svc = svc.PositionSide(toFuturesPositionSide(positionSide))
+	}
+	resp, err := svc.Do(ctx)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(resp.OrderID, 10), nil
+}
 // Each leg is cancelled independently; errors are aggregated so that one
 // failed cancel doesn't leave the other leg live unnoticed.
 func (b *FuturesBroker) CancelBracket(ctx context.Context, resp domain.BracketResponse) error {
@@ -271,6 +303,17 @@ func (b *FuturesBroker) CancelBracket(ctx context.Context, resp domain.BracketRe
 		orderID, perr := strconv.ParseInt(id, 10, 64)
 		if perr != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", id, perr))
+			continue
+		}
+		// Demo brackets are placed via the Algo Order API, so they must be
+		// cancelled through it too — the standard cancel endpoint does not
+		// know these IDs. Mainnet/testnet use the standard order cancel.
+		if b.mode == futuresModeDemo {
+			if _, cerr := b.client.NewCancelAlgoOrderService().
+				AlgoID(orderID).
+				Do(ctx); cerr != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", id, cerr))
+			}
 			continue
 		}
 		if _, cerr := b.client.NewCancelOrderService().
@@ -378,6 +421,34 @@ func (b *FuturesBroker) Positions(_ context.Context) ([]domain.Position, error) 
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// applyPositionSnapshot reconciles the in-memory cache against a fresh,
+// authoritative snapshot (e.g. from a REST resync). Positions absent from the
+// snapshot are dropped (closed on the exchange); positions present are taken
+// from the snapshot for live fields (qty/price/leverage/margin) while
+// Cerebro-internal metadata that the exchange does not track — OpenedAt, SL/TP
+// levels, Strategy, CorrelationID — is carried forward from any existing entry.
+// This is the recovery path for user-data WS events that were missed or never
+// delivered.
+func (b *FuturesBroker) applyPositionSnapshot(snapshot map[domain.Symbol]domain.Position) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	next := make(map[domain.Symbol]domain.Position, len(snapshot))
+	for sym, pos := range snapshot {
+		if existing, ok := b.positions[sym]; ok {
+			if !existing.OpenedAt.IsZero() {
+				pos.OpenedAt = existing.OpenedAt
+			}
+			pos.StopLoss = existing.StopLoss
+			pos.TakeProfit1 = existing.TakeProfit1
+			pos.Strategy = existing.Strategy
+			pos.CorrelationID = existing.CorrelationID
+		}
+		next[sym] = pos
+	}
+	b.positions = next
 }
 
 // Balance returns the current futures wallet balance.
