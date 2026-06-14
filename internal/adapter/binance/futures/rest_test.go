@@ -194,7 +194,38 @@ func TestHandleAccountUpdate_MarginAndIsolated(t *testing.T) {
 	})
 }
 
-// TestDeriveFuturesMarkPrice verifies the mark-price derivation from a
+// TestHandleUserDataMessage_NumericEventTime guards against the encoding/json
+// case-insensitive collision between "e" (event type, string) and "E" (event
+// time, number). Every Binance futures user-data message carries both keys; if
+// the envelope only declares "e", the decoder maps the numeric "E" onto the
+// string field and fails, silently dropping valid messages.
+func TestHandleUserDataMessage_NumericEventTime(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+	}{
+		{
+			"account update with event time",
+			`{"e":"ACCOUNT_UPDATE","E":1718000000000,"a":{"P":[{"s":"BTCUSDT","pa":"0.033","ep":"77325.80","mp":"77400"}]}}`,
+		},
+		{
+			"account config update with event time",
+			`{"e":"ACCOUNT_CONFIG_UPDATE","E":1718000000000,"ac":{"s":"BTCUSDT","l":50}}`,
+		},
+		{
+			"unhandled event with event time is ignored cleanly",
+			`{"e":"ORDER_TRADE_UPDATE","E":1718000000000,"o":{"s":"BTCUSDT"}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := NewFuturesBroker(nil, "mainnet")
+			if err := b.handleUserDataMessage([]byte(tt.msg)); err != nil {
+				t.Fatalf("handleUserDataMessage: unexpected error: %v", err)
+			}
+		})
+	}
+}
 // position's signed notional and signed position amount. The futures account
 // endpoint exposes neither markPrice nor a clean current price, so it is
 // derived as |notional| / |positionAmt|. Regression guard for the bug where

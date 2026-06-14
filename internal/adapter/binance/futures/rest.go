@@ -661,6 +661,11 @@ func (b *FuturesBroker) keepaliveUserStream(ctx context.Context, listenKey strin
 func (b *FuturesBroker) handleUserDataMessage(message []byte) error {
 	var envelope struct {
 		Event string `json:"e"`
+		// EventTime absorbs the numeric "E" (event time, ms) key. Without an
+		// explicit field, encoding/json's case-insensitive fallback matches
+		// "E" to the "e" string field and fails to unmarshal the number,
+		// dropping otherwise-valid messages.
+		EventTime int64 `json:"E"`
 	}
 	if err := json.Unmarshal(message, &envelope); err != nil {
 		return err
