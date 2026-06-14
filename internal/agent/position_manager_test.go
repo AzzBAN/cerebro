@@ -14,11 +14,12 @@ import (
 
 func TestParsePMResponse(t *testing.T) {
 	tests := []struct {
-		name      string
-		raw       string
-		wantDec   domain.ActionDecision
-		wantNewSL float64
-		wantErr   bool
+		name         string
+		raw          string
+		wantDec      domain.ActionDecision
+		wantNewSL    float64
+		wantCloseQty string
+		wantErr      bool
 	}{
 		{
 			name:    "HOLD",
@@ -40,6 +41,12 @@ func TestParsePMResponse(t *testing.T) {
 			name:    "PARTIAL_CLOSE maps to ActionClose",
 			raw:     `{"action":"PARTIAL_CLOSE","symbol":"BTCUSDT","reasoning":"TP1 hit","confidence":0.85}`,
 			wantDec: domain.ActionClose,
+		},
+		{
+			name:         "PARTIAL_CLOSE carries close_quantity",
+			raw:          `{"action":"PARTIAL_CLOSE","symbol":"BTCUSDT","reasoning":"bank half","close_quantity":"0.25","confidence":0.85}`,
+			wantDec:      domain.ActionClose,
+			wantCloseQty: "0.25",
 		},
 		{
 			name:    "FLIP maps to ActionFlip",
@@ -79,6 +86,12 @@ func TestParsePMResponse(t *testing.T) {
 				want := decimal.NewFromFloat(tt.wantNewSL)
 				if !action.NewStopLoss.Equal(want) {
 					t.Errorf("NewStopLoss = %s, want %s", action.NewStopLoss, want)
+				}
+			}
+			if tt.wantCloseQty != "" {
+				want, _ := decimal.NewFromString(tt.wantCloseQty)
+				if !action.CloseQuantity.Equal(want) {
+					t.Errorf("CloseQuantity = %s, want %s", action.CloseQuantity, want)
 				}
 			}
 		})

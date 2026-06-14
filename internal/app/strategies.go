@@ -656,8 +656,20 @@ func buildFlipEntryFn(
 			Side:          want.Side,
 			GeneratedAt:   time.Now().UTC(),
 		}
+		// Exclude the symbol being flipped from the gate's position view: the
+		// close leg was already routed but is processed asynchronously by the
+		// per-venue worker, so the position it counts is on its way out. Leaving
+		// it in would let position-count / notional limits spuriously reject the
+		// re-entry against exposure that is being removed.
 		positions := collectPositions(ctx, brokers)
-		if gerr := gate.Check(ctx, sig, positions); gerr != nil {
+		filtered := positions[:0:0]
+		for _, p := range positions {
+			if p.Symbol == resolved && p.Venue == meta.venue {
+				continue
+			}
+			filtered = append(filtered, p)
+		}
+		if gerr := gate.Check(ctx, sig, filtered); gerr != nil {
 			return fmt.Errorf("flip entry risk gate: %w", gerr)
 		}
 

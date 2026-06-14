@@ -41,8 +41,12 @@ type ReviewTrigger struct {
 type ManagedAction struct {
 	Decision    ActionDecision
 	NewStopLoss decimal.Decimal // required when Decision == ActionTightenStop
-	Reason      string
-	Confidence  float64 // 0..1
+	// CloseQuantity, when positive and Decision == ActionClose, closes only this
+	// many units (a partial close). Zero or negative means close the full
+	// position. Ignored for non-close decisions.
+	CloseQuantity decimal.Decimal
+	Reason        string
+	Confidence    float64 // 0..1
 }
 
 // Validate checks the action is internally consistent.

@@ -62,12 +62,18 @@ func (e *ActionExecutor) Execute(ctx context.Context, item QueuedAction) error {
 	}
 }
 
-// routeClose submits a reduce-only market order to close the full position.
+// routeClose submits a reduce-only market order to close the position. When
+// item.Action.CloseQuantity is positive it closes only that many units (a
+// partial close), capped at the position size; otherwise it closes in full.
 func (e *ActionExecutor) routeClose(ctx context.Context, item QueuedAction) error {
 	pos := item.Position
 	closeSide := domain.SideSell
 	if pos.Side == domain.SideSell {
 		closeSide = domain.SideBuy
+	}
+	qty := pos.Quantity
+	if cq := item.Action.CloseQuantity; cq.IsPositive() && cq.LessThan(pos.Quantity) {
+		qty = cq
 	}
 	intent := domain.OrderIntent{
 		ID:            uuid.New().String(),
@@ -76,7 +82,7 @@ func (e *ActionExecutor) routeClose(ctx context.Context, item QueuedAction) erro
 		Venue:         e.deps.Venue,
 		Side:          closeSide,
 		OrderType:     domain.OrderTypeMarket,
-		Quantity:      pos.Quantity,
+		Quantity:      qty,
 		Strategy:      pos.Strategy,
 		Environment:   e.deps.Env,
 		CreatedAt:     time.Now().UTC(),
@@ -86,7 +92,8 @@ func (e *ActionExecutor) routeClose(ctx context.Context, item QueuedAction) erro
 		return fmt.Errorf("executor: close route: %w", err)
 	}
 	slog.Info("executor: close routed",
-		"symbol", pos.Symbol, "decision", item.Action.Decision, "reason", item.Action.Reason)
+		"symbol", pos.Symbol, "decision", item.Action.Decision,
+		"qty", qty, "full", qty.Equal(pos.Quantity), "reason", item.Action.Reason)
 	return nil
 }
 

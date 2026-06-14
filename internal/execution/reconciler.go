@@ -60,13 +60,20 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 	return &Reconciler{deps: deps}
 }
 
-// Run ticks Job A until ctx is cancelled.
+// Run ticks Job A until ctx is cancelled. Job B (LLM-backed position review)
+// runs on its OWN goroutine with its own ticker, so a slow or hung LLM can
+// never delay Job A's deterministic bracket guarantee. Job B is only started
+// when Detector, Decider, and Queue are all wired.
 func (r *Reconciler) Run(ctx context.Context) error {
 	interval := time.Duration(r.deps.IntervalMS) * time.Millisecond
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	slog.Info("position reconciler started", "venue", r.deps.Venue, "interval", interval)
 	defer slog.Info("position reconciler stopping", "venue", r.deps.Venue)
+
+	if r.deps.Detector != nil && r.deps.Decider != nil && r.deps.Queue != nil {
+		go r.runReviewLoop(ctx, interval)
+	}
 
 	for {
 		select {
@@ -75,6 +82,21 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-tick.C:
 			r.enforceBrackets(ctx)
 			r.sweepOrphans(ctx)
+		}
+	}
+}
+
+// runReviewLoop ticks Job B independently of Job A. A single in-flight review
+// pass blocks only this loop — Job A keeps its cadence regardless of LLM
+// latency. Exits cleanly on ctx cancellation.
+func (r *Reconciler) runReviewLoop(ctx context.Context, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
 			r.reviewPositions(ctx)
 		}
 	}

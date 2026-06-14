@@ -203,7 +203,14 @@ func parsePMResponse(raw string) (domain.ManagedAction, error) {
 	case "MOVE_STOP":
 		action.Decision = domain.ActionTightenStop
 		action.NewStopLoss = decimal.NewFromFloat(resp.NewStop)
-	case "PARTIAL_CLOSE", "FLATTEN":
+	case "PARTIAL_CLOSE":
+		action.Decision = domain.ActionClose
+		// A partial close carries an explicit quantity; a malformed or
+		// non-positive value degrades to a full close (the safe direction).
+		if qty, err := decimal.NewFromString(resp.CloseQuantity); err == nil && qty.IsPositive() {
+			action.CloseQuantity = qty
+		}
+	case "FLATTEN":
 		action.Decision = domain.ActionClose
 	case "FLIP":
 		action.Decision = domain.ActionFlip
