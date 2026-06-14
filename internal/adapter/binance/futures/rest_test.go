@@ -3,6 +3,7 @@ package futures
 import (
 	"testing"
 
+	gobinancefutures "github.com/adshao/go-binance/v2/futures"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/shopspring/decimal"
 )
@@ -282,5 +283,23 @@ func TestFuturesAccountPositionToDomain_CurrentPriceIsMark(t *testing.T) {
 	}
 	if pos.CurrentPrice.IsNegative() {
 		t.Error("CurrentPrice must never be negative (regression: PnL stored as price)")
+	}
+}
+
+func TestDetectProtectiveLevels_Futures(t *testing.T) {
+	orders := []*gobinancefutures.Order{
+		{Symbol: "BTCUSDT", Type: orderTypeStopMarket, StopPrice: "60000", ClosePosition: true, OrderID: 111},
+		{Symbol: "BTCUSDT", Type: orderTypeTakeProfitMarket, StopPrice: "70000", ClosePosition: true, OrderID: 222},
+		{Symbol: "BTCUSDT", Type: gobinancefutures.OrderTypeLimit, Price: "65000", OrderID: 333}, // ignored
+	}
+	sl, tp, ids := detectProtectiveLevels(orders)
+	if !sl["BTCUSDT"].Equal(decimal.RequireFromString("60000")) {
+		t.Errorf("stop = %s, want 60000", sl["BTCUSDT"])
+	}
+	if !tp["BTCUSDT"].Equal(decimal.RequireFromString("70000")) {
+		t.Errorf("tp = %s, want 70000", tp["BTCUSDT"])
+	}
+	if ids["BTCUSDT"].StopOrderID != "111" || ids["BTCUSDT"].TakeProfitOrderID != "222" {
+		t.Errorf("ids = %+v, want stop=111 tp=222", ids["BTCUSDT"])
 	}
 }

@@ -19,6 +19,13 @@ import (
 
 type futuresMode string
 
+// protectiveOrders holds the exchange order IDs of an externally-set
+// stop / take-profit pair for one symbol.
+type protectiveOrders struct {
+	StopOrderID       string
+	TakeProfitOrderID string
+}
+
 const userDataKeepaliveInterval = 25 * time.Minute
 
 // defaultPositionResyncInterval is how often the broker re-fetches the
@@ -33,6 +40,14 @@ const (
 	futuresModeDemo    futuresMode = "demo"
 )
 
+// orderTypeStopMarket and orderTypeTakeProfitMarket are the go-binance futures
+// OrderType values for conditional close legs. The SDK only pre-declares Limit,
+// Market and Liquidation — these two are cast from their wire strings.
+const (
+	orderTypeStopMarket      = gobinancefutures.OrderType("STOP_MARKET")
+	orderTypeTakeProfitMarket = gobinancefutures.OrderType("TAKE_PROFIT_MARKET")
+)
+
 // FuturesBroker implements port.Broker for Binance USDT-M Futures REST API.
 type FuturesBroker struct {
 	client  *gobinancefutures.Client
@@ -45,6 +60,11 @@ type FuturesBroker struct {
 	mu            sync.RWMutex
 	positions     map[domain.Symbol]domain.Position
 	leverageCache map[domain.Symbol]int // last-applied leverage per symbol (avoids redundant REST calls)
+
+	// protective caches the exchange order IDs of detected externally-set
+	// STOP_MARKET / TAKE_PROFIT_MARKET orders per symbol, so a confirmed
+	// adjustment can cancel the exact orders. Guarded by b.mu.
+	protective map[domain.Symbol]protectiveOrders
 }
 
 // SetResyncInterval overrides the periodic REST position-resync cadence. A
@@ -64,6 +84,7 @@ func NewFuturesBroker(client *gobinancefutures.Client, mode string) *FuturesBrok
 		filters:       NewFuturesExchangeInfo(client),
 		positions:     make(map[domain.Symbol]domain.Position),
 		leverageCache: make(map[domain.Symbol]int),
+		protective:    make(map[domain.Symbol]protectiveOrders),
 	}
 }
 
@@ -482,8 +503,10 @@ func (b *FuturesBroker) applyPositionSnapshot(snapshot map[domain.Symbol]domain.
 			if !existing.OpenedAt.IsZero() {
 				pos.OpenedAt = existing.OpenedAt
 			}
-			pos.StopLoss = existing.StopLoss
-			pos.TakeProfit1 = existing.TakeProfit1
+			if pos.StopLoss.IsZero() && pos.TakeProfit1.IsZero() && !pos.ExternallyProtected {
+				pos.StopLoss = existing.StopLoss
+				pos.TakeProfit1 = existing.TakeProfit1
+			}
 			pos.Strategy = existing.Strategy
 			pos.CorrelationID = existing.CorrelationID
 		}
@@ -567,6 +590,39 @@ func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.S
 		}
 		next[pos.Symbol] = pos
 	}
+
+	openOrders, ooErr := b.client.NewListOpenOrdersService().Do(ctx)
+	if ooErr != nil {
+		slog.Warn("futures open-orders fetch for SL/TP detection failed", "error", ooErr)
+		return next, nil
+	}
+	stops, tps, ids := detectProtectiveLevels(openOrders)
+	detected := make(map[domain.Symbol]protectiveOrders, len(ids))
+	for rawSym, po := range ids {
+		sym := domain.Symbol(normaliseFuturesSymbol(rawSym))
+		if sym == "" {
+			continue
+		}
+		pos, ok := next[sym]
+		if !ok {
+			continue
+		}
+		if sl, has := stops[rawSym]; has {
+			pos.StopLoss = sl
+		}
+		if tp, has := tps[rawSym]; has {
+			pos.TakeProfit1 = tp
+		}
+		if !pos.StopLoss.IsZero() || !pos.TakeProfit1.IsZero() {
+			pos.ExternallyProtected = true
+		}
+		next[sym] = pos
+		detected[sym] = po
+	}
+	b.mu.Lock()
+	b.protective = detected
+	b.mu.Unlock()
+
 	return next, nil
 }
 
@@ -817,6 +873,53 @@ func futuresAccountPositionToDomain(rawSymbol, amountStr, entryStr, currentStr s
 		CurrentPrice: current,
 		OpenedAt:     time.Now().UTC(),
 	}, true, nil
+}
+
+// normaliseFuturesSymbol converts a raw exchange symbol (e.g. "BTCUSDT") to the
+// canonical domain.Symbol used as the positions map key (e.g. "BTC/USDT-PERP").
+// It mirrors the conversion inside futuresAccountPositionToDomain exactly.
+func normaliseFuturesSymbol(raw string) string {
+	sym, err := domain.NormalizeExchangeSymbol(raw, domain.ContractFuturesPerp)
+	if err != nil {
+		return ""
+	}
+	return string(sym)
+}
+
+// detectProtectiveLevels extracts externally-set stop / take-profit levels and
+// their order IDs from a list of open futures orders. Only reduce-only or
+// closePosition conditional orders count as protective. Keys are raw exchange
+// symbols (e.g. "BTCUSDT"); caller maps to domain.Symbol.
+func detectProtectiveLevels(orders []*gobinancefutures.Order) (
+	stops map[string]decimal.Decimal,
+	tps map[string]decimal.Decimal,
+	ids map[string]protectiveOrders,
+) {
+	stops = make(map[string]decimal.Decimal)
+	tps = make(map[string]decimal.Decimal)
+	ids = make(map[string]protectiveOrders)
+	for _, o := range orders {
+		if o == nil || (!o.ClosePosition && !o.ReduceOnly) {
+			continue
+		}
+		px, err := decimal.NewFromString(o.StopPrice)
+		if err != nil || px.IsZero() {
+			continue
+		}
+		cur := ids[o.Symbol]
+		switch o.Type {
+		case orderTypeStopMarket:
+			stops[o.Symbol] = px
+			cur.StopOrderID = strconv.FormatInt(o.OrderID, 10)
+		case orderTypeTakeProfitMarket:
+			tps[o.Symbol] = px
+			cur.TakeProfitOrderID = strconv.FormatInt(o.OrderID, 10)
+		default:
+			continue
+		}
+		ids[o.Symbol] = cur
+	}
+	return stops, tps, ids
 }
 
 // FetchKlines fetches historical closed candles from Binance USDT-M Futures REST API.
