@@ -8,6 +8,11 @@ configs/strategies.yaml
 cerebro
 /dist/
 
+# Embedded web frontend build output (rebuilt by `make web`; keep the
+# placeholder so the //go:embed directive compiles from a clean checkout)
+/internal/adapter/web/dist/*
+!/internal/adapter/web/dist/.gitkeep
+
 # Test data - real market data
 testdata/real/
 
