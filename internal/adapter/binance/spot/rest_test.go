@@ -4,9 +4,29 @@ import (
 	"context"
 	"testing"
 
+	gobinance "github.com/adshao/go-binance/v2"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/shopspring/decimal"
 )
+
+func TestDetectProtectiveLevels_Spot(t *testing.T) {
+	orders := []*gobinance.Order{
+		{Symbol: "ETHUSDT", Type: gobinance.OrderTypeStopLossLimit, Side: gobinance.SideTypeSell, StopPrice: "2800", OrderID: 11, OrderListId: 99},
+		{Symbol: "ETHUSDT", Type: gobinance.OrderTypeLimitMaker, Side: gobinance.SideTypeSell, Price: "3500", OrderID: 12, OrderListId: 99},
+		{Symbol: "ETHUSDT", Type: gobinance.OrderTypeLimit, Price: "3000", OrderID: 13}, // ignored
+	}
+	sl, tp, ids := detectSpotProtectiveLevels(orders)
+	if !sl["ETHUSDT"].Equal(decimal.RequireFromString("2800")) {
+		t.Errorf("stop = %s, want 2800", sl["ETHUSDT"])
+	}
+	if !tp["ETHUSDT"].Equal(decimal.RequireFromString("3500")) {
+		t.Errorf("tp = %s, want 3500", tp["ETHUSDT"])
+	}
+	got := ids["ETHUSDT"]
+	if got.ListID != "99" || got.StopOrderID != "11" || got.TakeProfitOrderID != "12" {
+		t.Errorf("ids = %+v, want list=99 stop=11 tp=12", got)
+	}
+}
 
 func TestHandleUserDataMessage_BalanceUpdateRemovesPosition(t *testing.T) {
 	b := NewSpotBroker(nil, "mainnet", []domain.Symbol{"BTC/USDT"}, nil)
@@ -176,7 +196,7 @@ func TestApplyBalanceSnapshot_Resync(t *testing.T) {
 		"USDT": {free: decimal.NewFromFloat(10000), locked: decimal.Zero},
 	}
 
-	b.applyBalanceSnapshot(snapshot)
+	b.applyBalanceSnapshot(snapshot, nil, nil, nil)
 
 	positions, _ := b.Positions(context.Background())
 	gotSyms := map[domain.Symbol]bool{}
