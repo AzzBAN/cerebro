@@ -8,6 +8,7 @@ import (
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/marketdata"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/charmbracelet/bubbletea"
 )
 
@@ -98,6 +99,11 @@ func (r *Runner) SendAgentLog(line string) {
 	r.Push(AgentLogMsg{Line: line})
 }
 
+// SendOrderLog delivers an order-lifecycle line to the TUI log panel.
+func (r *Runner) SendOrderLog(line string) {
+	r.Push(OrderMsg{Line: line})
+}
+
 // SendSysLog implements observability.LogSink.
 // It delivers a system log line (from slog) to the TUI log panel with the
 // appropriate level label so it can be coloured differently from agent output.
@@ -114,6 +120,10 @@ func (r *Runner) SendHeartbeat(line string) {
 func (r *Runner) SendPositions(positions []domain.Position) {
 	r.Push(PositionsMsg{Positions: positions})
 }
+
+// SendProposals is a no-op for the TUI: SL/TP adjustment proposals surface
+// only on the web dashboard, where the operator confirms or rejects them.
+func (r *Runner) SendProposals(_ []positionproposal.Proposal) {}
 
 // SendAgentState pushes a live agent step transition to the TUI agent panel.
 func (r *Runner) SendAgentState(msg AgentStateMsg) {

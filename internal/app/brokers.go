@@ -19,7 +19,6 @@ import (
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/azhar/cerebro/internal/risk"
-	"github.com/azhar/cerebro/internal/tui"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -112,6 +111,17 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 
 		if broker == nil {
 			return nil, nil, nil, fmt.Errorf("failed to wire broker for venue %s", venue)
+		}
+		// Apply the configured position-resync cadence (zero leaves the broker
+		// default in effect). Brokers ignore non-positive overrides.
+		if ms := cfg.Engine.PositionResyncIntervalMS; ms > 0 {
+			resync := time.Duration(ms) * time.Millisecond
+			switch b := broker.(type) {
+			case *spot.SpotBroker:
+				b.SetResyncInterval(resync)
+			case *futures.FuturesBroker:
+				b.SetResyncInterval(resync)
+			}
 		}
 		if err := broker.Connect(ctx); err != nil {
 			return nil, nil, nil, fmt.Errorf("%s broker connect: %w", venue, err)
@@ -289,7 +299,7 @@ func buildRouteOrderFn(
 	brokers map[domain.Venue]port.Broker,
 	symbolMeta map[domain.Symbol]symbolMeta,
 	env domain.Environment,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 ) func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 	return func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 		meta, resolved, err := resolveRouteSymbol(req.Symbol, symbolMeta)
@@ -322,7 +332,7 @@ func buildRouteOrderFn(
 			if gerr := gate.Check(ctx, sig, positions); gerr != nil {
 				slog.Warn("✗ agent order rejected by risk gate",
 					"symbol", resolved, "side", req.Side, "reason", gerr)
-				pushTUIOrder(tuiRunner, fmt.Sprintf("✗ RISK-REJECT(agent) %s %s — %v",
+				pushTUIOrder(uiSink, fmt.Sprintf("✗ RISK-REJECT(agent) %s %s — %v",
 					resolved, req.Side, gerr))
 				return fmt.Errorf("risk gate: %w", gerr)
 			}
@@ -381,7 +391,7 @@ func buildRouteOrderFn(
 		if !req.TakeProfit1.IsZero() {
 			summary += fmt.Sprintf(" TP=%s", req.TakeProfit1.StringFixed(4))
 		}
-		pushTUIOrder(tuiRunner, summary)
+		pushTUIOrder(uiSink, summary)
 		return nil
 	}
 }
@@ -493,4 +503,14 @@ func collectMinLotsForVenue(venues []config.VenueConfig, target domain.Venue) ma
 		}
 	}
 	return out
+}
+
+// noopProtectiveLookup satisfies positionproposal.ProtectiveLookup for brokers
+// that don't expose exchange-side protective orders (the paper matcher). It
+// reports no existing protection, so ApplyAdjustment simply places a fresh
+// bracket without a preceding cancel.
+type noopProtectiveLookup struct{}
+
+func (noopProtectiveLookup) ProtectiveBracket(domain.Symbol) (domain.BracketResponse, bool) {
+	return domain.BracketResponse{}, false
 }

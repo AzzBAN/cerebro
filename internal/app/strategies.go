@@ -18,7 +18,6 @@ import (
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/azhar/cerebro/internal/risk"
 	"github.com/azhar/cerebro/internal/strategy"
-	"github.com/azhar/cerebro/internal/tui"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
@@ -131,7 +130,7 @@ func runStrategyEngine(
 	llmCfg config.LLMConfig,
 	router *execution.Router,
 	symbolMeta map[domain.Symbol]symbolMeta,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 	metrics *runtimeMetrics,
 	kc *klineClients,
 	markets []config.VenueConfig,
@@ -181,7 +180,7 @@ func runStrategyEngine(
 					"tf", sig.Timeframe,
 					"reason", sig.Reason,
 				)
-				pushTUI(tuiRunner, fmt.Sprintf("⚡ SIGNAL %s %s %s — %s",
+				pushTUI(uiSink, fmt.Sprintf("⚡ SIGNAL %s %s %s — %s",
 					sig.Side, sig.Symbol, sig.Strategy, sig.Reason))
 
 				if !dedup.Allow(sig) {
@@ -196,7 +195,7 @@ func runStrategyEngine(
 					slog.Warn("✗ SIGNAL rejected by risk gate",
 						"strategy", sig.Strategy, "symbol", sig.Symbol,
 						"side", sig.Side, "reason", err)
-					pushTUI(tuiRunner, fmt.Sprintf("✗ RISK-REJECT %s %s — %v",
+					pushTUI(uiSink, fmt.Sprintf("✗ RISK-REJECT %s %s — %v",
 						sig.Symbol, sig.Strategy, err))
 					continue
 				}
@@ -219,21 +218,21 @@ func runStrategyEngine(
 							"strategy", sig.Strategy, "symbol", sig.Symbol,
 							"size_multiplier", llmCfg.TechnicalOnlySizeMultiplier,
 							"error", err)
-						pushTUI(tuiRunner, fmt.Sprintf("TECH-ONLY %s %s — LLM failed, sizing×%.2f",
+						pushTUI(uiSink, fmt.Sprintf("TECH-ONLY %s %s — LLM failed, sizing×%.2f",
 							sig.Symbol, sig.Strategy, llmCfg.TechnicalOnlySizeMultiplier))
 						// fall through to deterministic path
 					case err != nil:
 						metrics.signalsRejectedByRisk.Add(1)
 						slog.Warn("risk agent rejected signal (error)",
 							"strategy", sig.Strategy, "symbol", sig.Symbol, "error", err)
-						pushTUI(tuiRunner, fmt.Sprintf("RISK-AGENT-ERROR %s %s: %v",
+						pushTUI(uiSink, fmt.Sprintf("RISK-AGENT-ERROR %s %s: %v",
 							sig.Symbol, sig.Strategy, err))
 						continue
 					case !approved:
 						metrics.signalsRejectedByRisk.Add(1)
 						slog.Info("risk agent rejected signal",
 							"strategy", sig.Strategy, "symbol", sig.Symbol)
-						pushTUI(tuiRunner, fmt.Sprintf("RISK-AGENT-REJECT %s %s",
+						pushTUI(uiSink, fmt.Sprintf("RISK-AGENT-REJECT %s %s",
 							sig.Symbol, sig.Strategy))
 						continue
 					default:
@@ -314,7 +313,7 @@ func runStrategyEngine(
 					"qty", qty.String(),
 					"broker_id", resp.BrokerOrderID,
 				)
-				pushTUIOrder(tuiRunner, fmt.Sprintf("ORDER %s %s %.6f @ %.4f [%s] {%s}",
+				pushTUIOrder(uiSink, fmt.Sprintf("ORDER %s %s %.6f @ %.4f [%s] {%s}",
 					sig.Side, sig.Symbol,
 					qty.InexactFloat64(), c.Close.InexactFloat64(),
 					sig.Strategy, meta.venue))

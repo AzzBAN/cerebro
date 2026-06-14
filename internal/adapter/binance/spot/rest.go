@@ -27,6 +27,12 @@ const (
 	spotModeDemo    spotMode = "demo"
 )
 
+// defaultPositionResyncInterval is how often the broker re-fetches the
+// authoritative balance snapshot over REST to recover any open/close the
+// user-data WS stream may have missed (dropped events, silent socket stalls).
+// Overridable per-deployment via engine.position_resync_interval_ms.
+const defaultPositionResyncInterval = 5 * time.Second
+
 type spotBalance struct {
 	free   decimal.Decimal
 	locked decimal.Decimal
@@ -39,6 +45,14 @@ var knownStablecoins = map[string]bool{
 	"DAI": true, "USDP": true, "PYUSD": true, "USDS": true,
 }
 
+// spotProtectiveOrders holds the IDs needed to cancel an externally-set spot
+// protective order (OCO list, or a lone STOP_LOSS_LIMIT).
+type spotProtectiveOrders struct {
+	ListID            string // OCO orderListId; "" for a lone stop
+	StopOrderID       string
+	TakeProfitOrderID string
+}
+
 // SpotBroker implements port.Broker for Binance Spot REST calls.
 type SpotBroker struct {
 	client   *gobinance.Client
@@ -47,9 +61,24 @@ type SpotBroker struct {
 	minLots  map[domain.Symbol]decimal.Decimal // minimum tradeable qty per symbol (dust filter)
 	filters  *SpotExchangeInfo                 // symbol filter cache (PRICE/LOT/NOTIONAL)
 
+	// resyncInterval overrides defaultPositionResyncInterval when positive.
+	resyncInterval time.Duration
+
 	mu        sync.RWMutex
 	balances  map[string]spotBalance
 	positions map[domain.Symbol]domain.Position
+	// protective caches detected externally-set protective order IDs per symbol
+	// (OCO list id + leg order ids) so a confirmed adjustment can cancel them.
+	protective map[domain.Symbol]spotProtectiveOrders
+}
+
+// SetResyncInterval overrides the periodic REST position-resync cadence. A
+// non-positive value is ignored, leaving the default in effect. Must be called
+// before Connect.
+func (b *SpotBroker) SetResyncInterval(d time.Duration) {
+	if d > 0 {
+		b.resyncInterval = d
+	}
 }
 
 // NewSpotBroker creates a SpotBroker wrapping the provided client.
@@ -66,13 +95,14 @@ func NewSpotBroker(client *gobinance.Client, mode string, symbols []domain.Symbo
 		minLots = make(map[domain.Symbol]decimal.Decimal)
 	}
 	return &SpotBroker{
-		client:    client,
-		mode:      spotMode(mode),
-		symbols:   symSet,
-		minLots:   minLots,
-		filters:   NewSpotExchangeInfo(client),
-		balances:  make(map[string]spotBalance),
-		positions: make(map[domain.Symbol]domain.Position),
+		client:     client,
+		mode:       spotMode(mode),
+		symbols:    symSet,
+		minLots:    minLots,
+		filters:    NewSpotExchangeInfo(client),
+		balances:   make(map[string]spotBalance),
+		positions:  make(map[domain.Symbol]domain.Position),
+		protective: make(map[domain.Symbol]spotProtectiveOrders),
 	}
 }
 
@@ -85,9 +115,11 @@ func (b *SpotBroker) ExchangeInfo() *SpotExchangeInfo { return b.filters }
 func (b *SpotBroker) Venue() domain.Venue { return domain.VenueBinanceSpot }
 
 // Connect bootstraps positions once, then maintains a local position cache from
-// the private user-data websocket stream. It also loads the exchangeInfo
-// filter cache so subsequent order placements can quantise qty/price to
-// each symbol's tickSize and stepSize without an extra round-trip.
+// the private user-data websocket stream. A periodic REST resync runs alongside
+// as a safety net for any WS events that are dropped or never delivered. It
+// also loads the exchangeInfo filter cache so subsequent order placements can
+// quantise qty/price to each symbol's tickSize and stepSize without an extra
+// round-trip.
 func (b *SpotBroker) Connect(ctx context.Context) error {
 	if err := b.filters.Refresh(ctx); err != nil {
 		// Soft-fail: we still want to come up even if exchangeInfo is
@@ -99,7 +131,28 @@ func (b *SpotBroker) Connect(ctx context.Context) error {
 		return err
 	}
 	go b.runUserDataStream(ctx)
+	go b.runPositionResync(ctx)
 	return nil
+}
+
+// runPositionResync periodically re-fetches the authoritative balance snapshot
+// over REST so the cache converges to the exchange's true state even when the
+// user-data WS stream misses events. Exits cleanly on ctx cancel.
+func (b *SpotBroker) runPositionResync(ctx context.Context) {
+	interval := b.resyncInterval
+	if interval <= 0 {
+		interval = defaultPositionResyncInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.resyncPositions(ctx)
+		}
+	}
 }
 
 // StreamQuotes is not implemented on the REST broker; use KlinesWS.
@@ -455,18 +508,17 @@ func (b *SpotBroker) Balance(_ context.Context) (port.AccountBalance, error) {
 }
 
 func (b *SpotBroker) bootstrapPositions(ctx context.Context) error {
-	account, err := b.client.NewGetAccountService().Do(ctx)
+	snapshot, err := b.fetchBalanceSnapshot(ctx)
 	if err != nil {
-		return fmt.Errorf("binance spot get account: %w", err)
+		return err
 	}
+	// Fetch protective levels outside the lock — network call must not hold mu.
+	stops, tps, ids := b.fetchProtectiveLevels(ctx)
 
 	b.mu.Lock()
-	for _, bal := range account.Balances {
-		free, _ := decimal.NewFromString(bal.Free)
-		locked, _ := decimal.NewFromString(bal.Locked)
-		b.balances[strings.ToUpper(bal.Asset)] = spotBalance{free: free, locked: locked}
-	}
+	b.balances = snapshot
 	b.rebuildPositionsLocked()
+	b.applyProtectiveLocked(stops, tps, ids)
 	b.mu.Unlock()
 
 	// Fetch current market prices for each discovered position so that
@@ -474,6 +526,39 @@ func (b *SpotBroker) bootstrapPositions(ctx context.Context) error {
 	b.fetchCurrentPrices(ctx)
 
 	return nil
+}
+
+// fetchBalanceSnapshot queries the spot account REST endpoint and returns the
+// authoritative balance map. Shared by bootstrap (replace + price backfill)
+// and the periodic resync (replace via applyBalanceSnapshot).
+func (b *SpotBroker) fetchBalanceSnapshot(ctx context.Context) (map[string]spotBalance, error) {
+	account, err := b.client.NewGetAccountService().Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("binance spot get account: %w", err)
+	}
+	next := make(map[string]spotBalance, len(account.Balances))
+	for _, bal := range account.Balances {
+		free, _ := decimal.NewFromString(bal.Free)
+		locked, _ := decimal.NewFromString(bal.Locked)
+		next[strings.ToUpper(bal.Asset)] = spotBalance{free: free, locked: locked}
+	}
+	return next, nil
+}
+
+// resyncPositions fetches an authoritative REST balance snapshot, applies it
+// wholesale, and backfills prices for any newly-discovered positions. This
+// recovers any open/close the user-data WS stream missed. Errors are logged,
+// not fatal — the next tick retries.
+func (b *SpotBroker) resyncPositions(ctx context.Context) {
+	snapshot, err := b.fetchBalanceSnapshot(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "spot position resync failed", "err", err)
+		return
+	}
+	// Fetch protective levels outside the lock — network call must not hold mu.
+	stops, tps, ids := b.fetchProtectiveLevels(ctx)
+	b.applyBalanceSnapshot(snapshot, stops, tps, ids)
+	b.fetchCurrentPrices(ctx)
 }
 
 // fetchCurrentPrices queries the Binance ticker API for each open position and
@@ -640,6 +725,119 @@ func (b *SpotBroker) handleUserDataMessage(message []byte) error {
 	return nil
 }
 
+// applyBalanceSnapshot replaces the cached balance map with a fresh,
+// authoritative snapshot (e.g. from a REST resync) and rebuilds the position
+// view. Balances are REPLACED wholesale rather than merged: an asset sold to
+// zero is simply absent from the snapshot, so a merge would leave a stale
+// non-zero balance and a phantom position. Cerebro-internal position metadata
+// (SL/TP/Strategy/CorrelationID/OpenedAt) is preserved by
+// rebuildPositionsLocked for surviving symbols. This recovers state the
+// user-data WS may have missed.
+func (b *SpotBroker) applyBalanceSnapshot(snapshot map[string]spotBalance, stops, tps map[string]decimal.Decimal, ids map[string]spotProtectiveOrders) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.balances = make(map[string]spotBalance, len(snapshot))
+	for asset, bal := range snapshot {
+		b.balances[strings.ToUpper(asset)] = bal
+	}
+	b.rebuildPositionsLocked()
+	b.applyProtectiveLocked(stops, tps, ids)
+}
+
+// spotSymbolToDomain converts a raw exchange symbol (e.g. "ETHUSDT") to the
+// domain canonical form ("ETH/USDT"). Only USDT-quoted pairs are supported;
+// others are returned unchanged as a defensive fallback.
+func spotSymbolToDomain(raw string) string {
+	if strings.HasSuffix(raw, "USDT") {
+		return raw[:len(raw)-4] + "/USDT"
+	}
+	return raw
+}
+
+// detectSpotProtectiveLevels extracts externally-set stop / take-profit levels
+// and their order IDs from open spot orders. STOP_LOSS_LIMIT supplies the stop
+// (from StopPrice); the OCO LIMIT_MAKER leg supplies the take-profit (from
+// Price). Keys are raw exchange symbols (e.g. "ETHUSDT"). If a symbol has
+// multiple orders of the same type, the last one seen wins.
+func detectSpotProtectiveLevels(orders []*gobinance.Order) (
+	stops map[string]decimal.Decimal,
+	tps map[string]decimal.Decimal,
+	ids map[string]spotProtectiveOrders,
+) {
+	stops = make(map[string]decimal.Decimal)
+	tps = make(map[string]decimal.Decimal)
+	ids = make(map[string]spotProtectiveOrders)
+	for _, o := range orders {
+		if o == nil {
+			continue
+		}
+		cur := ids[o.Symbol]
+		if o.OrderListId > 0 {
+			cur.ListID = strconv.FormatInt(o.OrderListId, 10)
+		}
+		switch o.Type {
+		case gobinance.OrderTypeStopLossLimit:
+			px, err := decimal.NewFromString(o.StopPrice)
+			if err != nil || px.IsZero() {
+				continue
+			}
+			stops[o.Symbol] = px
+			cur.StopOrderID = strconv.FormatInt(o.OrderID, 10)
+		case gobinance.OrderTypeLimitMaker:
+			px, err := decimal.NewFromString(o.Price)
+			if err != nil || px.IsZero() {
+				continue
+			}
+			tps[o.Symbol] = px
+			cur.TakeProfitOrderID = strconv.FormatInt(o.OrderID, 10)
+		default:
+			continue
+		}
+		ids[o.Symbol] = cur
+	}
+	return stops, tps, ids
+}
+
+// fetchProtectiveLevels lists open orders and detects externally-set protective
+// levels. Non-fatal: on error it logs and returns empty maps so a transient
+// failure never blocks position bootstrap/resync.
+func (b *SpotBroker) fetchProtectiveLevels(ctx context.Context) (
+	map[string]decimal.Decimal, map[string]decimal.Decimal, map[string]spotProtectiveOrders,
+) {
+	orders, err := b.client.NewListOpenOrdersService().Do(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "spot open-orders fetch for SL/TP detection failed", "err", err)
+		return nil, nil, nil
+	}
+	return detectSpotProtectiveLevels(orders)
+}
+
+// applyProtectiveLocked stamps detected exchange-side SL/TP levels onto the
+// freshly-rebuilt positions and records the cancellation IDs. Caller MUST hold
+// b.mu. Keys in the input maps are raw exchange symbols (e.g. "ETHUSDT").
+func (b *SpotBroker) applyProtectiveLocked(stops, tps map[string]decimal.Decimal, ids map[string]spotProtectiveOrders) {
+	detected := make(map[domain.Symbol]spotProtectiveOrders, len(ids))
+	for rawSym, po := range ids {
+		sym := domain.Symbol(spotSymbolToDomain(rawSym))
+		pos, ok := b.positions[sym]
+		if !ok {
+			continue
+		}
+		if sl, has := stops[rawSym]; has {
+			pos.StopLoss = sl
+		}
+		if tp, has := tps[rawSym]; has {
+			pos.TakeProfit1 = tp
+		}
+		if !pos.StopLoss.IsZero() || !pos.TakeProfit1.IsZero() {
+			pos.ExternallyProtected = true
+		}
+		b.positions[sym] = pos
+		detected[sym] = po
+	}
+	b.protective = detected
+}
+
 func (b *SpotBroker) rebuildPositionsLocked() {
 	next := make(map[domain.Symbol]domain.Position)
 	now := time.Now().UTC()
@@ -673,6 +871,10 @@ func (b *SpotBroker) rebuildPositionsLocked() {
 			pos.CurrentPrice = existing.CurrentPrice
 			pos.StopLoss = existing.StopLoss
 			pos.TakeProfit1 = existing.TakeProfit1
+			// Carry the protected flag with its levels: a user-data balance
+			// rebuild between resyncs must not drop it, or the reconciler would
+			// place a duplicate bracket over the operator's exchange orders.
+			pos.ExternallyProtected = existing.ExternallyProtected
 			pos.Strategy = existing.Strategy
 			pos.CorrelationID = existing.CorrelationID
 		}
@@ -743,4 +945,22 @@ func (b *SpotBroker) userDataAPIEndpoint() string {
 	default:
 		return gobinance.BaseWsApiMainURL
 	}
+}
+
+// ProtectiveBracket returns a BracketResponse describing the externally-set
+// protective orders detected for sym, suitable for CancelBracket. ok is false
+// when no externally-set protection is cached.
+func (b *SpotBroker) ProtectiveBracket(sym domain.Symbol) (domain.BracketResponse, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	po, ok := b.protective[sym]
+	if !ok {
+		return domain.BracketResponse{}, false
+	}
+	return domain.BracketResponse{
+		Symbol:            sym,
+		ListID:            po.ListID,
+		StopOrderID:       po.StopOrderID,
+		TakeProfitOrderID: po.TakeProfitOrderID,
+	}, true
 }

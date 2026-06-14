@@ -43,6 +43,17 @@ const (
 // tick without logging warnings.
 var ErrRateLimited = errors.New("cryptopanic: rate-limited (cooldown active)")
 
+// ErrAntiBot is returned when CryptoPanic's edge (Cloudflare) blocks the
+// pure-Go client with a 403 — either on the CSRF-bootstrap GET / or on the
+// /web-api/posts/ POST. The block keys off the request's TLS fingerprint and
+// the absence of JS execution, so retrying or refreshing the CSRF token with
+// the same HTTP client cannot clear it. FetchPosts surfaces this immediately
+// (no retry storm) and the FallbackFeed routes the call to the headless-
+// Chromium tier, which presents a real browser fingerprint and can pass the
+// challenge. This is distinct from ErrBadPayload (AES key rotation): the RE
+// client is structurally fine here, it's just being denied at the edge.
+var ErrAntiBot = errors.New("cryptopanic: blocked by anti-bot edge (403)")
+
 // Client is a reverse-engineered HTTP client for CryptoPanic's internal
 // /web-api/posts/ endpoint. It emulates the Vue SPA's CSRF dance and
 // decrypts the AES-CBC+zlib-wrapped response locally.
@@ -164,6 +175,16 @@ func (c *Client) FetchPosts(ctx context.Context, q Query) ([]rawPost, error) {
 			return nil, fmt.Errorf("%w: upstream 429 %s", ErrRateLimited, http.StatusText(te.status))
 		}
 
+		// 403 — anti-bot edge block. Retrying the same HTTP client can't
+		// clear a fingerprint challenge, so stop immediately and surface
+		// ErrAntiBot. The FallbackFeed routes this to the headless browser,
+		// which presents a real fingerprint and can pass the challenge.
+		// (The POST-path 403 already invalidated the CSRF token; the
+		// GET-path 403 has no token to refresh.)
+		if te.status == http.StatusForbidden {
+			return nil, fmt.Errorf("%w: %s", ErrAntiBot, te.Error())
+		}
+
 		lastErr = err
 		if te.retryAfter > backoff {
 			backoff = te.retryAfter
@@ -196,6 +217,14 @@ func (t *transientError) Unwrap() error { return t.inner }
 // returns a *transientError so the caller can retry.
 func (c *Client) fetchPostsOnce(ctx context.Context, formBody string) ([]byte, string, error) {
 	if err := c.ensureCSRF(ctx); err != nil {
+		// ensureCSRF may already return a *transientError carrying a status
+		// (e.g. a 403 anti-bot block on the bootstrap GET). Preserve it so
+		// FetchPosts can route on the status rather than re-wrapping it as
+		// a status-0 generic transient (which would retry into exhaustion).
+		var te *transientError
+		if errors.As(err, &te) {
+			return nil, "", err
+		}
 		return nil, "", &transientError{inner: err}
 	}
 	c.respectRate()
@@ -307,6 +336,16 @@ func (c *Client) ensureCSRF(ctx context.Context) error {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden {
+		// Cloudflare anti-bot block on the bootstrap GET. There is no CSRF
+		// token to refresh and retrying the same HTTP client can't clear a
+		// fingerprint challenge — tag the status so FetchPosts surfaces
+		// ErrAntiBot and the FallbackFeed routes to the headless browser.
+		return &transientError{
+			status: resp.StatusCode,
+			inner:  fmt.Errorf("cryptopanic: home GET status %d (anti-bot)", resp.StatusCode),
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("cryptopanic: home GET status %d", resp.StatusCode)
 	}

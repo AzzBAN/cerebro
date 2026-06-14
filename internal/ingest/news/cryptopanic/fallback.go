@@ -136,24 +136,36 @@ func (f *FallbackFeed) FetchLatest(ctx context.Context, asset string, limit int)
 	}
 
 	// Distinguish structural RE breakage from upstream transient errors.
-	// Only the former warrants a browser round-trip.
-	if !errors.Is(err, ErrBadPayload) {
+	// Only the former warrants a browser round-trip:
+	//   - ErrBadPayload: AES key rotation — RE decrypt is structurally broken.
+	//   - ErrAntiBot:    Cloudflare 403 fingerprint block — the pure-Go client
+	//                    is denied at the edge, but a real headless browser
+	//                    presents a genuine fingerprint and can pass.
+	// Everything else (5xx, network timeout, CSRF hiccup) is a transient
+	// upstream condition the browser would hit identically, ~30s slower —
+	// propagate it and let the runner reuse the Redis cache.
+	if !errors.Is(err, ErrBadPayload) && !errors.Is(err, ErrAntiBot) {
 		// Log once at WARN — no browser spin-up, no consecutive-failure count.
 		slog.Warn("cryptopanic: RE fetch failed (transient); keeping cached data",
 			"error", err)
 		return nil, err
 	}
 
+	reason := "re_bad_payload"
+	if errors.Is(err, ErrAntiBot) {
+		reason = "re_anti_bot"
+	}
+
 	f.reFailures.Add(1)
 	n := f.failures.Add(1)
-	slog.Warn("cryptopanic: RE payload decode failed; falling back to browser",
-		"error", err, "consecutive_failures", n)
+	slog.Warn("cryptopanic: RE path blocked; falling back to browser",
+		"error", err, "reason", reason, "consecutive_failures", n)
 
 	if n >= f.failureThreshold {
 		f.tripBreaker(ctx, err)
 	}
 
-	return f.runBrowser(ctx, asset, limit, "re_bad_payload")
+	return f.runBrowser(ctx, asset, limit, reason)
 }
 
 // runBrowser drives the Chromium fallback and updates the tier counters.

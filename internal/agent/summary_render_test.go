@@ -47,12 +47,12 @@ func TestRenderScreeningSummary(t *testing.T) {
 
 	// Must be markdown with required sections.
 	for _, required := range []string{
-		"### Market Overview",
-		"### Per-Symbol Bias",
-		"### Top Opportunities",
+		"### 📊 Market Overview",
+		"### 🧭 Per-Symbol Bias",
+		"### 🎯 Top Opportunities",
 		"BTC/USDT",
 		"ETH/USDT",
-		"[AVOIDED]",
+		"AVOIDED",
 	} {
 		if !strings.Contains(out, required) {
 			t.Errorf("rendered summary missing %q\n---\n%s", required, out)
@@ -60,7 +60,7 @@ func TestRenderScreeningSummary(t *testing.T) {
 	}
 
 	// Bullish vs bearish split should trigger the watchlist divergence note.
-	if !strings.Contains(out, "### Watchlist") {
+	if !strings.Contains(out, "### 👀 Watchlist") {
 		t.Error("expected Watchlist section when bullish and bearish both > 0")
 	}
 
@@ -91,7 +91,7 @@ func TestRenderScreeningSummary_EmptyBiases(t *testing.T) {
 	// We still produce the overview section even with zero biases; the
 	// counts will all be zero. The caller (runSummary) guards against
 	// rendering empty summaries; here we just verify the function is safe.
-	if !strings.Contains(out, "### Market Overview") {
+	if !strings.Contains(out, "### 📊 Market Overview") {
 		t.Errorf("expected header even with empty input, got:\n%s", out)
 	}
 }

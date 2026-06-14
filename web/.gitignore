@@ -1,0 +1,15 @@
+# Next.js
+/.next/
+/dist/
+/out/
+
+# Dependencies
+/node_modules/
+/.pnp
+.pnp.js
+
+# Misc
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*

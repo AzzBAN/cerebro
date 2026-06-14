@@ -31,6 +31,11 @@ type Position struct {
 	// Isolated reports whether the position is held in isolated margin
 	// mode. Only meaningful for futures venues.
 	Isolated bool
+	// ExternallyProtected reports that StopLoss/TakeProfit1 were read from live
+	// protective orders on the exchange that Cerebro did not place itself
+	// (e.g. an SL/TP the operator set on the Binance website). When true the
+	// reconciler must neither flatten the position nor attach its own bracket.
+	ExternallyProtected bool
 }
 
 // InitialMargin returns the minimum margin required to hold this position

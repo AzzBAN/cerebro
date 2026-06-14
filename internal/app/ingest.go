@@ -35,7 +35,7 @@ func runSyntheticFeeder(
 	hub *marketdata.Hub,
 	venues []config.VenueConfig,
 	interval time.Duration,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 	metrics *runtimeMetrics,
 ) error {
 	feeds := collectAllTimeframeFeeds(venues)
@@ -165,7 +165,7 @@ func runFillMonitor(
 	ctx context.Context,
 	hub *marketdata.Hub,
 	matcher *paper.Matcher,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 	metrics *runtimeMetrics,
 ) error {
 	_, candles := hub.Subscribe()
@@ -209,7 +209,7 @@ func startIngestRunners(
 	newsFeed port.NewsFeed,
 	fjFeed port.NewsFeed,
 	calFeed port.CalendarFeed,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 ) {
 	symbols := collectSymbolList(cfg.Markets)
 
@@ -229,9 +229,9 @@ func startIngestRunners(
 				_ = cache.Set(ctx, fmt.Sprintf("derivatives:%s", sym), b, interval*2)
 				slog.Debug("coinglass: snapshot cached", "symbol", sym)
 			}
-			if tuiRunner != nil {
+			if len(uiSink) > 0 {
 				if macro, ok := buildMacroSnapshot(snaps, symbols); ok {
-					tuiRunner.SendMacro(macro)
+					uiSink.SendMacro(macro)
 				}
 			}
 			return nil
@@ -280,7 +280,7 @@ func startIngestRunners(
 			fjArg = nil
 		}
 		runner := scrape.NewRunner(name, interval, timeout, func(ctx context.Context) error {
-			return refreshNewsCache(ctx, cpFeed, fjArg, cache, tuiRunner, currencies, maxItems, interval)
+			return refreshNewsCache(ctx, cpFeed, fjArg, cache, uiSink, currencies, maxItems, interval)
 		})
 		g.Go(func() error { return runner.Run(ctx) })
 	}
@@ -405,7 +405,7 @@ func refreshNewsCache(
 	cpFeed port.NewsFeed,
 	fjFeed port.NewsFeed,
 	cache port.Cache,
-	tuiRunner *tui.Runner,
+	uiSink multiSink,
 	currencies []string,
 	maxItems int,
 	interval time.Duration,
@@ -512,12 +512,12 @@ func refreshNewsCache(
 	}
 
 	// 5) Push a digest to the TUI.
-	if tuiRunner != nil {
+	if len(uiSink) > 0 {
 		top := combined
 		if len(top) > 10 {
 			top = top[:10]
 		}
-		tuiRunner.SendNews(tui.NewsSnapshot{
+		uiSink.SendNews(tui.NewsSnapshot{
 			Items:     top,
 			UpdatedAt: time.Now().UTC(),
 		})

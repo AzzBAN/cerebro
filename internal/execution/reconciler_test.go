@@ -225,3 +225,68 @@ func TestReconciler_JobB_NoopWhenUnwired(t *testing.T) {
 	})
 	r.reviewPositions(context.Background()) // must not panic
 }
+
+func TestReconciler_JobB_ExternallyProtected_RoutesToPropose(t *testing.T) {
+	pos := longPos("BTCUSDT")
+	pos.ExternallyProtected = true
+	pos.StopLoss = decimal.NewFromInt(60000)
+	pos.TakeProfit1 = decimal.NewFromInt(70000)
+
+	decider := &stubDecider{action: domain.ManagedAction{
+		Decision: domain.ActionTightenStop, NewStopLoss: decimal.NewFromInt(62000), Reason: "lock profit"}}
+	queue := NewActionQueue(60, true, func(context.Context, QueuedAction) error { return nil })
+	detector := NewTriggerDetector(0, 0, 0, true)
+
+	var proposed []domain.ManagedAction
+	r := NewReconciler(ReconcilerDeps{
+		Venue: domain.VenueBinanceFutures, Broker: &stubReconBroker{}, Tracker: NewBracketTracker(),
+		Router: NewRouter([]domain.Venue{domain.VenueBinanceFutures}), Env: domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{pos} },
+		Detector:  detector, Decider: decider, Queue: queue,
+		Bias: func(domain.Symbol) (domain.BiasScore, bool) { return domain.BiasBearish, true },
+		Propose: func(p domain.Position, a domain.ManagedAction) {
+			proposed = append(proposed, a)
+		},
+	})
+	r.reviewPositions(context.Background())
+
+	if len(proposed) != 1 {
+		t.Fatalf("expected 1 proposal routed, got %d", len(proposed))
+	}
+	if !proposed[0].NewStopLoss.Equal(decimal.NewFromInt(62000)) {
+		t.Fatalf("proposed stop = %s, want 62000", proposed[0].NewStopLoss)
+	}
+	if got := len(queue.Pending()); got != 0 {
+		t.Fatalf("externally-protected adjustment must NOT enqueue; got %d queued", got)
+	}
+}
+
+func TestEnforceBrackets_SkipsExternallyProtected(t *testing.T) {
+	broker := &stubReconBroker{}
+	tracker := NewBracketTracker()
+	pos := domain.Position{
+		Symbol:              "BTC/USDT-PERP",
+		Venue:               domain.VenueBinanceFutures,
+		Side:                domain.SideBuy,
+		Quantity:            decimal.NewFromInt(1),
+		StopLoss:            decimal.NewFromInt(60000),
+		TakeProfit1:         decimal.NewFromInt(70000),
+		ExternallyProtected: true,
+	}
+	r := NewReconciler(ReconcilerDeps{
+		Venue:     domain.VenueBinanceFutures,
+		Broker:    broker,
+		Tracker:   tracker,
+		Router:    nil, // flatten must not be reached
+		Env:       domain.EnvironmentPaper,
+		Positions: func() []domain.Position { return []domain.Position{pos} },
+	})
+	r.enforceBrackets(context.Background())
+
+	if len(broker.placedBrackets) != 0 {
+		t.Errorf("expected no bracket placed, got %d", len(broker.placedBrackets))
+	}
+	if tracker.Has(pos.Symbol) {
+		t.Error("expected symbol not tracked")
+	}
+}

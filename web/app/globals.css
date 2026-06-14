@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #1c1c1c;
+  color: #d4d4d4;
+  font-feature-settings: "tnum" 1; /* tabular numerals for aligned columns */
+}
+
+body {
+  margin: 0;
+  overflow: hidden; /* the app manages its own panel scrolling */
+}
+
+/* Thin terminal-style scrollbars. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #1c1c1c;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4a4a4a;
+}
+
+/* Panel scroll regions share a class for consistent overflow behavior. */
+.scroll-y {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
