@@ -43,6 +43,13 @@ type ReconcilerDeps struct {
 	// BiasReason resolves an optional human-readable bias rationale for a
 	// symbol, surfaced to the agent. May be nil.
 	BiasReason func(domain.Symbol) string
+
+	// Propose (optional) routes an agent SL/TP adjustment on an externally-
+	// protected position to the web confirmation store instead of the
+	// autonomous action queue. When nil, such adjustments fall through to the
+	// normal queue path. Only ActionTightenStop on an ExternallyProtected
+	// position is routed here.
+	Propose func(pos domain.Position, action domain.ManagedAction)
 }
 
 // Reconciler enforces the hard TP/SL guarantee (Job A). Job B (review-trigger
@@ -217,6 +224,12 @@ func (r *Reconciler) reviewPositions(ctx context.Context) {
 		if action.Decision == domain.ActionHold {
 			slog.Debug("reconciler: review decided HOLD",
 				"symbol", trig.Symbol, "trigger", trig.Type)
+			continue
+		}
+		if pos.ExternallyProtected && action.Decision == domain.ActionTightenStop && r.deps.Propose != nil {
+			r.deps.Propose(pos, action)
+			slog.Info("reconciler: routed SL/TP adjustment to confirmation store",
+				"symbol", trig.Symbol, "trigger", trig.Type, "new_stop", action.NewStopLoss)
 			continue
 		}
 		id := r.deps.Queue.Enqueue(pos, trig, action)

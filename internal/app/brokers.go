@@ -504,3 +504,13 @@ func collectMinLotsForVenue(venues []config.VenueConfig, target domain.Venue) ma
 	}
 	return out
 }
+
+// noopProtectiveLookup satisfies positionproposal.ProtectiveLookup for brokers
+// that don't expose exchange-side protective orders (the paper matcher). It
+// reports no existing protection, so ApplyAdjustment simply places a fresh
+// bracket without a preceding cancel.
+type noopProtectiveLookup struct{}
+
+func (noopProtectiveLookup) ProtectiveBracket(domain.Symbol) (domain.BracketResponse, bool) {
+	return domain.BracketResponse{}, false
+}

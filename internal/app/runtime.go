@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/azhar/cerebro/internal/adapter/llm"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/adapter/postgres"
 	rediscache "github.com/azhar/cerebro/internal/adapter/redis"
 	"github.com/azhar/cerebro/internal/adapter/telegram"
@@ -608,6 +609,72 @@ func (a *App) runRuntime(ctx context.Context) error {
 	// for the workers is shared so "is this position protected?" is consistent.
 	if a.cfg.PositionManager.Enabled {
 		pmCfg := a.cfg.PositionManager
+
+		// ── SL/TP adjustment proposals (web-confirmed, no timeout) ───────────
+		// One global store. Confirmed proposals dispatch by venue to the
+		// concrete broker: PlaceBracket/CancelBracket come from port.Broker,
+		// ProtectiveBracket only from the concrete futures/spot broker (paper
+		// matchers fall back to a no-op lookup — paper positions are never
+		// externally protected anyway). bracketTracker records the new bracket.
+		applyByVenue := make(map[domain.Venue]positionproposal.ApplyFunc, len(activeVenues))
+		for _, venue := range activeVenues {
+			broker := brokersByVenue[venue]
+			var look positionproposal.ProtectiveLookup = noopProtectiveLookup{}
+			if pl, ok := broker.(positionproposal.ProtectiveLookup); ok {
+				look = pl
+			}
+			applyByVenue[venue] = positionproposal.ApplyAdjustment(broker, look, bracketTracker)
+		}
+		var proposalStore *positionproposal.Store
+		proposalStore = positionproposal.NewStore(
+			func(ctx context.Context, p positionproposal.Proposal) error {
+				apply, ok := applyByVenue[p.Venue]
+				if !ok {
+					return fmt.Errorf("proposal apply: no broker for venue %s", p.Venue)
+				}
+				return apply(ctx, p)
+			},
+			func() { uiSink.SendProposals(proposalStore.Pending()) },
+		)
+		proposalStore.SetPositionExists(func(sym domain.Symbol) bool {
+			for _, p := range collectPositions(gctx, brokersByVenue) {
+				if p.Symbol == sym {
+					return true
+				}
+			}
+			return false
+		})
+		if webServer != nil {
+			webServer.SetProposalController(proposalStore)
+		}
+		// Prune proposals whose position has closed (the only automatic removal —
+		// proposals never expire on a confirm-window clock).
+		g.Go(func() error {
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-gctx.Done():
+					return nil
+				case <-t.C:
+					proposalStore.Prune()
+				}
+			}
+		})
+		proposeFn := func(pos domain.Position, action domain.ManagedAction) {
+			proposalStore.Propose(positionproposal.Proposal{
+				Symbol:       pos.Symbol,
+				Venue:        pos.Venue,
+				Side:         pos.Side,
+				Quantity:     pos.Quantity,
+				CurrentStop:  pos.StopLoss,
+				CurrentTP:    pos.TakeProfit1,
+				ProposedStop: action.NewStopLoss,
+				ProposedTP:   pos.TakeProfit1, // tighten_stop changes only the stop; carry TP unchanged
+				Reasoning:    action.Reason,
+			})
+		}
+
 		biasFor := func(sym domain.Symbol) (domain.BiasScore, bool) {
 			raw, err := cache.Get(gctx, fmt.Sprintf("bias:%s", sym))
 			if err != nil || raw == nil {
@@ -684,6 +751,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 				Queue:      queue,
 				Bias:       biasFor,
 				BiasReason: biasReason,
+				Propose:    proposeFn,
 			})
 			g.Go(func() error {
 				return recon.Run(gctx)
