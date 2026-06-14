@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	agentpkg "github.com/azhar/cerebro/internal/agent"
-	agenttools "github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/adapter/binance/futures"
 	"github.com/azhar/cerebro/internal/adapter/binance/spot"
+	agentpkg "github.com/azhar/cerebro/internal/agent"
+	agenttools "github.com/azhar/cerebro/internal/agent/tools"
 	"github.com/azhar/cerebro/internal/config"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/execution"
@@ -64,6 +64,59 @@ type strategyCandidate struct {
 	cfg  config.StrategyConfig
 }
 
+// enabledStrategySet returns the set of strategy names that are
+// `enabled: true` in strategies.yaml. Used by the discovery planner so
+// the matcher only suggests presets the operator has actually opted in
+// to (including yaml-only variants like funding_arb / squeeze_fade
+// that don't have a Go implementation but can still be advised on).
+func enabledStrategySet(cfg config.StrategiesConfig) map[domain.StrategyName]bool {
+	out := make(map[domain.StrategyName]bool, len(cfg.Strategies))
+	for _, sc := range cfg.Strategies {
+		if sc.Enabled {
+			out[sc.Name] = true
+		}
+	}
+	return out
+}
+
+// runStandalonePlanner ticks the discovery + planner pipeline without
+// any LLM dependency. Used in demo / paper mode when no LLM key is
+// configured, so the operator still gets Telegram trade-plan reports.
+//
+// The loop runs once immediately on startup, then every `interval`.
+// Cancelling ctx returns cleanly.
+func runStandalonePlanner(
+	ctx context.Context,
+	discovery *agentpkg.Discovery,
+	planner *agentpkg.DiscoveryPlanner,
+	interval time.Duration,
+	ttl time.Duration,
+) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	runOnce := func() {
+		cands, err := discovery.Candidates(ctx)
+		if err != nil {
+			slog.Warn("standalone planner: discovery failed", "error", err)
+			return
+		}
+		plans := planner.Run(ctx, cands, ttl)
+		slog.Info("standalone planner: cycle complete",
+			"candidates", len(cands), "plans", len(plans))
+	}
+
+	runOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			runOnce()
+		}
+	}
+}
+
 // runStrategyEngine evaluates every strategy against every incoming candle,
 // routes approved signals through the risk gate, sizes positions, and dispatches
 // order intents to the execution router.
@@ -75,6 +128,7 @@ func runStrategyEngine(
 	gate *risk.Gate,
 	brokers map[domain.Venue]port.Broker,
 	env domain.Environment,
+	llmCfg config.LLMConfig,
 	router *execution.Router,
 	symbolMeta map[domain.Symbol]symbolMeta,
 	tuiRunner *tui.Runner,
@@ -149,33 +203,48 @@ func runStrategyEngine(
 
 				// Risk Agent evaluation (optional — only when LLM is wired).
 				// When active, the agent handles sizing and routing via its tools.
+				// On LLM error, `technical_only_fallback` can opt the signal
+				// into the deterministic path below with a reduced size.
 				// The deterministic path below is the fallback when no LLM is available.
+				techOnlyEngaged := false
 				if agentRuntime != nil {
 					riskTools := toolReg.ForAgentWithDefs("risk")
 					riskAgent := agentpkg.NewRiskAgentWithPerf(agentRuntime, riskTools, trades)
 					approved, err := riskAgent.Evaluate(ctx, sig, positions)
-					if err != nil {
+					switch {
+					case err != nil && llmCfg.TechnicalOnlyFallback:
+						metrics.signalsTechOnlyFallback.Add(1)
+						techOnlyEngaged = true
+						slog.Warn("risk agent failed; falling back to technical-only sizing",
+							"strategy", sig.Strategy, "symbol", sig.Symbol,
+							"size_multiplier", llmCfg.TechnicalOnlySizeMultiplier,
+							"error", err)
+						pushTUI(tuiRunner, fmt.Sprintf("TECH-ONLY %s %s — LLM failed, sizing×%.2f",
+							sig.Symbol, sig.Strategy, llmCfg.TechnicalOnlySizeMultiplier))
+						// fall through to deterministic path
+					case err != nil:
 						metrics.signalsRejectedByRisk.Add(1)
 						slog.Warn("risk agent rejected signal (error)",
 							"strategy", sig.Strategy, "symbol", sig.Symbol, "error", err)
 						pushTUI(tuiRunner, fmt.Sprintf("RISK-AGENT-ERROR %s %s: %v",
 							sig.Symbol, sig.Strategy, err))
 						continue
-					}
-					if !approved {
+					case !approved:
 						metrics.signalsRejectedByRisk.Add(1)
 						slog.Info("risk agent rejected signal",
 							"strategy", sig.Strategy, "symbol", sig.Symbol)
 						pushTUI(tuiRunner, fmt.Sprintf("RISK-AGENT-REJECT %s %s",
 							sig.Symbol, sig.Strategy))
 						continue
+					default:
+						slog.Info("risk agent approved signal",
+							"strategy", sig.Strategy, "symbol", sig.Symbol)
+						continue // LLM tools handled routing
 					}
-					slog.Info("risk agent approved signal",
-						"strategy", sig.Strategy, "symbol", sig.Symbol)
-					continue
 				}
 
-				// Deterministic fallback: no LLM available.
+				// Deterministic path: runs when no LLM is wired OR when
+				// technical-only fallback engaged above.
 				meta, ok := symbolMeta[sig.Symbol]
 				if !ok {
 					metrics.orderRouteErrors.Add(1)
@@ -184,6 +253,24 @@ func runStrategyEngine(
 					continue
 				}
 				qty := computeQuantity(sig, c.Close, s.cfg, symbolMeta)
+				if techOnlyEngaged {
+					qty = applyTechOnlyMultiplier(qty, llmCfg)
+				}
+
+				// Derive protective SL / TP levels from the strategy config
+				// so the broker can attach a server-side bracket after
+				// entry. The same SL value is used for sizing, so the pair
+				// is consistent by construction.
+				entryPrice := c.Close
+				sl := deriveStopLoss(sig.Side, entryPrice, s.cfg)
+				tp1 := deriveFirstTakeProfit(sig.Side, entryPrice, sl, s.cfg)
+				scaleOutPct := firstTPScaleOutPct(s.cfg)
+
+				orderType, limitPx, stopPx := deriveEntryOrder(sig.Side, entryPrice, s.cfg, meta)
+				tif := s.cfg.TimeInForce
+				if tif == "" {
+					tif = domain.TIFGTC
+				}
 
 				intent := domain.OrderIntent{
 					ID:            uuid.New().String(),
@@ -191,10 +278,24 @@ func runStrategyEngine(
 					Symbol:        sig.Symbol,
 					Venue:         meta.venue,
 					Side:          sig.Side,
+					OrderType:     orderType,
 					Quantity:      qty,
+					LimitPrice:    limitPx,
+					StopPrice:     stopPx,
+					TIF:           tif,
+					StopLoss:      sl,
+					TakeProfit1:   tp1,
+					ScaleOutPct:   scaleOutPct,
 					Strategy:      sig.Strategy,
 					Environment:   env,
 					CreatedAt:     time.Now().UTC(),
+				}
+				// Futures-only fields: carry leverage/positionSide through
+				// from the symbol config when the venue is futures.
+				if meta.venue == domain.VenueBinanceFutures {
+					intent.Leverage = meta.cfg.Leverage
+					// PositionSide left as zero (BOTH / one-way mode);
+					// hedge-mode support is a future extension.
 				}
 				resp, err := router.Route(ctx, intent, meta.venue)
 				if err != nil {
@@ -383,6 +484,117 @@ func roundToLotSize(qty, step decimal.Decimal) decimal.Decimal {
 	return qty.Div(step).Floor().Mul(step)
 }
 
+// applyTechOnlyMultiplier shrinks a position size when the LLM risk agent
+// failed and technical-only fallback is active. The multiplier is applied
+// only when it's a sensible reduction (0 < m < 1). Values <=0 or >=1 are
+// treated as "no adjustment" so that a misconfigured or unset multiplier
+// doesn't silently zero out the trade or amplify it.
+func applyTechOnlyMultiplier(qty decimal.Decimal, llmCfg config.LLMConfig) decimal.Decimal {
+	if !llmCfg.TechnicalOnlyFallback {
+		return qty
+	}
+	m := llmCfg.TechnicalOnlySizeMultiplier
+	if m <= 0 || m >= 1 {
+		return qty
+	}
+	return qty.Mul(decimal.NewFromFloat(m))
+}
+
+// deriveFirstTakeProfit computes the TP1 price from the strategy's first
+// TakeProfitLevel. TP is defined as a multiple of the SL distance (R:R
+// ratio), so risk is always quantised against the protective stop and the
+// paper/live bracket agrees with the sizing math.
+//
+// Returns zero when TP levels are not configured, which disables the TP leg
+// of the broker bracket.
+func deriveFirstTakeProfit(side domain.Side, entry, stop decimal.Decimal, sc config.StrategyConfig) decimal.Decimal {
+	if len(sc.TakeProfitLevels) == 0 {
+		return decimal.Zero
+	}
+	rr := sc.TakeProfitLevels[0].RRRatio
+	if rr <= 0 {
+		return decimal.Zero
+	}
+	if stop.IsZero() || entry.IsZero() {
+		return decimal.Zero
+	}
+	slDist := entry.Sub(stop).Abs()
+	tpDist := slDist.Mul(decimal.NewFromFloat(rr))
+	if side == domain.SideBuy {
+		return entry.Add(tpDist)
+	}
+	return entry.Sub(tpDist)
+}
+
+// firstTPScaleOutPct returns the fractional scale-out for TP1 (0–1 range).
+// A zero value means "close the full position at TP1". This drives the
+// client-side Monitor's partial-close behaviour; the server bracket always
+// closes the full position.
+func firstTPScaleOutPct(sc config.StrategyConfig) float64 {
+	if len(sc.TakeProfitLevels) == 0 {
+		return 0
+	}
+	pct := sc.TakeProfitLevels[0].ScaleOutPct
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 1
+	}
+	return pct / 100
+}
+
+// deriveEntryOrder picks the entry OrderType, LimitPrice and StopPrice for
+// the intent based on the strategy configuration. When OrderType is LIMIT
+// or STOP_LIMIT, we use meta.cfg.TickSize and sc.LimitOffsetPips to push
+// the limit slightly inside the last close to improve fill probability.
+//
+// Unknown or zero OrderType defaults to MARKET, which matches the previous
+// behaviour and is safe for strategies that have not yet adopted the new
+// config keys.
+func deriveEntryOrder(side domain.Side, close decimal.Decimal, sc config.StrategyConfig, meta symbolMeta) (domain.OrderType, decimal.Decimal, decimal.Decimal) {
+	switch sc.OrderType {
+	case domain.OrderTypeLimit:
+		return domain.OrderTypeLimit, limitPriceWithOffset(side, close, sc, meta), decimal.Zero
+	case domain.OrderTypeStopLimit:
+		// Stop-limit breakouts trigger above (buy) or below (sell) the
+		// current close. We use the configured offset as the trigger
+		// distance, and set the limit price equal to the trigger (price
+		// protection happens via the exchange's STOP logic).
+		trigger := stopPriceWithOffset(side, close, sc, meta)
+		limit := trigger
+		return domain.OrderTypeStopLimit, limit, trigger
+	default:
+		return domain.OrderTypeMarket, decimal.Zero, decimal.Zero
+	}
+}
+
+// limitPriceWithOffset offsets the entry limit by sc.LimitOffsetPips in the
+// direction that improves fill probability for the given side. For BUYs
+// this means bumping the limit up (we're willing to pay more than the last
+// close); for SELLs it means lowering the limit.
+//
+// "Pips" here is interpreted as tickSize units since our markets config
+// exposes tickSize, not a fixed $0.0001 convention.
+func limitPriceWithOffset(side domain.Side, close decimal.Decimal, sc config.StrategyConfig, meta symbolMeta) decimal.Decimal {
+	offsetTicks := decimal.NewFromFloat(sc.LimitOffsetPips)
+	tick := meta.cfg.TickSize
+	if tick.IsZero() {
+		tick = decimal.NewFromFloat(0.01)
+	}
+	delta := offsetTicks.Mul(tick)
+	if side == domain.SideBuy {
+		return close.Add(delta)
+	}
+	return close.Sub(delta)
+}
+
+// stopPriceWithOffset mirrors limitPriceWithOffset for stop triggers: buy
+// triggers above close, sell triggers below.
+func stopPriceWithOffset(side domain.Side, close decimal.Decimal, sc config.StrategyConfig, meta symbolMeta) decimal.Decimal {
+	return limitPriceWithOffset(side, close, sc, meta)
+}
+
 func deriveStopLoss(side domain.Side, entry decimal.Decimal, sc config.StrategyConfig) decimal.Decimal {
 	isBuy := side == domain.SideBuy
 
@@ -415,5 +627,80 @@ func deriveStopLoss(side domain.Side, entry decimal.Decimal, sc config.StrategyC
 			return entry.Mul(decimal.NewFromFloat(1).Sub(factor))
 		}
 		return entry.Mul(decimal.NewFromFloat(1).Add(factor))
+	}
+}
+
+// buildFlipEntryFn returns the EntryFn used by the position-manager flip path.
+// It opens a new gated, strategy-sized position in the requested direction
+// (the opposite of the position just closed). The full risk gate runs first;
+// a gate rejection returns an error so the executor leaves the position flat
+// rather than reversed-but-naked. Sizing uses a conservative default strategy
+// config (risk-% based), honouring the user's "strategy-sized flips" choice.
+func buildFlipEntryFn(
+	gate *risk.Gate,
+	router *execution.Router,
+	brokers map[domain.Venue]port.Broker,
+	symbolMeta map[domain.Symbol]symbolMeta,
+	env domain.Environment,
+) func(ctx context.Context, want domain.Position) error {
+	return func(ctx context.Context, want domain.Position) error {
+		meta, resolved, err := resolveRouteSymbol(want.Symbol, symbolMeta)
+		if err != nil {
+			return err
+		}
+
+		sig := domain.Signal{
+			CorrelationID: uuid.New().String(),
+			Strategy:      domain.StrategyName("position_manager_flip"),
+			Symbol:        resolved,
+			Side:          want.Side,
+			GeneratedAt:   time.Now().UTC(),
+		}
+		positions := collectPositions(ctx, brokers)
+		if gerr := gate.Check(ctx, sig, positions); gerr != nil {
+			return fmt.Errorf("flip entry risk gate: %w", gerr)
+		}
+
+		entry := want.CurrentPrice
+		if entry.IsZero() {
+			entry = want.EntryPrice
+		}
+		flipCfg := defaultFlipStrategyCfg()
+		qty := computeQuantity(sig, entry, flipCfg, symbolMeta)
+		sl := deriveStopLoss(want.Side, entry, flipCfg)
+		tp1 := deriveFirstTakeProfit(want.Side, entry, sl, flipCfg)
+
+		intent := domain.OrderIntent{
+			ID:            uuid.New().String(),
+			CorrelationID: sig.CorrelationID,
+			Symbol:        resolved,
+			Venue:         meta.venue,
+			Side:          want.Side,
+			OrderType:     domain.OrderTypeMarket,
+			Quantity:      qty,
+			StopLoss:      sl,
+			TakeProfit1:   tp1,
+			Strategy:      sig.Strategy,
+			Environment:   env,
+			CreatedAt:     time.Now().UTC(),
+		}
+		if meta.venue == domain.VenueBinanceFutures {
+			intent.Leverage = meta.cfg.Leverage
+		}
+		if _, err := router.Route(ctx, intent, meta.venue); err != nil {
+			return fmt.Errorf("flip entry route: %w", err)
+		}
+		return nil
+	}
+}
+
+// defaultFlipStrategyCfg returns conservative SL/TP/risk defaults for flip
+// re-entries when the originating strategy config is not in scope. 0.5% fixed
+// stop, 1.5 R:R take-profit, 0.5% account risk per trade.
+func defaultFlipStrategyCfg() config.StrategyConfig {
+	return config.StrategyConfig{
+		RiskPctPerTrade:  0.5,
+		StopLoss:         config.StopLossConfig{Type: domain.SLTypeFixedPct, FixedPct: 0.5},
+		TakeProfitLevels: []config.TPLevel{{RRRatio: 1.5, ScaleOutPct: 100}},
 	}
 }

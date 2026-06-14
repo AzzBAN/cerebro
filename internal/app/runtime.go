@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -481,6 +482,11 @@ func (a *App) runRuntime(ctx context.Context) error {
 
 	bracketTracker := execution.NewBracketTracker()
 
+	// pmQueues holds the per-venue action queues created when the position
+	// manager is enabled, so ChatOps /confirm and /reject can resolve an
+	// action ID to the queue that owns it.
+	pmQueues := make(map[domain.Venue]*execution.ActionQueue)
+
 	for _, venue := range activeVenues {
 		venue := venue
 		workerCh, ok := router.Channel(venue)
@@ -524,6 +530,103 @@ func (a *App) runRuntime(ctx context.Context) error {
 		g.Go(func() error {
 			return monitor.Run(gctx, hub)
 		})
+	}
+
+	// ── Position-lifecycle reconciler ──────────────────────────────────────────
+	// Job A (bracket guarantee + orphan sweep) is deterministic and runs for
+	// every active venue whenever position_manager.enabled is true. Job B
+	// (trigger detection → agent decision → action queue) additionally runs
+	// when the LLM agent runtime is available. The same bracketTracker created
+	// for the workers is shared so "is this position protected?" is consistent.
+	if a.cfg.PositionManager.Enabled {
+		pmCfg := a.cfg.PositionManager
+		biasFor := func(sym domain.Symbol) (domain.BiasScore, bool) {
+			raw, err := cache.Get(gctx, fmt.Sprintf("bias:%s", sym))
+			if err != nil || raw == nil {
+				return domain.BiasNeutral, false
+			}
+			var b domain.BiasResult
+			if json.Unmarshal(raw, &b) != nil {
+				return domain.BiasNeutral, false
+			}
+			return b.Score, true
+		}
+		biasReason := func(sym domain.Symbol) string {
+			raw, err := cache.Get(gctx, fmt.Sprintf("bias:%s", sym))
+			if err != nil || raw == nil {
+				return ""
+			}
+			var b domain.BiasResult
+			if json.Unmarshal(raw, &b) != nil {
+				return ""
+			}
+			return b.Reasoning
+		}
+		var decider execution.PositionDecider
+		if agentRuntime != nil {
+			decider = agentpkg.NewPositionManagerAgent(
+				agentRuntime, toolReg.ForAgentWithDefs("position_manager"), pmCfg)
+		}
+		flipEntry := buildFlipEntryFn(gate, router, brokersByVenue, symbolMeta, env)
+
+		for _, venue := range activeVenues {
+			venue := venue
+			executor := execution.NewActionExecutor(execution.ActionExecutorDeps{
+				Venue:   venue,
+				Broker:  brokersByVenue[venue],
+				Router:  router,
+				Tracker: bracketTracker,
+				Env:     env,
+				EntryFn: flipEntry,
+			})
+			queue := execution.NewActionQueue(pmCfg.ConfirmTimeoutSec, pmCfg.AutonomousOnTimeout, executor.Execute)
+			queue.SetPositionExists(func(sym domain.Symbol) bool {
+				for _, p := range positionsForVenue(gctx, brokersByVenue[venue], venue) {
+					if p.Symbol == sym {
+						return true
+					}
+				}
+				return false
+			})
+			// Tick the queue once per second so confirm-window timeouts fire.
+			g.Go(func() error {
+				t := time.NewTicker(time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-gctx.Done():
+						return nil
+					case <-t.C:
+						queue.Tick(gctx)
+					}
+				}
+			})
+			recon := execution.NewReconciler(execution.ReconcilerDeps{
+				Venue:      venue,
+				Broker:     brokersByVenue[venue],
+				Tracker:    bracketTracker,
+				Router:     router,
+				Env:        env,
+				IntervalMS: pmCfg.ReconcileIntervalMS,
+				Positions: func() []domain.Position {
+					return positionsForVenue(gctx, brokersByVenue[venue], venue)
+				},
+				Detector:   execution.NewTriggerDetector(pmCfg.TriggerDebounceSec, pmCfg.ProfitThresholdPct, pmCfg.NearTPSLPct, pmCfg.BiasFlipAgainst),
+				Decider:    decider,
+				Queue:      queue,
+				Bias:       biasFor,
+				BiasReason: biasReason,
+			})
+			g.Go(func() error {
+				return recon.Run(gctx)
+			})
+			// Expose the queue to ChatOps confirm/reject for this venue.
+			pmQueues[venue] = queue
+		}
+		slog.Info("position reconciler wired",
+			"venues", len(activeVenues), "job_b_enabled", decider != nil,
+			"confirm_timeout_sec", pmCfg.ConfirmTimeoutSec,
+			"autonomous_on_timeout", pmCfg.AutonomousOnTimeout)
 	}
 
 	// LLM agents (conditional)
