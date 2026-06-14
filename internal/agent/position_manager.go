@@ -183,8 +183,9 @@ func renderPMUserMsg(review domain.PositionReview) (string, error) {
 }
 
 // parsePMResponse converts the LLM's raw JSON output into a domain.ManagedAction.
-// LLM action names (HOLD / MOVE_STOP / PARTIAL_CLOSE / FLATTEN) are mapped to
-// the domain's ActionDecision constants.
+// LLM action names (HOLD / MOVE_STOP / PARTIAL_CLOSE / FLATTEN / FLIP) are
+// mapped to the domain's ActionDecision constants. FLIP closes the current
+// position and re-enters in the opposite direction (see ActionExecutor.flip).
 func parsePMResponse(raw string) (domain.ManagedAction, error) {
 	var resp pmRawResponse
 	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
@@ -204,6 +205,8 @@ func parsePMResponse(raw string) (domain.ManagedAction, error) {
 		action.NewStopLoss = decimal.NewFromFloat(resp.NewStop)
 	case "PARTIAL_CLOSE", "FLATTEN":
 		action.Decision = domain.ActionClose
+	case "FLIP":
+		action.Decision = domain.ActionFlip
 	default:
 		return domain.ManagedAction{}, fmt.Errorf("unknown pm action %q", resp.Action)
 	}

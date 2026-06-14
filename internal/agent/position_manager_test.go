@@ -42,8 +42,13 @@ func TestParsePMResponse(t *testing.T) {
 			wantDec: domain.ActionClose,
 		},
 		{
+			name:    "FLIP maps to ActionFlip",
+			raw:     `{"action":"FLIP","symbol":"BTCUSDT","reasoning":"decisive reversal","confidence":0.7}`,
+			wantDec: domain.ActionFlip,
+		},
+		{
 			name:    "unknown action returns error",
-			raw:     `{"action":"FLIP","symbol":"BTCUSDT","reasoning":"reversal"}`,
+			raw:     `{"action":"TELEPORT","symbol":"BTCUSDT","reasoning":"nonsense"}`,
 			wantErr: true,
 		},
 		{

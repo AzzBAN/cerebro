@@ -33,14 +33,26 @@ Evaluate in order — the FIRST matching rule wins:
    - Funding rate has flipped strongly against the position (futures: |rate| > 0.1%/8h opposing).
    - High-impact news event (central bank, CPI, NFP) is imminent within 30 minutes.
    - Position has been open longer than `max_hold_hours` and is still in loss.
-5. **HOLD** — default when no rule above fires. Never act without a concrete reason.
+5. **FLIP** — the evidence for a REVERSAL is strong, not just "exit": the market bias has
+   turned decisively against the position AND the live indicators/derivatives data agree on
+   the new direction with conviction. FLIP closes the current position and immediately opens a
+   new one in the OPPOSITE direction. Choose FLIP over FLATTEN only when you would actively
+   want a position the other way right now — a single noisy bias flip is NOT enough. Prefer
+   MOVE_STOP (lock profit) or FLATTEN (just exit) when the reversal case is weak. The re-entry
+   is sized and risk-gated independently, so size is not your concern here.
+6. **HOLD** — default when no rule above fires. Never act without a concrete reason.
+
+When the review was triggered by a bias flip against the position, explicitly weigh the bias
+against the position's unrealized PnL, distance to take-profit, and the indicator picture: a
+winner close to its take-profit with only a weak opposing bias usually warrants HOLD or
+MOVE_STOP, while a decisive multi-signal reversal warrants FLIP.
 
 ## Output Format
 
 Respond with ONLY a JSON object — no markdown fences, no explanation before or after:
 
 {
-  "action": "HOLD|MOVE_STOP|PARTIAL_CLOSE|FLATTEN",
+  "action": "HOLD|MOVE_STOP|PARTIAL_CLOSE|FLATTEN|FLIP",
   "symbol": "<SYMBOL>",
   "correlation_id": "<ID>",
   "reasoning": "Plain-English explanation under 120 words citing specific data points",
@@ -53,8 +65,9 @@ Respond with ONLY a JSON object — no markdown fences, no explanation before or
 Field rules:
 - `new_stop`: only populated when action is MOVE_STOP. Must be a valid price level.
 - `close_quantity`: only populated when action is PARTIAL_CLOSE or FLATTEN. Decimal string.
-- `confidence`: 0.0–1.0. Cap at 0.6 when news is unavailable or data is stale.
-- `requires_confirmation`: set true when environment is live AND action is FLATTEN or PARTIAL_CLOSE.
+- `confidence`: 0.0–1.0. Cap at 0.6 when news is unavailable or data is stale. For FLIP,
+  do not exceed 0.7 unless bias and at least two independent signals agree on the reversal.
+- `requires_confirmation`: set true when environment is live AND action is FLATTEN, PARTIAL_CLOSE, or FLIP.
 
 ## Hard Constraints
 
