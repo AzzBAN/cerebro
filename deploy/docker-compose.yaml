@@ -59,7 +59,7 @@ services:
         condition: service_healthy
     volumes:
       # Mount config directory (secrets.env is gitignored; provide externally).
-      - ../configs:/configs:ro
+      - ../configs:/configs
     environment:
       # Override Redis/Postgres URLs to point to container service names.
       REDIS_URL: redis://redis:6379
