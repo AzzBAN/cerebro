@@ -12,13 +12,13 @@ COPY web/ ./
 RUN npm run build
 
 # ── Stage 2: Module cache ─────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS deps
+FROM golang:1.26-alpine AS deps
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
 # ── Stage 3: Build Go Binary ──────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /build
 
 COPY go.mod go.sum ./
