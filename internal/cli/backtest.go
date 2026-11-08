@@ -29,10 +29,11 @@ func newBacktestCommand() *cobra.Command {
 		timeframe string
 		from      string
 		to        string
-		output    string
-		qty       float64
-		agentMode string
-		limit     int
+		output           string
+		qty              float64
+		agentMode        string
+		limit            int
+		maxPositionsFlag int
 	)
 
 	cmd := &cobra.Command{
@@ -200,11 +201,25 @@ Example:
 	}
 			sim.SetDefaultQuantity(orderQty)
 
+			maxPos := cfg.Risk.MaxOpenPositions
+			if maxPos <= 0 {
+				maxPos = 5
+			}
+			if maxPositionsFlag > 0 {
+				maxPos = maxPositionsFlag
+			}
+			maxPosSym := cfg.Risk.MaxOpenPositionsPerSymbol
+			if maxPosSym <= 0 {
+				maxPosSym = maxPos
+			}
+			if maxPositionsFlag > 0 {
+				maxPosSym = maxPositionsFlag
+			}
 			riskCfg := config.RiskConfig{
-				MaxDrawdownPct:            25.0,
-				MaxDailyLossPct:           10.0,
-				MaxOpenPositions:          5,
-				MaxOpenPositionsPerSymbol: 5,
+				MaxDrawdownPct:            cfg.Risk.MaxDrawdownPct,
+				MaxDailyLossPct:           cfg.Risk.MaxDailyLossPct,
+				MaxOpenPositions:          maxPos,
+				MaxOpenPositionsPerSymbol: maxPosSym,
 			}
 			gate := risk.NewGate(riskCfg, backtest.NewMemCache(), risk.NewCalendarBlackout())
 			gate.SetStartingEquity(decimal.NewFromInt(10_000))
@@ -340,6 +355,7 @@ Example:
 	cmd.Flags().Float64Var(&qty, "qty", 0, "order quantity in base asset (default 7.5)")
 	cmd.Flags().StringVar(&agentMode, "agent", "none", "risk agent decision mode: live (real LLM), smart (heuristic mock), none (technical rules only)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max number of candles to replay (0 = all)")
+	cmd.Flags().IntVar(&maxPositionsFlag, "max-positions", 0, "max open positions limit (default from app.yaml or 5)")
 
 	return cmd
 }

@@ -418,7 +418,7 @@ export function BacktestView() {
   const [from, setFrom] = useState("2026-01-01");
   const [to, setTo] = useState("2026-02-01");
   const [agentMode, setAgentMode] = useState("smart");
-
+  const [maxPositions, setMaxPositions] = useState(5);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -592,6 +592,7 @@ export function BacktestView() {
         from,
         to,
         agent_mode: agentMode,
+        max_positions: maxPositions,
       });
       setResult(res);
       setViewMode("results");
@@ -688,6 +689,19 @@ export function BacktestView() {
                 </option>
               ))}
             </select>
+          </div>
+
+          {/* Max Positions */}
+          <div className="flex items-center gap-1">
+            <span className="text-fg-dim">Max Pos:</span>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={maxPositions}
+              onChange={(e) => setMaxPositions(Math.max(1, parseInt(e.target.value) || 1))}
+              className="w-12 border border-border bg-bg px-1 py-0.5 text-fg outline-none focus:border-accent"
+            />
           </div>
         </div>
 

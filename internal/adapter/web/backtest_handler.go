@@ -25,7 +25,8 @@ type backtestRunRequest struct {
 	Timeframe string `json:"timeframe"`
 	From      string `json:"from"`
 	To        string `json:"to"`
-	AgentMode string `json:"agent_mode"` // "smart", "reject_all", "off"
+	AgentMode    string `json:"agent_mode"` // "smart", "reject_all", "off"
+	MaxPositions int    `json:"max_positions"`
 }
 
 type backtestCandleDTO struct {
@@ -156,11 +157,15 @@ func (s *Server) handleBacktestRun(w http.ResponseWriter, r *http.Request) {
 	sim.SetTradeStore(store)
 	sim.SetDefaultQuantity(decimal.NewFromFloat(1.0))
 
+	maxPos := 5
+	if req.MaxPositions > 0 {
+		maxPos = req.MaxPositions
+	}
 	riskCfg := config.RiskConfig{
 		MaxDrawdownPct:            25.0,
 		MaxDailyLossPct:           10.0,
-		MaxOpenPositions:          5,
-		MaxOpenPositionsPerSymbol: 5,
+		MaxOpenPositions:          maxPos,
+		MaxOpenPositionsPerSymbol: maxPos,
 	}
 	gate := risk.NewGate(riskCfg, backtest.NewMemCache(), risk.NewCalendarBlackout())
 	gate.SetStartingEquity(decimal.NewFromInt(10_000))

@@ -211,6 +211,7 @@ export interface BacktestRequest {
   from: string;
   to: string;
   agent_mode?: string;
+  max_positions?: number;
 }
 
 export interface BacktestCandle {
