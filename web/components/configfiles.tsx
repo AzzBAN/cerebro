@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   getConfigFiles,
   getConfigFile,
@@ -215,7 +215,7 @@ function MarketsManager({
   }
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-y-auto px-4 py-3 space-y-4">
+    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-4">
       {localError && (
         <div className="p-2.5 text-xs text-bear bg-bear/10 border border-bear/40 rounded flex items-center justify-between">
           <span>{localError}</span>
@@ -660,7 +660,8 @@ function RawYamlEditor({
 }) {
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [syntaxStatus, setSyntaxStatus] = useState<{ valid: boolean; error?: string } | null>(null);
-
+  const gutterRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lines = useMemo(() => content.split("\n"), [content]);
 
   const handleCopy = () => {
@@ -684,7 +685,7 @@ function RawYamlEditor({
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-bg">
       {/* Editor Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-panel border-b border-border text-xs">
+      <div className="shrink-0 flex items-center justify-between px-3 py-1.5 bg-panel border-b border-border text-xs">
         <div className="flex items-center gap-3 font-mono text-2xs text-fg-dim">
           <span>{lines.length} lines</span>
           <span>{content.length} bytes</span>
@@ -718,7 +719,15 @@ function RawYamlEditor({
       {/* Editor Textarea with line numbers */}
       <div className="flex-1 flex min-h-0 overflow-hidden font-mono text-xs">
         {/* Line numbers gutter */}
-        <div className="w-12 bg-panel/70 border-r border-border text-fg-dim/40 select-none py-3 px-2 text-right overflow-hidden leading-5">
+        <div
+          ref={gutterRef}
+          onWheel={(e) => {
+            if (textareaRef.current) {
+              textareaRef.current.scrollTop += e.deltaY;
+            }
+          }}
+          className="w-12 bg-panel/70 border-r border-border text-fg-dim/40 select-none py-3 px-2 text-right overflow-hidden leading-5"
+        >
           {lines.map((_, i) => (
             <div key={i}>{i + 1}</div>
           ))}
@@ -726,10 +735,16 @@ function RawYamlEditor({
 
         {/* Text body */}
         <textarea
+          ref={textareaRef}
           value={content}
           onChange={(e) => {
             onChange(e.target.value);
             if (syntaxStatus) setSyntaxStatus(null);
+          }}
+          onScroll={(e) => {
+            if (gutterRef.current) {
+              gutterRef.current.scrollTop = e.currentTarget.scrollTop;
+            }
           }}
           spellCheck={false}
           className="flex-1 min-h-0 bg-bg text-fg p-3 leading-5 resize-none border-none outline-none overflow-y-auto selection:bg-accent/30 font-mono whitespace-pre"
@@ -1111,9 +1126,9 @@ export function ConfigFilesView() {
   const isCurrentDirty = viewMode === "form" ? isFormDirty : isRawDirty;
 
   return (
-    <div className="h-full flex flex-col bg-bg text-fg">
+    <div className="h-full flex flex-col min-h-0 overflow-hidden bg-bg text-fg">
       {/* Top Bar: File Tabs & View Mode */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-panel border-b border-border">
+      <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-panel border-b border-border">
         {/* File Tabs */}
         <div className="flex items-center gap-1.5">
           {files.map((fileName) => {
@@ -1188,7 +1203,7 @@ export function ConfigFilesView() {
 
       {/* Error & Success Alert Banners */}
       {error && (
-        <div className="mx-3 mt-2 px-3 py-2 bg-bear/15 border border-bear/60 rounded text-xs text-bear flex items-start justify-between">
+        <div className="shrink-0 mx-3 mt-2 px-3 py-2 bg-bear/15 border border-bear/60 rounded text-xs text-bear flex items-start justify-between">
           <div className="space-y-0.5">
             <span className="font-bold">Error saving config: </span>
             <span className="font-mono">{error}</span>
@@ -1202,7 +1217,7 @@ export function ConfigFilesView() {
         </div>
       )}
       {success && (
-        <div className="mx-3 mt-2 px-3 py-2 bg-bull/15 border border-bull/60 rounded text-xs text-bull flex items-center justify-between">
+        <div className="shrink-0 mx-3 mt-2 px-3 py-2 bg-bull/15 border border-bull/60 rounded text-xs text-bull flex items-center justify-between">
           <span>✓ {success}</span>
           <button
             onClick={() => setSuccess("")}
@@ -1235,7 +1250,7 @@ export function ConfigFilesView() {
         />
       ) : (
         /* Form View */
-        <div className="flex-1 flex flex-col min-h-0 overflow-y-auto px-4 py-3">
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
           {/* Search bar inside form */}
           <div className="mb-3 flex items-center justify-between gap-3 bg-panel p-2.5 rounded border border-border">
             <div className="flex items-center gap-2 text-xs text-fg-dim">
@@ -1280,7 +1295,7 @@ export function ConfigFilesView() {
       )}
 
       {/* Bottom Sticky Action Bar */}
-      <div className="flex items-center justify-between px-4 py-2 bg-panel border-t border-border">
+      <div className="shrink-0 flex items-center justify-between px-4 py-2 bg-panel border-t border-border">
         <div className="flex items-center gap-3">
           <span className="text-xs font-mono font-bold text-fg">
             {FILE_METADATA[activeFile]?.label ?? activeFile}
