@@ -191,6 +191,9 @@ func (s *Simulator) Run(ctx context.Context) ([]domain.Trade, error) {
 			action = "rejected"
 			verdict = "REJECTED"
 			rationale = "Agent declined signal"
+			if rReason := s.riskAgent.LastRejectReason(); rReason != "" {
+				rationale = rReason
+			}
 			if err != nil {
 				rationale = fmt.Sprintf("Agent evaluation error: %v", err)
 			}

@@ -48,19 +48,27 @@ var discoveryTagPattern = regexp.MustCompile(`\[unconfigured[^\]]*\]`)
 // It can approve, reject, or resize a signal.
 // On any failure, the caller's risk gate fails closed (signal rejected).
 type RiskAgent struct {
+	mu             sync.RWMutex
 	runtime        *Runtime
 	tools          map[string]port.Tool
 	trades         port.TradeStore
 	cache          port.Cache
 	configuredSyms []domain.Symbol // routable symbols from markets.yaml
 	// quotes is an optional live-quote source (typically *marketdata.Hub).
-	// When non-nil the agent's user message is enriched with the latest
-	// Last/Mid price for the signal symbol so the LLM can compute a
+	// When non-nil, the agent's user message is enriched with the latest
+	// Last/Mid price for the signal symbol so the LLM can compute
 	// stop_loss in absolute terms instead of guessing.
-	quotes  QuoteSource
-	balance BalanceSource
+	quotes           QuoteSource
+	balance          BalanceSource
+	lastRejectReason string
 }
 
+// LastRejectReason returns the reason supplied to reject_signal on the latest evaluation.
+func (r *RiskAgent) LastRejectReason() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastRejectReason
+}
 // SetBalanceSource attaches an account balance source so the user message includes equity and drawdown.
 func (r *RiskAgent) SetBalanceSource(b BalanceSource) { r.balance = b }
 
@@ -145,7 +153,10 @@ func (r *RiskAgent) Evaluate(ctx context.Context, sig domain.Signal, positions [
 
 	result := r.runtime.Invoke(ctx, domain.AgentRisk, systemPrompt, userMsg, wrapped, "risk_evaluation",
 		"Evaluating risk for signal")
-	routed, rejected := rec.outcome()
+	routed, rejected, rejectReason := rec.outcome()
+	r.mu.Lock()
+	r.lastRejectReason = rejectReason
+	r.mu.Unlock()
 	if result.Err != nil {
 		if routed {
 			slog.Warn("risk agent: invocation error after order routed; treating as already routed",
@@ -181,9 +192,10 @@ func (r *RiskAgent) Evaluate(ctx context.Context, sig domain.Signal, positions [
 // decision — a tool that errored (bad args, route failure) is surfaced to the
 // model as an observation and does not represent a committed outcome.
 type decisionRecorder struct {
-	mu       sync.Mutex
-	routed   bool // approve_and_route_order or resize_and_route_order succeeded
-	rejected bool // reject_signal succeeded
+	mu           sync.Mutex
+	routed       bool   // approve_and_route_order or resize_and_route_order succeeded
+	rejected     bool   // reject_signal succeeded
+	rejectReason string // reason argument passed to reject_signal
 }
 
 // wrap returns a copy of tools with the three decision tools instrumented to
@@ -196,9 +208,9 @@ func (d *decisionRecorder) wrap(in map[string]port.Tool) map[string]port.Tool {
 	for name, t := range in {
 		switch name {
 		case "approve_and_route_order", "resize_and_route_order":
-			out[name] = d.record(t, &d.routed)
+			out[name] = d.record(t, &d.routed, nil)
 		case "reject_signal":
-			out[name] = d.record(t, &d.rejected)
+			out[name] = d.record(t, &d.rejected, &d.rejectReason)
 		default:
 			out[name] = t
 		}
@@ -207,13 +219,21 @@ func (d *decisionRecorder) wrap(in map[string]port.Tool) map[string]port.Tool {
 }
 
 // record wraps a single tool so that a successful handler call sets *flag.
-func (d *decisionRecorder) record(t port.Tool, flag *bool) port.Tool {
+func (d *decisionRecorder) record(t port.Tool, flag *bool, reasonTarget *string) port.Tool {
 	orig := t.Handler
 	t.Handler = func(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
 		res, err := orig(ctx, input)
 		if err == nil {
 			d.mu.Lock()
 			*flag = true
+			if reasonTarget != nil {
+				var args struct {
+					Reason string `json:"reason"`
+				}
+				if jErr := json.Unmarshal(input, &args); jErr == nil && args.Reason != "" {
+					*reasonTarget = args.Reason
+				}
+			}
 			d.mu.Unlock()
 		}
 		return res, err
@@ -222,10 +242,10 @@ func (d *decisionRecorder) record(t port.Tool, flag *bool) port.Tool {
 }
 
 // outcome reports whether an order was routed and/or the signal was rejected.
-func (d *decisionRecorder) outcome() (routed, rejected bool) {
+func (d *decisionRecorder) outcome() (routed, rejected bool, rejectReason string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.routed, d.rejected
+	return d.routed, d.rejected, d.rejectReason
 }
 
 func truncate(s string, n int) string {
