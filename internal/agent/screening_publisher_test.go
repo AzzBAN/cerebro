@@ -21,11 +21,12 @@ func (noopCache) IncrBy(_ context.Context, _ string, _ int64, _ time.Duration) (
 }
 func (noopCache) Keys(_ context.Context, _ string) ([]string, error) { return nil, nil }
 func (noopCache) Exists(_ context.Context, _ string) (bool, error)   { return false, nil }
+func (noopCache) SetNX(_ context.Context, _ string, _ []byte, _ time.Duration) (bool, error) { return true, nil }
 
 // captureBias records every BiasResult sent to it so the test can assert.
 type captureBias struct {
-	mu     sync.Mutex
-	calls  []domain.BiasResult
+	mu    sync.Mutex
+	calls []domain.BiasResult
 }
 
 func (c *captureBias) SendBias(b domain.BiasResult) {

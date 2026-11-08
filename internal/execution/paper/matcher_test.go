@@ -28,6 +28,9 @@ func (s *stubTradeStore) SaveTrade(_ context.Context, t domain.Trade) error {
 func (s *stubTradeStore) TradesByWindow(_ context.Context, _, _ time.Time) ([]domain.Trade, error) {
 	return nil, nil
 }
+func (s *stubTradeStore) IntentsByWindow(_ context.Context, _, _ time.Time) ([]domain.OrderIntent, error) {
+	return nil, nil
+}
 
 func TestMatcher_PlaceOrder(t *testing.T) {
 	book := NewBook()

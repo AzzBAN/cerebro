@@ -42,8 +42,8 @@ export function fmtUsdCompact(s: string): string {
 }
 
 // signClass returns a tailwind text color class based on the numeric sign.
-export function signClass(s: string): string {
-  const n = Number(s);
+export function signClass(s: string | number): string {
+  const n = typeof s === "number" ? s : Number(s);
   if (!isFinite(n) || n === 0) return "text-fg";
   return n > 0 ? "text-bull" : "text-bear";
 }

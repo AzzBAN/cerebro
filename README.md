@@ -205,7 +205,7 @@ The **Fallback Chain** tries providers in order. On timeout, rate limit, or budg
 |------|-------------|-------------|
 | `get_market_data` | All | Real-time price, bid/ask, 24h change, volume from WebSocket feed |
 | `get_derivatives_data` | Screening | OI, funding rate, liquidations, long/short ratio, taker delta, CVD, fear & greed, basis |
-| `fetch_latest_news` | Screening | CryptoPanic news search by keyword |
+| `fetch_latest_news` | Screening | FinancialJuice news headlines |
 | `get_economic_events` | Screening | FairEconomy/ForexFactory economic calendar (GDP, CPI, NFP, FOMC) |
 | `get_active_positions` | Copilot | All open positions across all venues |
 | `query_agent_logs` | Copilot | Past agent invocation logs within a time window |
@@ -228,7 +228,7 @@ The **Fallback Chain** tries providers in order. On timeout, rate limit, or budg
 | Source | Data | API Key Required |
 |--------|------|-----------------|
 | CoinGlass | Open interest, funding rate, long/short ratio, liquidations, taker delta, CVD, fear & greed, basis | Yes |
-| CryptoPanic | Crypto news headlines with keyword search | Yes |
+| FinancialJuice | Crypto and macro news headlines (RSS) | No |
 | FairEconomy/ForexFactory | Economic calendar events (GDP, CPI, NFP, FOMC) | No |
 | FinancialJuice | Real-time financial news squawks (scraped via HTTP) | No |
 
@@ -408,7 +408,7 @@ cerebro/
 │   │   └── tools/               # Agent tool implementations
 │   ├── ingest/                  # External data sources
 │   │   ├── coinglass/           # Derivatives data (OI, funding, etc.)
-│   │   ├── news/                # CryptoPanic news feed
+│   │   ├── news/                # FinancialJuice news feed
 │   │   ├── calendar/            # FairEconomy/ForexFactory economic calendar
 │   │   └── scrape/              # FinancialJuice web scraper
 │   ├── watchdog/                # Boot reconciliation

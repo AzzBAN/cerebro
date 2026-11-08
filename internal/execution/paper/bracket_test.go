@@ -29,6 +29,9 @@ func (s *bracketStubStore) SaveTrade(_ context.Context, t domain.Trade) error {
 func (s *bracketStubStore) TradesByWindow(_ context.Context, _, _ time.Time) ([]domain.Trade, error) {
 	return s.trades, nil
 }
+func (s *bracketStubStore) IntentsByWindow(_ context.Context, _, _ time.Time) ([]domain.OrderIntent, error) {
+	return nil, nil
+}
 
 func bdec(s string) decimal.Decimal {
 	d, err := decimal.NewFromString(s)

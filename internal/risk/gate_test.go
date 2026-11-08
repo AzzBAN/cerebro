@@ -2,6 +2,7 @@ package risk
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +59,16 @@ func (s *stubCache) Exists(_ context.Context, key string) (bool, error) {
 	defer s.mu.RUnlock()
 	_, ok := s.data[key]
 	return ok, nil
+}
+
+func (s *stubCache) SetNX(_ context.Context, key string, val []byte, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		return false, nil
+	}
+	s.data[key] = val
+	return true, nil
 }
 
 func makeSignal(symbol domain.Symbol) domain.Signal {
@@ -297,3 +308,40 @@ func TestGate_Check_ContextCancellation(t *testing.T) {
 		t.Fatalf("cancelled context should not cause error in gate, got %v", err)
 	}
 }
+func TestGate_RejectsOpposingBiasWhenEnforced(t *testing.T) {
+	cache := newStubCache()
+	bias := domain.BiasResult{
+		Symbol: "BTC/USDT",
+		Score:  domain.BiasBullish,
+	}
+	bBytes, _ := json.Marshal(bias)
+	_ = cache.Set(context.Background(), "bias:BTC/USDT", bBytes, 0)
+
+	cfg := config.RiskConfig{
+		RequireBiasAlignment: true,
+	}
+	g := NewGate(cfg, cache, NewCalendarBlackout())
+
+	// SELL signal opposes Bullish bias (+1) => must reject
+	sellSig := domain.Signal{
+		Symbol:   "BTC/USDT",
+		Side:     domain.SideSell,
+		Strategy: "mean_reversion",
+	}
+	err := g.Check(context.Background(), sellSig, nil)
+	if err == nil {
+		t.Fatal("expected rejection for SELL signal opposing Bullish bias")
+	}
+
+	// BUY signal aligns with Bullish bias (+1) => must pass
+	buySig := domain.Signal{
+		Symbol:   "BTC/USDT",
+		Side:     domain.SideBuy,
+		Strategy: "mean_reversion",
+	}
+	err = g.Check(context.Background(), buySig, nil)
+	if err != nil {
+		t.Fatalf("expected BUY signal to pass with Bullish bias, got %v", err)
+	}
+}
+

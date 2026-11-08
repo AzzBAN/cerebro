@@ -86,7 +86,7 @@ func TestCopilot_FollowUp_IncludesPriorTurn(t *testing.T) {
 
 	second := llm.messageAt(1)
 	for _, want := range []string{
-		"what are my positions?",   // prior operator message
+		"what are my positions?",    // prior operator message
 		"You hold 2 BTC and 5 ETH.", // prior copilot reply
 		"which is bigger?",          // current message
 	} {

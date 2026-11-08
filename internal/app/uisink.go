@@ -44,6 +44,24 @@ func (m multiSink) SendBias(b domain.BiasResult) {
 	}
 }
 
+// opportunitySink is the optional capability a UI surface may implement to
+// receive ranked screening opportunities. The web dashboard implements it;
+// the TUI does not. multiSink fans out only to members that satisfy it, so
+// the feature is purely additive — no change to the uistate.Sink interface.
+type opportunitySink interface {
+	SendOpportunities(opps []domain.ScreeningOpportunity)
+}
+
+// SendOpportunities forwards the ranked opportunities to every member that
+// implements opportunitySink, skipping those (e.g. the TUI) that do not.
+func (m multiSink) SendOpportunities(opps []domain.ScreeningOpportunity) {
+	for _, s := range m {
+		if os, ok := s.(opportunitySink); ok {
+			os.SendOpportunities(opps)
+		}
+	}
+}
+
 func (m multiSink) SendMacro(s uistate.MacroSnapshot) {
 	for _, sink := range m {
 		sink.SendMacro(s)

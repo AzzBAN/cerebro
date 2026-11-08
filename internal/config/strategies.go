@@ -158,6 +158,18 @@ type VenueConfig struct {
 	Symbols  []SymbolConfig `yaml:"symbols"`
 }
 
+// LoadStrategiesRaw reads strategies.yaml and returns the RAW, pre-scaling
+// strategy config — exactly the values on disk, with venue/preset defaults
+// merged in but WITHOUT the aggressiveness dial applied.
+//
+// The web dashboard's edit form must source its editable values from here, not
+// from a loaded *Config (whose strategy values have already been scaled by
+// applyAggressiveness). Writing scaled values back to disk would double-scale
+// them on the next Load.
+func LoadStrategiesRaw(path string) (StrategiesConfig, error) {
+	return loadStrategies(path)
+}
+
 // loadStrategies supports both supported schema variants:
 // 1) list-style: { strategies: [ ... ] }
 // 2) preset-map style: { defaults: { ... }, mean_reversion: { ... }, ... }

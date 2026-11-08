@@ -17,8 +17,8 @@ func GetAccountBalance(brokers []port.Broker) port.Tool {
 				bal, err := broker.Balance(ctx)
 				if err != nil {
 					results = append(results, map[string]any{
-						"venue":  string(broker.Venue()),
-						"error":  err.Error(),
+						"venue": string(broker.Venue()),
+						"error": err.Error(),
 					})
 					continue
 				}

@@ -7,15 +7,18 @@ import (
 
 // ATR computes the Average True Range using Wilder's smoothing.
 type ATR struct {
-	period   int
+	period    int
 	prevClose decimal.Decimal
-	atr      decimal.Decimal
-	count    int
-	ready    bool
+	atr       decimal.Decimal
+	count     int
+	ready     bool
 }
 
 // NewATR creates an ATR calculator for the given period.
 func NewATR(period int) *ATR {
+	if period <= 0 {
+		period = 14
+	}
 	return &ATR{period: period}
 }
 

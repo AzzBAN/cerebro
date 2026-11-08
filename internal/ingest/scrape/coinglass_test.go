@@ -1,9 +1,12 @@
 package scrape
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
+	"github.com/chromedp/chromedp"
 	"github.com/shopspring/decimal"
 )
 
@@ -254,7 +257,7 @@ func TestIsCoinglassSupportedCoin(t *testing.T) {
 	}{
 		{"BTC", true},
 		{"ETH", true},
-		{"btc", true},  // case-insensitive
+		{"btc", true}, // case-insensitive
 		{"  SOL ", true},
 		{"XAU", false}, // gold synthetic — not on Coinglass
 		{"xag", false}, // silver
@@ -304,10 +307,10 @@ func TestParseLongShortCell(t *testing.T) {
 		{"0.98", 0.98, true},
 		{"", 0, false},
 		{"—", 0, false},
-		{"55.5%", 55.5 / 44.5, true},   // pct → ratio
-		{"50%", 50.0 / 50.0, true},     // 50% long = ratio 1.0
-		{"100%", 0, false},             // degenerate
-		{"0%", 0, false},               // degenerate
+		{"55.5%", 55.5 / 44.5, true}, // pct → ratio
+		{"50%", 50.0 / 50.0, true},   // 50% long = ratio 1.0
+		{"100%", 0, false},           // degenerate
+		{"0%", 0, false},             // degenerate
 		{"nonsense", 0, false},
 	}
 	for _, tc := range tests {
@@ -394,5 +397,51 @@ func TestParseLongShortDOM_Malformed(t *testing.T) {
 	got := parseLongShortDOM("not json", domain.Symbol("BTC/USDT"))
 	if got.GlobalRatio != 0 {
 		t.Errorf("malformed input must yield zero ratio, got %v", got.GlobalRatio)
+	}
+}
+
+func TestCoinglassScraper_TabLifecycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping browser integration test in short mode")
+	}
+	s, err := NewCoinglassScraper(10 * time.Second)
+	if err != nil {
+		t.Skipf("skipping: chrome not available: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Tab 1: run simple evaluate and close tab
+	tabCtx1, tabCancel1, err := s.tabContext(ctx)
+	if err != nil {
+		t.Fatalf("tabContext 1 failed: %v", err)
+	}
+	var res1 int
+	if err := chromedp.Run(tabCtx1, chromedp.Evaluate(`1 + 1`, &res1)); err != nil {
+		t.Fatalf("tab 1 run failed: %v", err)
+	}
+	if res1 != 2 {
+		t.Fatalf("expected 2, got %d", res1)
+	}
+	tabCancel1()
+
+	// Verify browser is still alive: Tab 2 must succeed on same browser process
+	if s.browserCtx == nil || s.browserCtx.Err() != nil {
+		t.Fatal("browserCtx was killed when tab 1 closed")
+	}
+
+	tabCtx2, tabCancel2, err := s.tabContext(ctx)
+	if err != nil {
+		t.Fatalf("tabContext 2 failed: %v", err)
+	}
+	defer tabCancel2()
+	var res2 int
+	if err := chromedp.Run(tabCtx2, chromedp.Evaluate(`2 + 2`, &res2)); err != nil {
+		t.Fatalf("tab 2 run failed: %v", err)
+	}
+	if res2 != 4 {
+		t.Fatalf("expected 4, got %d", res2)
 	}
 }

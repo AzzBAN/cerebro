@@ -1,7 +1,10 @@
 package futures
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
 	gobinancefutures "github.com/adshao/go-binance/v2/futures"
 	"github.com/azhar/cerebro/internal/domain"
@@ -227,6 +230,7 @@ func TestHandleUserDataMessage_NumericEventTime(t *testing.T) {
 		})
 	}
 }
+
 // position's signed notional and signed position amount. The futures account
 // endpoint exposes neither markPrice nor a clean current price, so it is
 // derived as |notional| / |positionAmt|. Regression guard for the bug where
@@ -288,10 +292,10 @@ func TestFuturesAccountPositionToDomain_CurrentPriceIsMark(t *testing.T) {
 
 func TestDetectProtectiveLevels_Futures(t *testing.T) {
 	tests := []struct {
-		name      string
-		orders    []*gobinancefutures.Order
-		wantStop  string // "" = expect no stop entry
-		wantTP    string // "" = expect no tp entry
+		name       string
+		orders     []*gobinancefutures.Order
+		wantStop   string // "" = expect no stop entry
+		wantTP     string // "" = expect no tp entry
 		wantStopID string
 		wantTPID   string
 	}{
@@ -388,3 +392,74 @@ func TestHandleAccountUpdate_CarriesExternallyProtected(t *testing.T) {
 		t.Errorf("SL/TP not preserved: got SL=%s TP=%s", got.StopLoss, got.TakeProfit1)
 	}
 }
+type mockTradeStore struct {
+	mu     sync.Mutex
+	trades []domain.Trade
+}
+
+func (m *mockTradeStore) SaveIntent(_ context.Context, _ domain.OrderIntent) error { return nil }
+func (m *mockTradeStore) UpdateIntentStatus(_ context.Context, _ string, _ domain.OrderStatus, _ string) error {
+	return nil
+}
+func (m *mockTradeStore) SaveTrade(_ context.Context, t domain.Trade) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trades = append(m.trades, t)
+	return nil
+}
+func (m *mockTradeStore) TradesByWindow(_ context.Context, _, _ time.Time) ([]domain.Trade, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.trades, nil
+}
+func (m *mockTradeStore) IntentsByWindow(_ context.Context, _, _ time.Time) ([]domain.OrderIntent, error) {
+	return nil, nil
+}
+
+func TestFuturesBroker_HandleOrderTradeUpdate_SavesTrade(t *testing.T) {
+	store := &mockTradeStore{}
+	b := NewFuturesBroker(nil, "demo")
+	b.SetTradeStore(store)
+
+	msg := []byte(`{
+		"e": "ORDER_TRADE_UPDATE",
+		"E": 1729340000000,
+		"o": {
+			"s": "BTCUSDT",
+			"c": "cerebro-123",
+			"S": "SELL",
+			"o": "MARKET",
+			"q": "0.029",
+			"ap": "82700.00",
+			"x": "TRADE",
+			"X": "FILLED",
+			"l": "0.029",
+			"L": "82700.00",
+			"n": "0.05",
+			"rp": "-2.50000000"
+		}
+	}`)
+
+	err := b.handleUserDataMessage(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(store.trades) != 1 {
+		t.Fatalf("expected 1 trade saved, got %d", len(store.trades))
+	}
+	tr := store.trades[0]
+	if tr.Symbol != "BTC/USDT-PERP" {
+		t.Errorf("expected BTC/USDT-PERP, got %s", tr.Symbol)
+	}
+	if tr.PnL == nil || !tr.PnL.Equal(decimal.RequireFromString("-2.50000000")) {
+		t.Errorf("expected PnL -2.5, got %v", tr.PnL)
+	}
+	if !tr.FillPrice.Equal(decimal.RequireFromString("82700.00")) {
+		t.Errorf("expected FillPrice 82700.00, got %s", tr.FillPrice)
+	}
+	if !tr.Quantity.Equal(decimal.RequireFromString("0.029")) {
+		t.Errorf("expected Quantity 0.029, got %s", tr.Quantity)
+	}
+}
+

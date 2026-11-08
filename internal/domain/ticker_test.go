@@ -16,7 +16,7 @@ func TestTickerSummary_IsNewListing(t *testing.T) {
 		{name: "zero time", listedAt: time.Time{}, maxAge: 30 * 24 * time.Hour, want: false},
 		{name: "zero maxAge", listedAt: now.Add(-24 * time.Hour), maxAge: 0, want: false},
 		{name: "within window", listedAt: now.Add(-24 * time.Hour), maxAge: 48 * time.Hour, want: true},
-		{name: "at edge", listedAt: now.Add(-48 * time.Hour), maxAge: 48 * time.Hour + time.Minute, want: true},
+		{name: "at edge", listedAt: now.Add(-48 * time.Hour), maxAge: 48*time.Hour + time.Minute, want: true},
 		{name: "outside window", listedAt: now.Add(-60 * 24 * time.Hour), maxAge: 30 * 24 * time.Hour, want: false},
 	}
 

@@ -31,6 +31,7 @@ func (paperStubCache) IncrBy(context.Context, string, int64, time.Duration) (int
 }
 func (paperStubCache) Keys(context.Context, string) ([]string, error) { return nil, nil }
 func (paperStubCache) Exists(context.Context, string) (bool, error)   { return false, nil }
+func (paperStubCache) SetNX(context.Context, string, []byte, time.Duration) (bool, error) { return true, nil }
 
 // TestMatcher_BracketExit_FeedsRealizedPnL proves the close path computes a
 // correctly-signed realised PnL and reports it to the PnLReporter. Before the

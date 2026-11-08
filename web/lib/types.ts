@@ -60,6 +60,17 @@ export interface Bias {
   cachedAt: number;
 }
 
+export interface Opportunity {
+  id: string;
+  symbol: string;
+  venue: string;
+  side: string; // "buy" | "sell"
+  confidence: number; // 0.0–1.0
+  reasoning: string;
+  avoided: boolean;
+  cachedAt: number;
+}
+
 export interface AgentRun {
   runId: string;
   agent: string;
@@ -100,6 +111,112 @@ export interface Budget {
   costBudgetUsd: number;
 }
 
+export interface StrategySummary {
+  name: string;
+  primaryTimeframe: string;
+  trendTimeframe: string;
+  riskPctPerTrade: number;
+  maxPositionSizePct: number;
+  dedupWindowSeconds: number;
+  confirmationCandles: number;
+  requireBiasAlignment: boolean;
+  orderType: string;
+  markets: number;
+}
+
+export interface RiskSummary {
+  maxDrawdownPct: number;
+  maxDailyLossPct: number;
+  maxExposurePct: number;
+  maxOpenPositions: number;
+  maxOpenPositionsPerVenue: number;
+  maxOpenPositionsPerSymbol: number;
+  minEquityToTrade: number;
+}
+
+export interface Config {
+  environment: string;
+  aggressiveness: string; // "conservative" | "balanced" | "aggressive"
+  strategies: StrategySummary[];
+  risk: RiskSummary;
+}
+
+// RawStrategy is one strategy's pre-scaling editable values (GET /api/strategies/raw).
+export interface RawStrategy {
+  name: string;
+  enabled: boolean;
+  riskPctPerTrade: number;
+  maxPositionSizePct: number;
+  dedupWindowSeconds: number;
+  confirmationCandles: number;
+  requireBiasAlignment: boolean;
+  stopLossFixedPct: number;
+  tp1RrRatio: number;
+}
+
+export interface RawStrategiesView {
+  aggressiveness: string;
+  strategies: RawStrategy[];
+}
+
+// StrategyEdit carries only the fields the user changed (all optional).
+export interface StrategyEdit {
+  name: string;
+  enabled?: boolean;
+  riskPctPerTrade?: number;
+  maxPositionSizePct?: number;
+  dedupWindowSeconds?: number;
+  confirmationCandles?: number;
+  requireBiasAlignment?: boolean;
+  stopLossFixedPct?: number;
+  tp1RrRatio?: number;
+}
+
+export interface EditRequest {
+  aggressiveness?: string;
+  strategies?: StrategyEdit[];
+}
+
+// ─── Config file editing ─────────────────────────────────────────────────────
+
+export interface ConfigFileDTO {
+  name: string;
+  content: string;
+}
+
+export interface ConfigFileSaveRequest {
+  content: string;
+}
+
+// ─── Config Form Types ───────────────────────────────────────────────────────
+
+export interface ConfigFormField {
+  name: string;
+  label: string;
+  type: string; // string, number, bool, select, text
+  value: string | number | boolean | null;
+  options?: string[]; // for select type
+  description?: string;
+  required?: boolean;
+  min?: number;
+  max?: number;
+  step?: number;
+  comment?: string;
+}
+
+export interface ConfigFormSection {
+  title: string;
+  description?: string;
+  key: string;
+  fields: ConfigFormField[];
+  sections?: ConfigFormSection[];
+}
+
+export interface ConfigFormSchema {
+  file: string;
+  sections: ConfigFormSection[];
+}
+
 export interface Snapshot {
   quotes: Quote[];
   positions: Position[];
@@ -107,10 +224,61 @@ export interface Snapshot {
   logs: LogLine[];
   agentRuns: AgentRun[];
   bias: Bias[];
+  opportunities: Opportunity[];
   macro: Macro | null;
   news: NewsItem[];
   budget: Budget | null;
   heartbeat: string;
+  config: Config | null;
+  recentIntents: OrderIntent[];
+  recentTrades: Trade[];
+}
+
+// OrderIntent is the JSON DTO for one row in the order-history intent log.
+export interface OrderIntent {
+  id: string;
+  correlationId: string;
+  symbol: string;
+  venue: string;
+  side: string;
+  orderType: string;
+  quantity: string;
+  limitPrice?: string;
+  stopPrice?: string;
+  stopLoss?: string;
+  takeProfit1?: string;
+  timeInForce?: string;
+  reduceOnly: boolean;
+  positionSide?: string;
+  leverage: number;
+  strategy: string;
+  environment: string;
+  status: string; // pending|submitted|filled|rejected|cancelled
+  createdAt: number;
+}
+
+// Trade is the JSON DTO for one closed/filled trade. pnl/closedAt are
+// present only once the position has fully closed.
+export interface Trade {
+  id: string;
+  intentId: string;
+  correlationId: string;
+  symbol: string;
+  side: string;
+  quantity: string;
+  fillPrice: string;
+  fees: string;
+  pnl?: string;
+  strategy: string;
+  venue: string;
+  closedAt?: number;
+  createdAt: number;
+}
+
+// History is the response shape of GET /api/history.
+export interface HistoryResponse {
+  intents: OrderIntent[];
+  trades: Trade[];
 }
 
 // Envelope is the WebSocket frame: a type tag + one payload.

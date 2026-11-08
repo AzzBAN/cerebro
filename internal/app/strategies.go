@@ -2,9 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/azhar/cerebro/internal/adapter/binance/futures"
@@ -38,10 +41,12 @@ func registerStrategies(cfg *config.Config) []strategyCandidate {
 			out = append(out, strategyCandidate{impl: strategy.NewTrendFollowing(sc), cfg: sc})
 		case "volatility_breakout":
 			out = append(out, strategyCandidate{impl: strategy.NewVolatilityBreakout(sc), cfg: sc})
+		case "scalping":
+			out = append(out, strategyCandidate{impl: strategy.NewScalping(sc), cfg: sc})
 		default:
 			slog.Warn("strategy preset not executable by runtime; skipping",
 				"name", sc.Name,
-				"hint", "only mean_reversion / trend_following / volatility_breakout are wired")
+				"hint", "only mean_reversion / trend_following / volatility_breakout / scalping are wired")
 		}
 	}
 
@@ -122,7 +127,7 @@ func runStandalonePlanner(
 func runStrategyEngine(
 	ctx context.Context,
 	hub *marketdata.Hub,
-	strategies []strategyCandidate,
+	strategiesPtr *atomic.Pointer[[]strategyCandidate],
 	dedup *strategy.DedupWindow,
 	gate *risk.Gate,
 	brokers map[domain.Venue]port.Broker,
@@ -137,12 +142,13 @@ func runStrategyEngine(
 	agentRuntime *agentpkg.Runtime,
 	toolReg *agenttools.Registry,
 	trades port.TradeStore,
+	configuredSymbols []domain.Symbol, // routable symbols from markets.yaml
 ) error {
 	// Warm up strategies with historical klines before the live loop starts.
-	warmupStrategies(ctx, strategies, kc, markets, symbolMeta)
+	warmupStrategies(ctx, *strategiesPtr.Load(), kc, markets, symbolMeta)
 
 	_, candles := hub.Subscribe()
-	slog.Info("strategy engine started", "strategies", len(strategies))
+	slog.Info("strategy engine started", "strategies", len(*strategiesPtr.Load()))
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,21 +160,36 @@ func runStrategyEngine(
 			metrics.candlesConsumedByStrategy.Add(1)
 			c := evt.Candle
 
-			slog.Debug("strategy engine candle",
-				"symbol", c.Symbol, "tf", c.Timeframe,
-				"close", c.Close.StringFixed(4),
-				"candles_total", metrics.candlesConsumedByStrategy.Load(),
-			)
-
-			if len(strategies) == 0 {
+			// Load live strategy set once per candle. The web dashboard
+			// may have hot-swapped strategies via strategyReloader since the last event.
+			liveStrategies := *strategiesPtr.Load()
+			if len(liveStrategies) == 0 {
 				continue
 			}
 
+			slog.Info("strategy engine candle received",
+				"symbol", c.Symbol, "timeframe", c.Timeframe,
+				"close", c.Close.StringFixed(6),
+				"candles_total", metrics.candlesConsumedByStrategy.Load(),
+				"strategies_count", len(liveStrategies),
+			)
+
 			positions := collectPositions(ctx, brokers)
 
-			for _, s := range strategies {
+			for _, s := range liveStrategies {
+				slog.Info("evaluating strategy",
+					"strategy", s.cfg.Name,
+					"symbol", c.Symbol,
+					"timeframe", c.Timeframe,
+					"strategy_timeframe", s.cfg.PrimaryTimeframe,
+				)
 				sig, fired := s.impl.OnCandle(ctx, c)
 				if !fired {
+					slog.Info("strategy did not fire",
+						"strategy", s.cfg.Name,
+						"symbol", c.Symbol,
+						"reason", "no entry conditions met",
+					)
 					continue
 				}
 				metrics.signalsFired.Add(1)
@@ -183,13 +204,44 @@ func runStrategyEngine(
 				pushTUI(uiSink, fmt.Sprintf("⚡ SIGNAL %s %s %s — %s",
 					sig.Side, sig.Symbol, sig.Strategy, sig.Reason))
 
-				if !dedup.Allow(sig) {
+				dedupWin := time.Duration(s.cfg.SignalDedupWindowSeconds) * time.Second
+				if !dedup.Allow(sig, dedupWin) {
 					metrics.signalsDeduped.Add(1)
-					slog.Debug("signal deduped (same symbol+strategy within window)",
-						"strategy", sig.Strategy, "symbol", sig.Symbol)
+					slog.Info("signal DEDUPED (same symbol+strategy within window)",
+						"strategy", sig.Strategy, "symbol", sig.Symbol,
+						"side", sig.Side, "dedup_window_seconds", s.cfg.SignalDedupWindowSeconds)
 					continue
 				}
+				slog.Info("signal passed dedup check",
+					"strategy", sig.Strategy, "symbol", sig.Symbol, "side", sig.Side)
 
+				// Per-strategy bias alignment check
+				if s.cfg.RequireBiasAlignment && gate != nil && gate.Cache() != nil {
+					biasKey := fmt.Sprintf("bias:%s", sig.Symbol)
+					if bBytes, err := gate.Cache().Get(ctx, biasKey); err == nil && len(bBytes) > 0 {
+						var bias domain.BiasResult
+						if err := json.Unmarshal(bBytes, &bias); err == nil {
+							if bias.Score > 0 && sig.Side == domain.SideSell {
+								metrics.signalsRejectedByRisk.Add(1)
+								slog.Warn("✗ SIGNAL rejected: strategy requires bias alignment (SELL opposes Bullish)",
+									"strategy", sig.Strategy, "symbol", sig.Symbol, "score", bias.Score)
+								pushTUI(uiSink, fmt.Sprintf("✗ BIAS-REJECT %s %s — SELL opposes Bullish bias", sig.Symbol, sig.Strategy))
+								continue
+							}
+							if bias.Score < 0 && sig.Side == domain.SideBuy {
+								metrics.signalsRejectedByRisk.Add(1)
+								slog.Warn("✗ SIGNAL rejected: strategy requires bias alignment (BUY opposes Bearish)",
+									"strategy", sig.Strategy, "symbol", sig.Symbol, "score", bias.Score)
+								pushTUI(uiSink, fmt.Sprintf("✗ BIAS-REJECT %s %s — BUY opposes Bearish bias", sig.Symbol, sig.Strategy))
+								continue
+							}
+						}
+					}
+				}
+
+				slog.Info("checking risk gate",
+					"strategy", sig.Strategy, "symbol", sig.Symbol, "side", sig.Side,
+					"open_positions", len(positions))
 				if err := gate.Check(ctx, sig, positions); err != nil {
 					metrics.signalsRejectedByRisk.Add(1)
 					slog.Warn("✗ SIGNAL rejected by risk gate",
@@ -199,6 +251,8 @@ func runStrategyEngine(
 						sig.Symbol, sig.Strategy, err))
 					continue
 				}
+				slog.Info("signal passed risk gate",
+					"strategy", sig.Strategy, "symbol", sig.Symbol, "side", sig.Side)
 
 				// Risk Agent evaluation (optional — only when LLM is wired).
 				// When active, the agent handles sizing and routing via its tools.
@@ -209,8 +263,18 @@ func runStrategyEngine(
 				if agentRuntime != nil {
 					riskTools := toolReg.ForAgentWithDefs("risk")
 					riskAgent := agentpkg.NewRiskAgentWithPerf(agentRuntime, riskTools, trades)
+					riskAgent.SetConfiguredSymbols(configuredSymbols)
+					riskAgent.SetQuoteSource(hub)
+					if gate != nil {
+						riskAgent.SetCache(gate.Cache())
+						riskAgent.SetBalanceSource(runtimeBalanceSource{brokers: brokers, gate: gate})
+					}
 					approved, err := riskAgent.Evaluate(ctx, sig, positions)
 					switch {
+					case errors.Is(err, agentpkg.ErrOrderAlreadyRouted):
+						slog.Warn("risk agent order already routed before invocation error; skipping fallback",
+							"strategy", sig.Strategy, "symbol", sig.Symbol)
+						continue
 					case err != nil && llmCfg.TechnicalOnlyFallback:
 						metrics.signalsTechOnlyFallback.Add(1)
 						techOnlyEngaged = true
@@ -320,6 +384,25 @@ func runStrategyEngine(
 			}
 		}
 	}
+}
+type runtimeBalanceSource struct {
+	brokers map[domain.Venue]port.Broker
+	gate    *risk.Gate
+}
+
+func (r runtimeBalanceSource) AccountEquity(ctx context.Context) (decimal.Decimal, float64, bool) {
+	total := decimal.Zero
+	for _, b := range r.brokers {
+		bal, err := b.Balance(ctx)
+		if err == nil {
+			total = total.Add(bal.TotalUSDT)
+		}
+	}
+	dd := 0.0
+	if r.gate != nil {
+		dd = r.gate.CurrentDrawdownPct()
+	}
+	return total, dd, true
 }
 
 // warmupStrategies fetches historical klines from Binance REST and feeds them

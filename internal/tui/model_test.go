@@ -1232,6 +1232,109 @@ func TestWatchFocus_MouseWheel(t *testing.T) {
 	}
 }
 
+func TestLogAutoScroll_SnapToBottomOnIdle(t *testing.T) {
+	m := New(100)
+	m.width = 120
+	m.height = 40
+	m.recalculateLayout()
+
+	// Fill with 50 log entries so scrolling has room.
+	for i := 0; i < 50; i++ {
+		m.appendLog(logEntry{ts: time.Now(), level: "INFO", text: fmt.Sprintf("line %d", i)})
+	}
+	m.clampLogScroll()
+
+	// User scrolls up with PgUp — should NOT snap back to bottom.
+	m.scrollLogUp(10)
+	if m.logScrollY == 0 {
+		t.Fatal("scrollLogUp should move viewport away from bottom")
+	}
+	if !m.logUserScrolledRecently() {
+		t.Fatal("after scrollLogUp, logUserScrolledRecently should be true")
+	}
+
+	// New log arrives while user is reading — viewport should stay put.
+	before := m.logScrollY
+	m.Update(SysLogMsg{At: time.Now(), Level: "INFO", Line: "new line"})
+	if m.logScrollY != before {
+		t.Errorf("new log while user reading: scrollY changed from %d to %d, want unchanged", before, m.logScrollY)
+	}
+
+	// Simulate 31s passing — idle window expires.
+	m.logLastUserScrollAt = time.Now().Add(-31 * time.Second)
+	if m.logUserScrolledRecently() {
+		t.Fatal("after 31s idle, logUserScrolledRecently should be false")
+	}
+
+	// New log arrives — should snap to bottom.
+	m.Update(SysLogMsg{At: time.Now(), Level: "INFO", Line: "new line after idle"})
+	if m.logScrollY != 0 {
+		t.Errorf("new log after idle: scrollY = %d, want 0 (bottom)", m.logScrollY)
+	}
+}
+
+func TestLogAutoScroll_AgentAndOrderMsgRespectIdle(t *testing.T) {
+	m := New(100)
+	m.width = 120
+	m.height = 40
+	m.recalculateLayout()
+
+	for i := 0; i < 50; i++ {
+		m.appendLog(logEntry{ts: time.Now(), level: "INFO", text: "line"})
+	}
+	m.clampLogScroll()
+
+	// User scrolls up.
+	m.scrollLogUp(5)
+	before := m.logScrollY
+
+	// Agent log arrives while reading — should not snap.
+	m.Update(AgentLogMsg{Line: "agent reasoning"})
+	if m.logScrollY != before {
+		t.Errorf("agent log while reading: scrollY changed from %d to %d", before, m.logScrollY)
+	}
+
+	// Order event arrives while reading — should not snap.
+	m.Update(OrderMsg{Line: "order filled"})
+	if m.logScrollY != before {
+		t.Errorf("order msg while reading: scrollY changed from %d to %d", before, m.logScrollY)
+	}
+
+	// Expire idle window.
+	m.logLastUserScrollAt = time.Now().Add(-31 * time.Second)
+
+	// Agent log after idle — should snap.
+	m.Update(AgentLogMsg{Line: "agent reasoning after idle"})
+	if m.logScrollY != 0 {
+		t.Errorf("agent log after idle: scrollY = %d, want 0", m.logScrollY)
+	}
+}
+
+func TestLogAutoScroll_MouseWheelStampsIdle(t *testing.T) {
+	m := New(100)
+	m.width = 120
+	m.height = 40
+	m.now = time.Now()
+	m.recalculateLayout()
+
+	for i := 0; i < 50; i++ {
+		m.appendLog(logEntry{ts: time.Now(), level: "INFO", text: "line"})
+	}
+	m.clampLogScroll()
+
+	// Mouse wheel up on log area — should stamp idle timer.
+	watchH := m.computedWatchH()
+	logY := 1 + 1 + watchH + 2
+	m.Update(tea.MouseMsg{Type: tea.MouseWheelUp, X: m.width - 10, Y: logY})
+
+	if !m.logUserScrolledRecently() {
+		t.Fatal("mouse wheel on log should stamp logLastUserScrollAt")
+	}
+	if m.logScrollY == 0 {
+		t.Fatal("mouse wheel up should scroll log away from bottom")
+	}
+}
+
 // TestQuoteMsgUpdatesPositionCurrentPrice asserts that incoming WS quote
 // events update the CurrentPrice of any open position with a matching
 // symbol in real-time, so the Active Positions panel reflects live PnL

@@ -90,3 +90,13 @@ func (c *Cache) Exists(ctx context.Context, key string) (bool, error) {
 	}
 	return n > 0, nil
 }
+
+// SetNX sets the value only if the key does not already exist.
+// Returns true if the key was set, false if it already existed.
+func (c *Cache) SetNX(ctx context.Context, key string, val []byte, ttl time.Duration) (bool, error) {
+	ok, err := c.client.SetNX(ctx, key, val, ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis setnx %q: %w", key, err)
+	}
+	return ok, nil
+}

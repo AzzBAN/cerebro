@@ -14,7 +14,13 @@ import (
 
 // Config is the merged, validated application configuration.
 type Config struct {
-	Environment     domain.Environment    `yaml:"environment"`
+	Environment domain.Environment `yaml:"environment"`
+
+	// Aggressiveness is a global dial (conservative|balanced|aggressive) that
+	// scales every enabled strategy's entry parameters at load time. Empty
+	// normalises to balanced (identity), so existing configs are unaffected.
+	Aggressiveness domain.Aggressiveness `yaml:"aggressiveness"`
+
 	Log             LogConfig             `yaml:"log"`
 	Engine          EngineConfig          `yaml:"engine"`
 	Risk            RiskConfig            `yaml:"risk"`
@@ -25,6 +31,7 @@ type Config struct {
 	ChatOps         ChatOpsConfig         `yaml:"chatops"`
 	TUI             TUIConfig             `yaml:"tui"`
 	Web             WebConfig             `yaml:"web"`
+	Run             RunConfig             `yaml:"run"`
 	Ingest          IngestConfig          `yaml:"ingest"`
 	Backtest        BacktestConfig        `yaml:"backtest"`
 	LogRetention    LogRetentionConfig    `yaml:"log_retention"`
@@ -73,6 +80,7 @@ type RiskConfig struct {
 	HaltModeOnDrawdown         domain.HaltMode `yaml:"halt_mode_on_drawdown"`
 	ResumeRequiresConfirmation bool            `yaml:"resume_requires_confirmation"`
 	MinEquityToTrade           float64         `yaml:"min_equity_to_trade"`
+	RequireBiasAlignment       bool            `yaml:"require_bias_alignment"`
 }
 
 type AgentConfig struct {
@@ -86,6 +94,24 @@ type AgentConfig struct {
 	LLM                       LLMConfig        `yaml:"llm"`
 	ToolPolicy                ToolPolicyConfig `yaml:"tool_policy"`
 	Discovery                 DiscoveryConfig  `yaml:"discovery"`
+	// RiskAgent governs the SL/TP defaults the route function falls back to
+	// when the LLM approves a trade without setting stop_loss itself. Without
+	// these defaults, an unprotected Cerebro entry would be force-closed by
+	// the reconciler within the flatten grace period. DefaultSLPct / DefaultTPPct
+	// are fractions (0.5 = 0.5%) applied to the live mark price to derive
+	// protective levels.
+	RiskAgent RiskAgentConfig `yaml:"risk_agent"`
+}
+
+// RiskAgentConfig configures the risk agent's behaviour and SL/TP safety net.
+type RiskAgentConfig struct {
+	// DefaultSLPct is the percentage distance below (buys) or above (sells)
+	// the live mark price at which the route function places a stop loss when
+	// the LLM-approved request omits one. Expressed as a percentage (0.5 = 0.5%).
+	// 0 disables the fallback.
+	DefaultSLPct float64 `yaml:"default_sl_pct"`
+	// DefaultTPPct mirrors DefaultSLPct for the take-profit side.
+	DefaultTPPct float64 `yaml:"default_tp_pct"`
 }
 
 // PositionManagerConfig controls the position-lifecycle reconciler and the
@@ -97,7 +123,9 @@ type PositionManagerConfig struct {
 	ConfirmTimeoutSec   int     `yaml:"confirm_timeout_sec"`
 	AutonomousOnTimeout bool    `yaml:"autonomous_on_timeout"`
 	TriggerDebounceSec  int     `yaml:"trigger_debounce_sec"`
+	FlattenGraceSec     int     `yaml:"flatten_grace_sec"`  // grace period before flattening unprotected positions (default 30)
 	LLMFailureAction    string  `yaml:"llm_failure_action"` // tighten_breakeven | hold
+	LLMTimeoutSec       int     `yaml:"llm_timeout_sec"`    // per-review LLM invocation deadline (default 120)
 	ProfitThresholdPct  float64 `yaml:"profit_threshold_pct"`
 	NearTPSLPct         float64 `yaml:"near_tp_sl_pct"`
 	BiasFlipAgainst     bool    `yaml:"bias_flip_against"`
@@ -118,10 +146,16 @@ func (p PositionManagerConfig) Validate() error {
 	if p.TriggerDebounceSec < 0 {
 		return fmt.Errorf("position_manager.trigger_debounce_sec must be >= 0")
 	}
+	if p.FlattenGraceSec < 0 {
+		return fmt.Errorf("position_manager.flatten_grace_sec must be >= 0")
+	}
 	switch p.LLMFailureAction {
 	case "tighten_breakeven", "hold":
 	default:
 		return fmt.Errorf("position_manager.llm_failure_action must be tighten_breakeven|hold, got %q", p.LLMFailureAction)
+	}
+	if p.LLMTimeoutSec < 0 {
+		return fmt.Errorf("position_manager.llm_timeout_sec must be >= 0")
 	}
 	if p.ProfitThresholdPct < 0 {
 		return fmt.Errorf("position_manager.profit_threshold_pct must be >= 0")
@@ -219,10 +253,29 @@ type WebConfig struct {
 	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
+// RunConfig controls how the engine presents itself at startup.
+type RunConfig struct {
+	// DefaultMode selects the terminal presentation used when the interactive
+	// startup menu is skipped — either because no TTY is attached (VPS /
+	// systemd / docker / nohup) or because --no-menu is passed. One of
+	// "tui" or "web". Empty defaults to "tui".
+	DefaultMode domain.RunMode `yaml:"default_mode"`
+
+	// Menu, when true, shows an interactive run-mode selection menu at startup
+	// whenever a TTY is attached. When false the menu is never shown and
+	// DefaultMode is used directly. Defaults to true.
+	Menu *bool `yaml:"menu"`
+}
+
+// ShowMenu reports whether the interactive startup menu should be offered.
+// It defaults to true when unset so a fresh config is interactive.
+func (r RunConfig) ShowMenu() bool {
+	return r.Menu == nil || *r.Menu
+}
+
 type IngestConfig struct {
 	CoinGlass        IngestSourceConfig `yaml:"coinglass"`
 	CoinGlassScraper IngestSourceConfig `yaml:"coinglass_scraper"`
-	CryptoPanic      CryptoPanicConfig  `yaml:"cryptopanic"`
 	Finnhub          IngestSourceConfig `yaml:"finnhub"`
 	FinancialJuice   IngestSourceConfig `yaml:"financialjuice"`
 }
@@ -231,18 +284,6 @@ type IngestSourceConfig struct {
 	Enabled         bool `yaml:"enabled"`
 	IntervalMinutes int  `yaml:"interval_minutes"`
 	TimeoutSeconds  int  `yaml:"timeout_seconds"`
-}
-
-// CryptoPanicConfig extends the shared ingest knobs with CryptoPanic-specific
-// tuning. Filter maps to the SPA's filter query parameter
-// (hot|rising|bullish|bearish|important|saved|lol). Currencies limits the
-// per-tick scrape to the given tickers (empty = global feed). MaxItems caps
-// how many posts we keep in the Redis cache per tick.
-type CryptoPanicConfig struct {
-	IngestSourceConfig `yaml:",inline"`
-	Filter             string   `yaml:"filter"`
-	Currencies         []string `yaml:"currencies"`
-	MaxItems           int      `yaml:"max_items"`
 }
 
 type BacktestConfig struct {
@@ -338,6 +379,11 @@ func Load(secretsPath, appPath, marketsPath, strategiesPath string) (*Config, er
 	//     normalizeSymbols so all symbol names are in canonical form.
 	resolveStrategyAssignments(cfg)
 
+	// 4c. Apply the global aggressiveness dial to every enabled strategy's
+	//     entry parameters. Runs before Validate so the validator sees the
+	//     post-scaling values (and can reject an unknown level).
+	applyAggressiveness(cfg)
+
 	// 5. Populate secrets from env
 	cfg.Secrets = loadSecrets()
 
@@ -415,6 +461,11 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 		errs.add("CLI flag environment (%q) does not match app.yaml environment (%q)", cliEnv, c.Environment)
 	}
 
+	// Aggressiveness, when set, must be a recognised level.
+	if err := validateAggressiveness(c.Aggressiveness); err != nil {
+		errs.add("%s", err.Error())
+	}
+
 	// Bias TTL must be >= screening interval
 	if c.Agent.BiasTTLMinutes < c.Agent.ScreeningIntervalMinutes {
 		errs.add("bias_ttl_minutes (%d) must be >= screening_interval_minutes (%d)",
@@ -467,6 +518,14 @@ func (c *Config) Validate(cliEnv domain.Environment) error {
 	// Risk guardrails: at least one limit must be set
 	if c.Risk.MaxDrawdownPct == 0 && c.Risk.MaxDailyLossPct == 0 {
 		errs.add("at least one of max_drawdown_pct or max_daily_loss_pct must be > 0 (no guardrails)")
+	}
+
+	// Run mode: default_mode, when set, must be a known RunMode.
+	switch c.Run.DefaultMode {
+	case "", domain.RunModeTUI, domain.RunModeWeb:
+		// ok — empty falls back to tui at resolution time.
+	default:
+		errs.add("run.default_mode (%q) must be one of \"tui\" or \"web\"", c.Run.DefaultMode)
 	}
 
 	// Web dashboard: when enabled it must have a bind address and an auth

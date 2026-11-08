@@ -22,10 +22,10 @@ import (
 type UniverseFeed struct {
 	client *gobinancefutures.Client
 
-	mu               sync.Mutex
-	infoCache        map[string]symbolInfo // key = exchange symbol (e.g. BTCUSDT)
-	infoFetchedAt    time.Time
-	exchangeInfoTTL  time.Duration
+	mu              sync.Mutex
+	infoCache       map[string]symbolInfo // key = exchange symbol (e.g. BTCUSDT)
+	infoFetchedAt   time.Time
+	exchangeInfoTTL time.Duration
 }
 
 type symbolInfo struct {

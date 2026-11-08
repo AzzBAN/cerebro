@@ -29,18 +29,18 @@ const DiscoveryCacheKey = "discovery:candidates"
 // service. It is cached in Redis as a JSON array under DiscoveryCacheKey
 // and consumed by the get_discovery_candidates tool and the TUI.
 type DiscoveryCandidate struct {
-	Symbol           domain.Symbol   `json:"symbol"`
-	Venue            domain.Venue    `json:"venue"`
+	Symbol           domain.Symbol       `json:"symbol"`
+	Venue            domain.Venue        `json:"venue"`
 	ContractType     domain.ContractType `json:"contract_type"`
-	QuoteAsset       string          `json:"quote_asset"`
-	LastPrice        decimal.Decimal `json:"last_price"`
-	PriceChangePct24 float64         `json:"price_change_pct_24h"`
-	QuoteVolume24h   decimal.Decimal `json:"quote_volume_24h"`
-	ListedAt         time.Time       `json:"listed_at,omitempty"`
-	IsNewListing     bool            `json:"is_new_listing"`
-	Tags             []string        `json:"tags,omitempty"`
-	Score            float64         `json:"score"`
-	FetchedAt        time.Time       `json:"fetched_at"`
+	QuoteAsset       string              `json:"quote_asset"`
+	LastPrice        decimal.Decimal     `json:"last_price"`
+	PriceChangePct24 float64             `json:"price_change_pct_24h"`
+	QuoteVolume24h   decimal.Decimal     `json:"quote_volume_24h"`
+	ListedAt         time.Time           `json:"listed_at,omitempty"`
+	IsNewListing     bool                `json:"is_new_listing"`
+	Tags             []string            `json:"tags,omitempty"`
+	Score            float64             `json:"score"`
+	FetchedAt        time.Time           `json:"fetched_at"`
 }
 
 // Discovery screens the full venue universe each cycle and caches a
@@ -79,8 +79,8 @@ func (d *Discovery) Candidates(ctx context.Context) ([]DiscoveryCandidate, error
 	maxAge := time.Duration(d.cfg.NewListingMaxAgeDays) * 24 * time.Hour
 
 	var (
-		mu     sync.Mutex
-		raw    []domain.TickerSummary
+		mu  sync.Mutex
+		raw []domain.TickerSummary
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	for _, rawVenue := range d.cfg.IncludeVenues {

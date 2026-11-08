@@ -45,9 +45,20 @@ var commandPermissions = map[string]Permission{
 // "/ask Why did you buy BTC?" → ("/ask", "Why did you buy BTC?")
 // Handles Telegram's "/cmd@BotName" format by stripping the @ suffix.
 func ParseCommand(raw string) (cmd, arg string) {
-	// Strip Telegram @botname suffix before matching.
-	if at := strings.Index(raw, "@"); at > 0 && raw[0] == '/' {
-		raw = raw[:at]
+	// Strip Telegram's "@botname" suffix, which only ever appears inside the
+	// command token itself (e.g. "/ask@CerebroBot ..."), never in the free-form
+	// argument. Bound the search to the first whitespace-delimited token so an
+	// "@" inside an /ask question (e.g. "/ask is BTC@60000 a good entry?" or
+	// "/ask email ops@desk.io") is preserved rather than truncating the query.
+	if raw != "" && raw[0] == '/' {
+		head, tail := raw, ""
+		if sp := strings.IndexByte(raw, ' '); sp >= 0 {
+			head, tail = raw[:sp], raw[sp:] // tail keeps its leading space
+		}
+		if at := strings.IndexByte(head, '@'); at > 0 {
+			head = head[:at]
+		}
+		raw = head + tail
 	}
 	for name := range commandPermissions {
 		if len(raw) >= len(name) && raw[:len(name)] == name {

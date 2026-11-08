@@ -2,9 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { Header, TabBar, StatusBar, type Tab } from "@/components/chrome";
-import { MarketWatch, Positions, BiasSignals, SystemLog } from "@/components/panels";
+import { MarketWatch, Positions, BiasSignals, Opportunities, SystemLog, ConfigPanel } from "@/components/panels";
 import { Macro, News, AgentRuns, AgentReasoning } from "@/components/agentpanels";
 import { Copilot, ChatOpsControls } from "@/components/copilot";
+import { ConfigFilesView } from "@/components/configfiles";
+import { History } from "@/components/History";
+import { RecentTrades } from "@/components/RecentTrades";
+import { BacktestView } from "@/components/BacktestView";
 import { useStore } from "@/lib/store";
 import { getState, getToken, setToken } from "@/lib/api";
 import { connectWS } from "@/lib/ws";
@@ -47,6 +51,9 @@ export default function Page() {
           </div>
         )}
         {tab === "agents" && <AgentsView />}
+        {tab === "history" && <History />}
+        {tab === "configs" && <ConfigFilesView />}
+        {tab === "backtest" && <BacktestView />}
       </main>
       <StatusBar />
     </div>
@@ -54,32 +61,41 @@ export default function Page() {
 }
 
 /** DashboardView: market watch on top, four columns below, agent strip. */
+/** DashboardView: Professional 2-column trading terminal layout. */
 function DashboardView() {
   return (
-    <div className="grid h-full grid-rows-[minmax(0,1.2fr)_minmax(0,1.6fr)_minmax(0,0.8fr)] gap-1">
-      <MarketWatch />
-      <div className="grid min-h-0 grid-cols-4 gap-1">
+    <div className="grid h-full grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)] gap-1">
+      {/* Left Column: Risk, Market Data & Execution */}
+      <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,1.3fr)_minmax(0,0.8fr)] gap-1">
         <Positions />
-        <BiasSignals />
-        <SystemLog />
-        <div className="grid min-h-0 grid-rows-2 gap-1">
+        <MarketWatch />
+        <RecentTrades />
+      </div>
+
+      {/* Right Column: Intelligence, Macro & System Telemetry */}
+      <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,0.9fr)_minmax(0,1.2fr)] gap-1">
+        <div className="grid min-h-0 grid-cols-2 gap-1">
+          <BiasSignals />
+          <Opportunities />
+        </div>
+        <div className="grid min-h-0 grid-cols-2 gap-1">
           <Macro />
           <News />
         </div>
-      </div>
-      <div className="grid min-h-0 grid-cols-2 gap-1">
-        <AgentRuns />
-        <AgentReasoning />
+        <SystemLog />
       </div>
     </div>
   );
 }
 
-/** MarketView: full watchlist with a narrow macro/news rail. */
+/** MarketView: full watchlist with opportunities below, and a narrow macro/news rail. */
 function MarketView() {
   return (
     <div className="grid h-full grid-cols-[minmax(0,5fr)_minmax(0,1fr)] gap-1">
-      <MarketWatch />
+      <div className="grid min-h-0 grid-rows-[minmax(0,2fr)_minmax(0,1fr)] gap-1">
+        <MarketWatch />
+        <Opportunities />
+      </div>
       <div className="grid min-h-0 grid-rows-2 gap-1">
         <Macro />
         <News />
@@ -96,8 +112,9 @@ function AgentsView() {
         <AgentRuns />
         <AgentReasoning />
       </div>
-      <div className="grid min-h-0 grid-rows-[minmax(0,3fr)_minmax(0,1fr)] gap-1">
+      <div className="grid min-h-0 grid-rows-[minmax(0,2fr)_minmax(0,1.2fr)_minmax(0,1fr)] gap-1">
         <Copilot />
+        <ConfigPanel />
         <ChatOpsControls />
       </div>
     </div>

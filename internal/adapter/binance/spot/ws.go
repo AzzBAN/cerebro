@@ -2,9 +2,11 @@ package spot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sync"
 	"time"
 
 	gobinance "github.com/adshao/go-binance/v2"
@@ -29,10 +31,12 @@ const (
 //
 // Kline streams are fully public — no API key or client auth is required.
 type KlinesWS struct {
-	hub       *marketdata.Hub
-	symbols   []domain.Symbol
-	timeframe domain.Timeframe
-	notifyFn  func(msg string) // optional; called after alertAfterFails consecutive failures
+	mu          sync.RWMutex
+	hub         *marketdata.Hub
+	symbols     []domain.Symbol
+	timeframe   domain.Timeframe
+	notifyFn    func(msg string) // optional; called after alertAfterFails consecutive failures
+	reconnectCh chan struct{}
 }
 
 // NewKlinesWS creates a Spot KlinesWS.
@@ -44,11 +48,70 @@ func NewKlinesWS(
 	notifyFn func(string),
 ) *KlinesWS {
 	return &KlinesWS{
-		hub:       hub,
-		symbols:   symbols,
-		timeframe: timeframe,
-		notifyFn:  notifyFn,
+		hub:         hub,
+		symbols:     symbols,
+		timeframe:   timeframe,
+		notifyFn:    notifyFn,
+		reconnectCh: make(chan struct{}, 1),
 	}
+}
+
+// UpdateSymbols updates the symbol list and triggers a reconnection to subscribe
+// to the new set of symbols. This allows dynamic subscription management at runtime.
+//
+// No-op (and no reconnect) if newSymbols is set-equal to the current
+// subscription. Without this guard the 5-minute discovery watcher would tear
+// down the WS on every poll even when nothing changed, surfacing as a stream
+// of "spot klines WS disconnected … error=context canceled" warnings that
+// eventually trip the alertAfterFails threshold.
+func (k *KlinesWS) UpdateSymbols(newSymbols []domain.Symbol) {
+	k.mu.Lock()
+	if symbolSetEqual(k.symbols, newSymbols) {
+		k.mu.Unlock()
+		return
+	}
+	oldCount := len(k.symbols)
+	k.symbols = newSymbols
+	k.mu.Unlock()
+
+	slog.Info("updating kline subscription",
+		"old_count", oldCount,
+		"new_count", len(newSymbols),
+		"timeframe", k.timeframe)
+
+	// Signal reconnect (non-blocking)
+	select {
+	case k.reconnectCh <- struct{}{}:
+	default:
+		// Reconnect already pending
+	}
+}
+
+// symbolSetEqual reports whether a and b contain the same symbols, regardless
+// of order or duplicates. Cheap for the small lists (≤ a few hundred) carried
+// by markets.yaml + discovery candidates.
+func symbolSetEqual(a, b []domain.Symbol) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	set := make(map[domain.Symbol]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+		delete(set, s)
+	}
+	return len(set) == 0
+}
+
+// getSymbols returns a snapshot of the current symbol list
+func (k *KlinesWS) getSymbols() []domain.Symbol {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return append([]domain.Symbol(nil), k.symbols...)
 }
 
 // Run starts the WS stream and reconnects on failure until ctx is cancelled.
@@ -63,7 +126,42 @@ func (k *KlinesWS) Run(ctx context.Context) error {
 		default:
 		}
 
-		if err := k.connect(ctx); err != nil {
+		// Create a child context for this connection
+		connCtx, connCancel := context.WithCancel(ctx)
+
+		// Watch for reconnection signals. When UpdateSymbols fires we want to
+		// tear down the current connection and resubscribe, but we must NOT
+		// treat that as a failure for backoff/alert purposes — symbol churn
+		// from the 5-minute discovery watcher would otherwise generate a
+		// "disconnected" warning per poll and trip the alert threshold.
+		reconnectRequested := false
+		go func() {
+			select {
+			case <-k.reconnectCh:
+				slog.Info("reconnection requested, closing current connection",
+					"venue", "binance_spot", "timeframe", k.timeframe)
+				reconnectRequested = true
+				connCancel()
+			case <-connCtx.Done():
+			}
+		}()
+
+		err := k.connect(connCtx)
+		connCancel()
+
+		if err != nil {
+			// Symbol-driven reconnect: not a failure. Don't increment the
+			// failure counter, don't back off, don't alert.
+			if reconnectRequested && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				failures = 0
+				delay = reconnectBase
+				continue
+			}
+			// Parent shutdown — propagate cleanly without a "disconnected" warning.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
 			failures++
 			slog.Warn("spot klines WS disconnected",
 				"venue", "binance_spot",
@@ -100,8 +198,9 @@ func (k *KlinesWS) Run(ctx context.Context) error {
 }
 
 func (k *KlinesWS) connect(ctx context.Context) error {
-	syms := make([]string, len(k.symbols))
-	for i, s := range k.symbols {
+	symbols := k.getSymbols()
+	syms := make([]string, len(symbols))
+	for i, s := range symbols {
 		syms[i] = domain.ToExchangeSymbol(s)
 	}
 

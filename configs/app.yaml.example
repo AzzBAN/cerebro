@@ -14,6 +14,24 @@
 # Any mismatch is a fatal error at startup — no silent overrides.
 environment: paper
 
+# --- Aggressiveness ---------------------------------------------------------
+# Global dial that scales how often and how large the engine trades. Applied at
+# load time to every ENABLED strategy in strategies.yaml, layered on top of each
+# strategy's own parameters (multiplicative — it tunes, it does not replace).
+#
+#   conservative — half risk per trade, smaller caps, longer signal-dedup
+#                  windows, +1 confirmation candle, and forces
+#                  require_bias_alignment on (LLM bias must agree to enter).
+#   balanced     — identity. No scaling. Same as omitting this field.
+#   aggressive   — ~1.75× risk per trade, larger caps, half the dedup window,
+#                  -1 confirmation candle (enter sooner, trade more often).
+#
+# SAFETY: this never relaxes the global `risk:` hard caps below or the risk gate
+# (internal/risk). It only changes how strategies behave inside those limits.
+# Risk is always clamped to each strategy's max_position_size_pct after scaling.
+# Unset = balanced, so existing configs are unaffected.
+aggressiveness: balanced
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -196,6 +214,17 @@ agent:
     circuit_breaker_error_window_minutes: 5
     circuit_breaker_cooldown_minutes: 10
 
+  # --- Risk Agent SL/TP safety net ---
+  # When the LLM approves an order without supplying stop_loss/take_profit,
+  # the route function falls back to these defaults applied to the live mark
+  # price. This closes the "no SL/TP levels to attach" flatten race that the
+  # reconciler would otherwise force-close within 30s. Set either value to 0
+  # to disable the fallback on that side (the reconciler will still flatten
+  # an unprotected entry — keep the defaults on for paper/demo trading).
+  risk_agent:
+    default_sl_pct: 0.5       # stop loss 0.5% from mark price
+    default_tp_pct: 0.8       # take profit 0.8% from mark price
+
   # --- Tool policy ---
   # Which tool skills each agent is DENIED from calling.
   # This is enforced by the tool registry in code, not by prompt engineering.
@@ -297,6 +326,16 @@ web:
   listen_addr: ":8080"
   allowed_origins: []
 
+# Startup presentation. The web dashboard is governed by web.enabled above and
+# runs in any mode; this only controls the terminal surface.
+run:
+  # Show an interactive run-mode picker at startup when a terminal is attached.
+  # Set false (or pass --no-menu) to skip it and use default_mode directly.
+  menu: true
+  # Used when the menu is skipped — headless (no TTY: VPS / systemd / docker)
+  # or menu off. One of "tui" or "web". Use "web" on a server.
+  default_mode: tui
+
 # =============================================================================
 # INGEST — SCRAPERS & NEWS FEEDS
 # =============================================================================
@@ -322,26 +361,6 @@ ingest:
     enabled: true
     interval_minutes: 60
     timeout_seconds: 15
-
-  # CryptoPanic news feed — no API key required.
-  # Primary path: pure-Go reverse-engineered AES+zlib decrypt of the
-  # internal /web-api/posts/ endpoint (~200ms per scrape).
-  # Fallback path: headless Chromium that hooks JSON.parse to capture
-  # the decrypted payload (~5s per scrape, kicks in automatically when
-  # CryptoPanic rotates their AES key).
-  cryptopanic:
-    enabled: true
-    interval_minutes: 15
-    timeout_seconds: 15
-    # Filter: hot | rising | bullish | bearish | important | saved | lol
-    filter: hot
-    # Optional: per-currency feeds in addition to the global feed. Each
-    # is cached under news:by_asset:<CODE> and exposed to the agent via
-    # the fetch_latest_news tool.
-    currencies: [BTC, ETH]
-    # Maximum items to keep in the Redis cache per tick (global + per-asset
-    # keys). Defaults to 50 when unset.
-    max_items: 50
 
 # =============================================================================
 # BACKTEST ENGINE
@@ -380,10 +399,22 @@ position_manager:
   # Minimum seconds between consecutive trigger evaluations for the same position.
   trigger_debounce_sec: 300
 
+  # Grace period (seconds) before flattening an unprotected position.
+  # This gives the REST resync time to detect SL/TP that was placed externally
+  # (e.g. on the Binance website) before the reconciler closes the position.
+  # Default: 30 seconds
+  flatten_grace_sec: 30
+
   # Action taken when the LLM is unavailable or returns an unusable response.
   # tighten_breakeven — move SL to entry price (lock in breakeven)
   # hold              — take no action, leave bracket unchanged
   llm_failure_action: tighten_breakeven
+
+  # Timeout (seconds) for each position manager LLM invocation. The FallbackChain
+  # splits this deadline across providers, so with 2 providers each gets ~50% of
+  # this value. Default 120s gives each provider ~60s, which is enough for slow
+  # proxies and reasoning models. Set lower (e.g. 60) for fast models only.
+  llm_timeout_sec: 120
 
   # Minimum unrealised profit (%) before the agent considers active management.
   profit_threshold_pct: 1.0

@@ -138,6 +138,71 @@ func (s *TradeStore) TradesByWindow(ctx context.Context, from, to time.Time) ([]
 	return out, rows.Err()
 }
 
+// IntentsByWindow returns every order intent whose created_at falls in
+// [from, to), newest-first. Used by the order-history view to render the
+// intent lifecycle (pending → submitted → filled/rejected/cancelled).
+func (s *TradeStore) IntentsByWindow(ctx context.Context, from, to time.Time) ([]domain.OrderIntent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, correlation_id, symbol, side, quantity, stop_loss,
+		       take_profit_1, strategy, environment, status, order_type,
+		       limit_price, stop_price, time_in_force, reduce_only,
+		       position_side, leverage, scale_out_pct, created_at
+		FROM order_intents
+		WHERE created_at >= $1 AND created_at < $2
+		ORDER BY created_at DESC`,
+		from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: intents by window: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.OrderIntent
+	for rows.Next() {
+		var i domain.OrderIntent
+		var qty string
+		var sl, tp, lim, sp *string
+		var tif, ps *string
+		var lev *int
+		var scale float64
+
+		err := rows.Scan(
+			&i.ID, &i.CorrelationID, &i.Symbol, &i.Side, &qty,
+			&sl, &tp, &i.Strategy, &i.Environment, &i.Status,
+			&i.OrderType, &lim, &sp, &tif, &i.ReduceOnly,
+			&ps, &lev, &scale, &i.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan intent: %w", err)
+		}
+		i.Quantity, _ = decimal.NewFromString(qty)
+		if sl != nil && *sl != "" {
+			i.StopLoss, _ = decimal.NewFromString(*sl)
+		}
+		if tp != nil && *tp != "" {
+			i.TakeProfit1, _ = decimal.NewFromString(*tp)
+		}
+		if lim != nil && *lim != "" {
+			i.LimitPrice, _ = decimal.NewFromString(*lim)
+		}
+		if sp != nil && *sp != "" {
+			i.StopPrice, _ = decimal.NewFromString(*sp)
+		}
+		if tif != nil {
+			i.TIF = domain.TimeInForce(*tif)
+		}
+		if ps != nil {
+			i.PositionSide = domain.PositionSide(*ps)
+		}
+		if lev != nil {
+			i.Leverage = *lev
+		}
+		i.ScaleOutPct = scale
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
 func nullDecimal(d decimal.Decimal) *string {
 	if d.IsZero() {
 		return nil

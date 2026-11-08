@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    ".opencode/instructions/project-overview.md",
+    ".opencode/instructions/hexagonal-architecture.md",
+    ".opencode/instructions/go-standards.md",
+    ".opencode/instructions/config-conventions.md",
+    ".opencode/instructions/agent-llm.md",
+    ".opencode/instructions/runtime-wiring.md",
+    ".opencode/instructions/migrations.md",
+    ".opencode/instructions/testing-standards.md",
+    ".opencode/instructions/web-frontend.md",
+    ".opencode/instructions/chatops.md"
+  ],
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "plugin": [
+    ".opencode/plugins/graphify.js"
+  ]
+}

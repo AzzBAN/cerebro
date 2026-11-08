@@ -35,9 +35,9 @@ func TestATR_SimpleCalculation(t *testing.T) {
 	// Candle 1: TR = H - L = 12 - 9 = 3
 	// Candle 2: TR = max(14-11, |14-11|, |11-11|) = 3
 	// Candle 3: TR = max(15-12, |15-14|, |12-14|) = 3
-	atr.Add(makeCandle(10, 12, 9, 11))   // TR = 3
-	atr.Add(makeCandle(11, 14, 11, 14))  // TR = max(3, 3, 2) = 3
-	atr.Add(makeCandle(14, 15, 12, 13))  // TR = max(3, 1, 2) = 3
+	atr.Add(makeCandle(10, 12, 9, 11))  // TR = 3
+	atr.Add(makeCandle(11, 14, 11, 14)) // TR = max(3, 3, 2) = 3
+	atr.Add(makeCandle(14, 15, 12, 13)) // TR = max(3, 1, 2) = 3
 
 	val, ready := atr.Value()
 	if !ready {
@@ -52,10 +52,10 @@ func TestATR_SimpleCalculation(t *testing.T) {
 func TestATR_WilderSmoothing(t *testing.T) {
 	atr := NewATR(3)
 
-	atr.Add(makeCandle(10, 12, 9, 11))   // TR = 3
-	atr.Add(makeCandle(11, 14, 11, 14))  // TR = 3
-	atr.Add(makeCandle(14, 15, 12, 13))  // TR = 3, ATR = 3
-	atr.Add(makeCandle(13, 16, 13, 15))  // TR = max(3, 3, 0) = 3
+	atr.Add(makeCandle(10, 12, 9, 11))  // TR = 3
+	atr.Add(makeCandle(11, 14, 11, 14)) // TR = 3
+	atr.Add(makeCandle(14, 15, 12, 13)) // TR = 3, ATR = 3
+	atr.Add(makeCandle(13, 16, 13, 15)) // TR = max(3, 3, 0) = 3
 
 	val, _ := atr.Value()
 	// Wilder: (3 * (3-1) + 3) / 3 = (6 + 3) / 3 = 3

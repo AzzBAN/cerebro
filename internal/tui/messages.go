@@ -89,19 +89,19 @@ var mainTabIcons = []string{"◈", "◉", "▤", "⚙"}
 
 // Color palette — subtle, professional dark theme.
 var (
-	colorBg       = lipgloss.Color("235") // dark grey background
-	colorBgAlt    = lipgloss.Color("236") // slightly lighter for contrast
-	colorFg       = lipgloss.Color("252") // light grey text
-	colorFgDim    = lipgloss.Color("242") // dimmed text
-	colorAccent   = lipgloss.Color("75")  // cyan-blue accent
-	colorAccentDim = lipgloss.Color("67") // muted accent
-	colorGreen    = lipgloss.Color("114") // green for positive values
-	colorRed      = lipgloss.Color("203") // red for errors / negative
-	colorYellow   = lipgloss.Color("221") // yellow for warnings
-	colorMagenta  = lipgloss.Color("176") // magenta for agents
-	colorWhite    = lipgloss.Color("255") // bright white
-	colorBorder   = lipgloss.Color("240") // subtle border
-	colorBorderFocus = lipgloss.Color("75") // focused border
+	colorBg          = lipgloss.Color("235") // dark grey background
+	colorBgAlt       = lipgloss.Color("236") // slightly lighter for contrast
+	colorFg          = lipgloss.Color("252") // light grey text
+	colorFgDim       = lipgloss.Color("242") // dimmed text
+	colorAccent      = lipgloss.Color("75")  // cyan-blue accent
+	colorAccentDim   = lipgloss.Color("67")  // muted accent
+	colorGreen       = lipgloss.Color("114") // green for positive values
+	colorRed         = lipgloss.Color("203") // red for errors / negative
+	colorYellow      = lipgloss.Color("221") // yellow for warnings
+	colorMagenta     = lipgloss.Color("176") // magenta for agents
+	colorWhite       = lipgloss.Color("255") // bright white
+	colorBorder      = lipgloss.Color("240") // subtle border
+	colorBorderFocus = lipgloss.Color("75")  // focused border
 )
 
 var (
@@ -110,7 +110,7 @@ var (
 			Bold(true).
 			Foreground(colorAccent).
 			PaddingLeft(1)
-	dimStyle = lipgloss.NewStyle().Foreground(colorFgDim)
+	dimStyle    = lipgloss.NewStyle().Foreground(colorFgDim)
 	borderStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorBorder).
@@ -239,6 +239,13 @@ type AskResponseMsg struct {
 	Response string
 	Query    string
 	Err      error
+}
+
+// ChatMessage represents a single message in the copilot chat history.
+type ChatMessage struct {
+	Role      string    `json:"role"` // "user" or "assistant"
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // BiasUpdatedMsg pushes a fresh BiasResult into the TUI's Bias panel.
@@ -389,12 +396,12 @@ const maxBiasRows = 8
 const maxAgentRunRows = 8
 
 // xsTabCount is the number of tabs available in the XS single-panel layout.
-const xsTabCount = 6
+const xsTabCount = 7
 
 // xsTabLabels are the full tab names used in the XS layout. Indexes here align
 // with the xsTab field in the model and the per-index switch in renderMiddleXS.
-var xsTabLabels = []string{"Market", "Positions", "Log", "Bias", "Macro", "Agents"}
+var xsTabLabels = []string{"Market", "Positions", "Log", "Bias", "Macro", "Agents", "Chat"}
 
 // xsTabShort are abbreviated labels used when the terminal is too narrow for
 // the full names.
-var xsTabShort = []string{"Mkt", "Pos", "Log", "Bias", "Mac", "Agt"}
+var xsTabShort = []string{"Mkt", "Pos", "Log", "Bias", "Mac", "Agt", "Cht"}

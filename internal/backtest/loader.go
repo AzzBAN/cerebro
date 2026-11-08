@@ -19,7 +19,8 @@ const csvTimeLayout = "2006-01-02 15:04:05"
 
 // LoadCSV loads historical candle data from a CSV file.
 // Expected columns (comma-separated, with optional header):
-//   timestamp_ms OR timestamp (YYYY-MM-DD HH:MM:SS), open, high, low, close, volume
+//
+//	timestamp_ms OR timestamp (YYYY-MM-DD HH:MM:SS), open, high, low, close, volume
 func LoadCSV(path string, symbol domain.Symbol, tf domain.Timeframe) ([]domain.Candle, error) {
 	f, err := os.Open(path)
 	if err != nil {

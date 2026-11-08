@@ -55,12 +55,19 @@ func (s *AgentLogStore) RunsByWindow(ctx context.Context, agent string, from, to
 	var out []domain.AgentRun
 	for rows.Next() {
 		var r domain.AgentRun
+		var outcome, errStr *string
 		if err := rows.Scan(
 			&r.ID, &r.Agent, &r.Model, &r.Provider,
 			&r.InputTokens, &r.OutputTokens, &r.CostUSDCents, &r.LatencyMS,
-			&r.Outcome, &r.Error, &r.CreatedAt,
+			&outcome, &errStr, &r.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan agent run: %w", err)
+		}
+		if outcome != nil {
+			r.Outcome = *outcome
+		}
+		if errStr != nil {
+			r.Error = *errStr
 		}
 		out = append(out, r)
 	}

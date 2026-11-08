@@ -53,6 +53,15 @@ func (m *memCache) Exists(_ context.Context, k string) (bool, error) {
 	_, ok := m.kv[k]
 	return ok, nil
 }
+func (m *memCache) SetNX(_ context.Context, k string, v []byte, _ time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.kv[k]; ok {
+		return false, nil
+	}
+	m.kv[k] = append([]byte(nil), v...)
+	return true, nil
+}
 
 // stubScanner returns canned rows from each endpoint.
 type stubScanner struct {

@@ -94,3 +94,40 @@ func TestRSI_IsOversold_NotReady(t *testing.T) {
 		t.Error("should not report oversold when not ready")
 	}
 }
+
+func TestRSI_FlatMarket(t *testing.T) {
+	period := 14
+	rsi := NewRSI(period)
+
+	for range period + 10 {
+		rsi.Add(decimal.NewFromInt(100))
+	}
+
+	val, ready := rsi.Value()
+	if !ready {
+		t.Fatal("RSI should be ready")
+	}
+	if !val.Equal(decimal.NewFromInt(50)) {
+		t.Errorf("RSI for flat market = %s, want 50", val.String())
+	}
+}
+
+func TestRSI_MemoryEfficiency(t *testing.T) {
+	period := 14
+	rsi := NewRSI(period)
+
+	for i := range 10000 {
+		rsi.Add(decimal.NewFromInt(int64(100 + (i % 10))))
+	}
+
+	val, ready := rsi.Value()
+	if !ready {
+		t.Fatal("RSI should be ready")
+	}
+	if val.IsZero() {
+		t.Error("RSI value should not be zero")
+	}
+	if len(rsi.prices) != 0 {
+		t.Errorf("expected r.prices to be empty after warmup, got len %d", len(rsi.prices))
+	}
+}

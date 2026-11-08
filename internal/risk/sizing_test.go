@@ -8,65 +8,65 @@ import (
 
 func TestCalculatePositionSize(t *testing.T) {
 	tests := []struct {
-		name            string
-		equity          decimal.Decimal
-		riskPct         float64
-		entry           decimal.Decimal
-		stopLoss        decimal.Decimal
-		minLot          decimal.Decimal
-		maxLot          decimal.Decimal
-		minNotional     decimal.Decimal
-		wantQty         string
-		wantRiskAmount  string
-		wantErr         bool
-		errContains     string
+		name           string
+		equity         decimal.Decimal
+		riskPct        float64
+		entry          decimal.Decimal
+		stopLoss       decimal.Decimal
+		minLot         decimal.Decimal
+		maxLot         decimal.Decimal
+		minNotional    decimal.Decimal
+		wantQty        string
+		wantRiskAmount string
+		wantErr        bool
+		errContains    string
 	}{
 		{
-			name:        "basic long position",
-			equity:      decimal.NewFromInt(10000),
-			riskPct:     1,
-			entry:       decimal.NewFromInt(50000),
-			stopLoss:    decimal.NewFromInt(49000),
-			minLot:      decimal.Zero,
-			maxLot:      decimal.Zero,
-			minNotional: decimal.Zero,
-			wantQty:     "0.1",
+			name:           "basic long position",
+			equity:         decimal.NewFromInt(10000),
+			riskPct:        1,
+			entry:          decimal.NewFromInt(50000),
+			stopLoss:       decimal.NewFromInt(49000),
+			minLot:         decimal.Zero,
+			maxLot:         decimal.Zero,
+			minNotional:    decimal.Zero,
+			wantQty:        "0.1",
 			wantRiskAmount: "100",
 		},
 		{
-			name:        "clamped to min lot",
-			equity:      decimal.NewFromInt(100),
-			riskPct:     1,
-			entry:       decimal.NewFromInt(50000),
-			stopLoss:    decimal.NewFromInt(49000),
-			minLot:      decimal.NewFromFloat(0.1),
-			maxLot:      decimal.Zero,
-			minNotional: decimal.Zero,
-			wantQty:     "0.1",
+			name:           "clamped to min lot",
+			equity:         decimal.NewFromInt(100),
+			riskPct:        1,
+			entry:          decimal.NewFromInt(50000),
+			stopLoss:       decimal.NewFromInt(49000),
+			minLot:         decimal.NewFromFloat(0.1),
+			maxLot:         decimal.Zero,
+			minNotional:    decimal.Zero,
+			wantQty:        "0.1",
 			wantRiskAmount: "1",
 		},
 		{
-			name:        "clamped to max lot",
-			equity:      decimal.NewFromInt(1000000),
-			riskPct:     2,
-			entry:       decimal.NewFromInt(50000),
-			stopLoss:    decimal.NewFromInt(49900),
-			minLot:      decimal.Zero,
-			maxLot:      decimal.NewFromInt(1),
-			minNotional: decimal.Zero,
-			wantQty:     "1",
+			name:           "clamped to max lot",
+			equity:         decimal.NewFromInt(1000000),
+			riskPct:        2,
+			entry:          decimal.NewFromInt(50000),
+			stopLoss:       decimal.NewFromInt(49900),
+			minLot:         decimal.Zero,
+			maxLot:         decimal.NewFromInt(1),
+			minNotional:    decimal.Zero,
+			wantQty:        "1",
 			wantRiskAmount: "20000",
 		},
 		{
-			name:        "short position (SL above entry)",
-			equity:      decimal.NewFromInt(10000),
-			riskPct:     1,
-			entry:       decimal.NewFromInt(50000),
-			stopLoss:    decimal.NewFromInt(50500),
-			minLot:      decimal.Zero,
-			maxLot:      decimal.Zero,
-			minNotional: decimal.Zero,
-			wantQty:     "0.2",
+			name:           "short position (SL above entry)",
+			equity:         decimal.NewFromInt(10000),
+			riskPct:        1,
+			entry:          decimal.NewFromInt(50000),
+			stopLoss:       decimal.NewFromInt(50500),
+			minLot:         decimal.Zero,
+			maxLot:         decimal.Zero,
+			minNotional:    decimal.Zero,
+			wantQty:        "0.2",
 			wantRiskAmount: "100",
 		},
 		{

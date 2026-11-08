@@ -5,16 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
+	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 )
 
-// LLMMock implements port.LLM using pre-recorded fixture files.
-// Each call sequence is deterministic: responses are served in round-robin order.
-// Used by the backtest engine to test strategy performance without live LLM costs.
+var _ port.LLM = (*LLMMock)(nil)
+
+// LLMMock implements port.LLM using pre-recorded fixture files or tool scripts.
+// Each call sequence is deterministic.
 type LLMMock struct {
+	mu        sync.Mutex
 	responses []string
 	idx       int
+	toolCall  string
+	toolInput json.RawMessage
+	err       error
 }
 
 // NewLLMMock creates a fixture-backed LLM mock.
@@ -36,16 +44,46 @@ func NewLLMMockFromSlice(responses []string) *LLMMock {
 	return &LLMMock{responses: responses}
 }
 
+// WithToolCall configures the mock to invoke a specific tool on Complete.
+func (m *LLMMock) WithToolCall(name string, input json.RawMessage) *LLMMock {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.toolCall = name
+	m.toolInput = input
+	return m
+}
+
+// WithError configures the mock to return an error on Complete.
+func (m *LLMMock) WithError(err error) *LLMMock {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.err = err
+	return m
+}
+
 func (m *LLMMock) Provider() string { return "mock" }
 func (m *LLMMock) ModelID() string  { return "mock-v1" }
 
-// Complete returns the next fixture response in sequence (round-robin).
+// Complete returns the next fixture response or runs the configured tool call.
 func (m *LLMMock) Complete(
-	_ context.Context,
+	ctx context.Context,
 	_ string,
 	_ string,
-	tools map[string]port.ToolHandler,
+	tools map[string]port.Tool,
 ) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.toolCall != "" {
+		if t, ok := tools[m.toolCall]; ok {
+			_, _ = t.Handler(ctx, m.toolInput)
+		}
+	}
+
+	if m.err != nil {
+		return "", m.err
+	}
+
 	if len(m.responses) == 0 {
 		return `{"bias":"Neutral","reasoning":"mock"}`, nil
 	}
@@ -63,3 +101,14 @@ func NeutralBiasFixture() string {
 func ApproveAllFixture() string {
 	return `{"approved":true}`
 }
+
+var _ port.AgentLogStore = (*NoopLogStore)(nil)
+
+// NoopLogStore satisfies port.AgentLogStore without persisting.
+type NoopLogStore struct{}
+
+func (NoopLogStore) SaveRun(_ context.Context, _ domain.AgentRun) error { return nil }
+func (NoopLogStore) RunsByWindow(_ context.Context, _ string, _, _ time.Time) ([]domain.AgentRun, error) {
+	return nil, nil
+}
+func (NoopLogStore) SaveMessage(_ context.Context, _ domain.AgentMessage) error { return nil }

@@ -6,8 +6,16 @@ CREATE TABLE IF NOT EXISTS archived_agent_runs (
 );
 
 CREATE TABLE IF NOT EXISTS archived_agent_messages (
-    LIKE agent_messages INCLUDING ALL
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    tool_name       TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE archived_agent_messages DROP CONSTRAINT IF EXISTS agent_messages_run_id_fkey;
+ALTER TABLE archived_agent_messages DROP CONSTRAINT IF EXISTS archived_agent_messages_run_id_fkey;
 
 CREATE TABLE IF NOT EXISTS archived_audit_events (
     LIKE audit_events INCLUDING ALL

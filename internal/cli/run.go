@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/azhar/cerebro/internal/app"
 	"github.com/azhar/cerebro/internal/config"
@@ -13,9 +14,12 @@ import (
 
 func newRunCommand() *cobra.Command {
 	var (
-		paper bool
-		demo  bool
-		live  bool
+		paper      bool
+		demo       bool
+		live       bool
+		mode       string
+		noMenu     bool
+		background bool
 	)
 
 	cmd := &cobra.Command{
@@ -70,16 +74,32 @@ all agree — any mismatch causes an immediate fatal error at startup.`,
 				slog.Warn("kill_switch is enabled in config; no orders will be placed")
 			}
 
+			decision, err := resolveStartup(mode, background, cfg, noMenu, runStartupMenu(os.Stdin, os.Stdout))
+			if err != nil {
+				return err
+			}
+			if decision.cancelled {
+				slog.Info("startup cancelled by operator")
+				return nil
+			}
+			if decision.background {
+				return detachBackground(cfgDir, env)
+			}
+			slog.Info("run mode selected", "mode", decision.mode, "web_enabled", cfg.Web.Enabled)
+
 			ctx, cancel := app.WaitForShutdown()
 			defer cancel()
 
-			return app.New(cfg).Run(ctx)
+			return app.New(cfg, app.WithRunMode(decision.mode), app.WithConfigDir(cfgDir)).Run(ctx)
 		},
 	}
 
 	cmd.Flags().BoolVar(&paper, "paper", false, "offline paper trading with synthetic market data")
 	cmd.Flags().BoolVar(&demo, "demo", false, "demo trading: real Binance prices, virtual execution (demo.binance.com)")
 	cmd.Flags().BoolVar(&live, "live", false, "live trading with real funds on Binance mainnet")
+	cmd.Flags().StringVar(&mode, "mode", "", "terminal presentation: \"tui\" or \"web\" (skips the startup menu)")
+	cmd.Flags().BoolVar(&noMenu, "no-menu", false, "skip the interactive run-mode menu; use run.default_mode from app.yaml")
+	cmd.Flags().BoolVar(&background, "background", false, "detach and run headless (web mode); parent prints the PID/log path and exits")
 
 	return cmd
 }

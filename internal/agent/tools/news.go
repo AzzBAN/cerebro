@@ -15,10 +15,10 @@ import (
 // tight. Operators asking the agent for more detail can override via the
 // limit argument up to maxNewsLimit.
 const (
-	defaultNewsLimit  = 5
-	maxNewsLimit      = 10
-	maxTitleChars     = 140
-	maxSummaryChars   = 200
+	defaultNewsLimit     = 5
+	maxNewsLimit         = 10
+	maxTitleChars        = 140
+	maxSummaryChars      = 200
 	maxCurrenciesPerItem = 4
 )
 
@@ -68,10 +68,9 @@ func truncate(s string, n int) string {
 
 // FetchLatestNews implements the fetch_latest_news agent tool.
 //
-// The tool first tries the Redis cache populated by the combined news
-// ingest runner (news:latest holds the merged CryptoPanic + FinancialJuice
-// stream; news:by_asset:<CODE> is CryptoPanic-only since FJ has no
-// asset-keyed query). It only falls back to a live FetchLatest call on
+// The tool first tries the Redis cache populated by the news
+// ingest runner (news:latest holds the FinancialJuice stream). It only
+// falls back to a live FetchLatest call on
 // cache miss. This matters during ReAct loops where the agent may call
 // the tool multiple times per run — we do not want to spawn a Chromium
 // instance or bounce through the CSRF dance on every call.
@@ -146,7 +145,7 @@ func FetchLatestNews(feed port.NewsFeed, cache port.Cache) port.Tool {
 	}
 }
 
-// readNewsFromCache looks up the CryptoPanic ingest cache for either a
+// readNewsFromCache looks up the news ingest cache for either a
 // ticker-specific list (news:by_asset:BTC) or the global list
 // (news:latest). Returns nil on any error — the caller falls back to a
 // live fetch. query is treated as a ticker match when it looks like one

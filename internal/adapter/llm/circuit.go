@@ -18,22 +18,22 @@ import (
 //   - CLOSED    : calls flow through; outcomes recorded in a sliding window.
 //   - OPEN      : calls return immediately with ErrAgentTimeout (cheap fail).
 //   - HALF_OPEN : exactly one probe call is allowed; success closes the
-//                 breaker, failure re-opens it for a fresh cooldown.
+//     breaker, failure re-opens it for a fresh cooldown.
 //
 // The breaker is safe for concurrent use.
 type CircuitBreaker struct {
-	inner       port.LLM
-	threshold   float64       // error rate (0..1) that trips the breaker
-	window      time.Duration // sliding window for error-rate computation
-	cooldown    time.Duration // minimum time spent in OPEN before a probe
-	minSamples  int           // don't trip on < this many recorded calls
-	now         func() time.Time
+	inner      port.LLM
+	threshold  float64       // error rate (0..1) that trips the breaker
+	window     time.Duration // sliding window for error-rate computation
+	cooldown   time.Duration // minimum time spent in OPEN before a probe
+	minSamples int           // don't trip on < this many recorded calls
+	now        func() time.Time
 
-	mu           sync.Mutex
-	state        breakerState
-	outcomes     []outcome // sliding window, pruned on record
-	openedAt     time.Time // when state transitioned to OPEN
-	probeInFlight bool     // true when a HALF_OPEN probe is executing
+	mu            sync.Mutex
+	state         breakerState
+	outcomes      []outcome // sliding window, pruned on record
+	openedAt      time.Time // when state transitioned to OPEN
+	probeInFlight bool      // true when a HALF_OPEN probe is executing
 }
 
 type breakerState int
@@ -65,10 +65,10 @@ type outcome struct {
 // CircuitBreakerOpts configures the breaker. ErrorRatePct <= 0 disables it
 // and the constructor returns the underlying LLM unchanged.
 type CircuitBreakerOpts struct {
-	ErrorRatePct    float64       // e.g. 50 means "trip at 50% failures"
-	Window          time.Duration // sliding window for rate calc
-	Cooldown        time.Duration // time to stay OPEN before probing
-	MinSamples      int           // minimum calls in window before tripping
+	ErrorRatePct float64       // e.g. 50 means "trip at 50% failures"
+	Window       time.Duration // sliding window for rate calc
+	Cooldown     time.Duration // time to stay OPEN before probing
+	MinSamples   int           // minimum calls in window before tripping
 }
 
 // NewCircuitBreaker wraps inner with a CircuitBreaker. When opts.ErrorRatePct

@@ -95,6 +95,16 @@ func (s *stubCache) Exists(_ context.Context, key string) (bool, error) {
 	return ok, nil
 }
 
+func (s *stubCache) SetNX(_ context.Context, key string, val []byte, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		return false, nil
+	}
+	s.data[key] = val
+	return true, nil
+}
+
 // keep import happy
 var _ = decimal.NewFromInt(0)
 

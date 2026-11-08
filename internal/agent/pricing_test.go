@@ -4,8 +4,8 @@ import "testing"
 
 func TestLookupPricing(t *testing.T) {
 	tests := []struct {
-		model       string
-		wantInput   float64 // 0 when unknown
+		model     string
+		wantInput float64 // 0 when unknown
 	}{
 		{"claude-haiku-4-5", 1.00},
 		{"claude-haiku-4-5-20250514", 1.00}, // prefix match survives versioned IDs

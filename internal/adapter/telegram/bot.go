@@ -46,9 +46,9 @@ func installSlogLogger() {
 // It receives commands, dispatches them, and sends notifications.
 type Bot struct {
 	api        *tgbotapi.BotAPI
-	allowlist   map[int64]bool
+	allowlist  map[int64]bool
 	dispatchFn func(ctx context.Context, actorID, message string) string
-	channelIDs  map[string]int64 // NotifyChannel → chat ID
+	channelIDs map[string]int64 // NotifyChannel → chat ID
 }
 
 // NewBot creates a Telegram Bot.

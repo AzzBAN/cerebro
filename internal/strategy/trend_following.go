@@ -52,8 +52,8 @@ func NewTrendFollowing(cfg config.StrategyConfig) *TrendFollowing {
 	return s
 }
 
-func (t *TrendFollowing) Name() domain.StrategyName  { return t.cfg.Name }
-func (t *TrendFollowing) Symbols() []domain.Symbol    { return t.symbols }
+func (t *TrendFollowing) Name() domain.StrategyName { return t.cfg.Name }
+func (t *TrendFollowing) Symbols() []domain.Symbol  { return t.symbols }
 func (t *TrendFollowing) Timeframes() []domain.Timeframe {
 	return []domain.Timeframe{t.cfg.PrimaryTimeframe}
 }
@@ -77,17 +77,20 @@ func (t *TrendFollowing) OnCandle(_ context.Context, c domain.Candle) (domain.Si
 	trend.Add(c.Close)
 	atr.Add(c)
 
+	fastVal, fastOK := fast.Value()
+	slowVal, slowOK := slow.Value()
+
 	t.warmup[c.Symbol]++
 	if t.warmup[c.Symbol] < t.cfg.WarmupCandles {
+		if fastOK && slowOK {
+			t.prevFastAboveSlow[c.Symbol] = fastVal.GreaterThan(slowVal)
+		}
 		return domain.Signal{}, false
 	}
 
-	fastVal, fastOK := fast.Value()
-	slowVal, slowOK := slow.Value()
 	if !fastOK || !slowOK {
 		return domain.Signal{}, false
 	}
-
 	fastAboveSlow := fastVal.GreaterThan(slowVal)
 	prev := t.prevFastAboveSlow[c.Symbol]
 	t.prevFastAboveSlow[c.Symbol] = fastAboveSlow
@@ -125,6 +128,10 @@ func (t *TrendFollowing) OnCandle(_ context.Context, c domain.Candle) (domain.Si
 
 func (t *TrendFollowing) newSignal(c domain.Candle, side domain.Side, reason string) domain.Signal {
 	id := uuid.New().String()
+	genAt := c.CloseTime
+	if genAt.IsZero() {
+		genAt = time.Now().UTC()
+	}
 	return domain.Signal{
 		ID:            id,
 		CorrelationID: id,
@@ -133,7 +140,7 @@ func (t *TrendFollowing) newSignal(c domain.Candle, side domain.Side, reason str
 		Side:          side,
 		Timeframe:     c.Timeframe,
 		Reason:        reason,
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   genAt,
 	}
 }
 

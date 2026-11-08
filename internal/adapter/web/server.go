@@ -16,6 +16,13 @@ import (
 // maxLogLines caps the in-memory log ring buffer mirrored to new clients.
 const defaultMaxLogLines = 500
 
+// maxHistoryRows bounds the order-history ring buffer mirrored to new
+// clients. 500 covers a busy day without blowing up the dashboard's
+// per-connection JSON payload.
+const defaultMaxHistoryRows = 500
+
+// maxAgentRuns caps the in-memory agent run buffer mirrored to new clients.
+const defaultMaxAgentRuns = 100
 // envelope is the WebSocket message frame. Type selects the client-side
 // reducer; Data is one of the *DTO types defined in state.go.
 type envelope struct {
@@ -46,29 +53,40 @@ type client struct {
 // uistate.Sink (and observability.LogSink via SendSysLog), holding the latest
 // snapshot of every panel and broadcasting deltas to connected clients.
 type Server struct {
-	cfg        Config
-	dispatcher Dispatcher
-	tradeStore TradeReader
-	hub        *marketdata.Hub
+	cfg          Config
+	dispatcher   Dispatcher
+	tradeStore   TradeReader
+	intentReader IntentReader
+	hub          *marketdata.Hub
+	editor       StrategyEditor
+	configEditor ConfigFileEditor
 
 	mu                 sync.RWMutex
 	quotes             map[string]QuoteDTO
 	positions          []PositionDTO
 	proposals          []ProposalDTO
 	proposalController ProposalController
-	logs      []LogDTO
-	agentRuns map[string]AgentRunDTO
-	runOrder  []string
-	bias      map[string]BiasDTO
-	biasOrder []string
-	macro     MacroDTO
-	macroSet  bool
-	news      []NewsItemDTO
-	budget    BudgetDTO
-	budgetSet bool
-	heartbeat string
+	logs               []LogDTO
+	agentRuns          map[string]AgentRunDTO
+	runOrder           []string
+	bias               map[string]BiasDTO
+	biasOrder          []string
+	opps               []OpportunityDTO
+	macro              MacroDTO
+	macroSet           bool
+	news               []NewsItemDTO
+	budget             BudgetDTO
+	budgetSet          bool
+	heartbeat          string
+	configDTO          *ConfigDTO
+	// recent intents + trades cache the order-history panel. The slice
+	// is bounded by MaxHistoryRows so a long-running engine never blows
+	// up the dashboard's memory footprint.
+	recentIntents []OrderIntentDTO
+	recentTrades  []TradeDTO
 
-	maxLogLines int
+	maxLogLines    int
+	maxHistoryRows int
 
 	clientsMu sync.Mutex
 	clients   map[*client]struct{}
@@ -86,6 +104,13 @@ type TradeReader interface {
 	TradesByWindow(ctx context.Context, from, to time.Time) ([]domain.Trade, error)
 }
 
+// IntentReader is the read-only slice of port.TradeStore the order-history
+// view needs to list the full intent lifecycle (pending → filled/rejected).
+// Implemented by both the in-memory store and the Postgres adapter.
+type IntentReader interface {
+	IntentsByWindow(ctx context.Context, from, to time.Time) ([]domain.OrderIntent, error)
+}
+
 // NewServer builds a web dashboard server. hub may be nil (no live quote feed);
 // dispatcher may be nil and set later via SetDispatcher (the chatops dispatcher
 // is constructed after the UI sink in the composition root).
@@ -94,16 +119,29 @@ func NewServer(cfg Config, hub *marketdata.Hub, dispatcher Dispatcher, trades Tr
 		maxLogLines = defaultMaxLogLines
 	}
 	return &Server{
-		cfg:         cfg,
-		dispatcher:  dispatcher,
-		tradeStore:  trades,
-		hub:         hub,
-		quotes:      make(map[string]QuoteDTO),
-		agentRuns:   make(map[string]AgentRunDTO),
-		bias:        make(map[string]BiasDTO),
-		clients:     make(map[*client]struct{}),
-		maxLogLines: maxLogLines,
+		cfg:            cfg,
+		dispatcher:     dispatcher,
+		tradeStore:     trades,
+		intentReader:   intentReaderOf(trades),
+		hub:            hub,
+		quotes:         make(map[string]QuoteDTO),
+		agentRuns:      make(map[string]AgentRunDTO),
+		bias:           make(map[string]BiasDTO),
+		clients:        make(map[*client]struct{}),
+		maxLogLines:    maxLogLines,
+		maxHistoryRows: defaultMaxHistoryRows,
 	}
+}
+
+// intentReaderOf extracts the IntentReader view when the configured
+// TradeReader also implements it (the production port.TradeStore does).
+// When only TradeReader is available the order-history view silently
+// degrades to trades-only.
+func intentReaderOf(r TradeReader) IntentReader {
+	if ir, ok := r.(IntentReader); ok {
+		return ir
+	}
+	return nil
 }
 
 // SetDispatcher injects the ChatOps dispatcher used by POST /api/command. Call
@@ -115,11 +153,65 @@ func (s *Server) SetDispatcher(d Dispatcher) {
 // SetTradeStore injects the trade reader used by GET /api/trades.
 func (s *Server) SetTradeStore(t TradeReader) {
 	s.tradeStore = t
+	s.intentReader = intentReaderOf(t)
+}
+
+// SendTrade implements port.TradeSink: each fill is appended to the
+// recent-trades ring buffer and broadcast to every connected client as
+// a "trade" frame so the order-history panel updates without polling.
+// The buffer is bounded; the oldest row is evicted when the cap is hit.
+func (s *Server) SendTrade(t domain.Trade) {
+	dto := tradeToDTO(t)
+	s.mu.Lock()
+	s.recentTrades = append(s.recentTrades, dto)
+	if len(s.recentTrades) > s.maxHistoryRows {
+		s.recentTrades = s.recentTrades[len(s.recentTrades)-s.maxHistoryRows:]
+	}
+	s.mu.Unlock()
+	s.broadcast("trade", dto)
+}
+
+// sendIntent pushes an intent row into the recent ring buffer. Called
+// when the engine surfaces an intent transition (filled/cancelled/etc).
+// Intent pushes are not currently emitted by the broadcasting store
+// (it only fans out on SaveTrade) but the hook is here for the
+// follow-up "intent" frame without re-plumbing the snapshot type.
+func (s *Server) sendIntent(i domain.OrderIntent) {
+	dto := orderIntentToDTO(i)
+	s.mu.Lock()
+	s.recentIntents = append(s.recentIntents, dto)
+	if len(s.recentIntents) > s.maxHistoryRows {
+		s.recentIntents = s.recentIntents[len(s.recentIntents)-s.maxHistoryRows:]
+	}
+	s.mu.Unlock()
+	s.broadcast("intent", dto)
 }
 
 // SetProposalController wires the proposal store for confirm/reject handling.
 func (s *Server) SetProposalController(c ProposalController) {
 	s.proposalController = c
+}
+
+// SetConfig injects the read-only configuration snapshot shown on the
+// dashboard's config panel. Call once during wiring before Run; the snapshot
+// is static for the process lifetime (config is loaded once at startup).
+func (s *Server) SetConfig(dto ConfigDTO) {
+	s.mu.Lock()
+	s.configDTO = &dto
+	s.mu.Unlock()
+}
+
+// SetStrategyEditor wires the runtime hook for GET /api/strategies/raw and
+// POST /api/strategies. Call once during wiring before Run. When nil, those
+// endpoints return 503.
+func (s *Server) SetStrategyEditor(e StrategyEditor) {
+	s.editor = e
+}
+
+// SetConfigFileEditor wires the runtime hook for GET/PUT /api/configs/{name}.
+// Call once during wiring before Run. When nil, those endpoints return 503.
+func (s *Server) SetConfigFileEditor(e ConfigFileEditor) {
+	s.configEditor = e
 }
 
 // ─── uistate.Sink implementation ──────────────────────────────────────────────
@@ -158,6 +250,20 @@ func (s *Server) SendBias(b domain.BiasResult) {
 	s.bias[dto.Symbol] = dto
 	s.mu.Unlock()
 	s.broadcast("bias", dto)
+}
+
+// SendOpportunities records the latest ranked cross-symbol opportunities
+// (screening Phase 2). Replaces the prior set wholesale — each cycle emits a
+// fresh ranked list, so there is no per-ID merge.
+func (s *Server) SendOpportunities(opps []domain.ScreeningOpportunity) {
+	dtos := make([]OpportunityDTO, 0, len(opps))
+	for _, o := range opps {
+		dtos = append(dtos, opportunityToDTO(o))
+	}
+	s.mu.Lock()
+	s.opps = dtos
+	s.mu.Unlock()
+	s.broadcast("opportunities", dtos)
 }
 
 // SendMacro records the latest macro snapshot.
@@ -212,6 +318,11 @@ func (s *Server) SendAgentState(st uistate.AgentState) {
 	s.mu.Lock()
 	if _, ok := s.agentRuns[dto.RunID]; !ok {
 		s.runOrder = append(s.runOrder, dto.RunID)
+		for len(s.runOrder) > defaultMaxAgentRuns {
+			oldest := s.runOrder[0]
+			delete(s.agentRuns, oldest)
+			s.runOrder = s.runOrder[1:]
+		}
 	}
 	s.agentRuns[dto.RunID] = dto
 	s.mu.Unlock()
@@ -247,16 +358,20 @@ func (s *Server) appendLog(e LogDTO) {
 
 // snapshot is the full initial state sent to a freshly connected client.
 type snapshot struct {
-	Quotes    []QuoteDTO    `json:"quotes"`
-	Positions []PositionDTO `json:"positions"`
-	Proposals []ProposalDTO `json:"proposals"`
-	Logs      []LogDTO      `json:"logs"`
-	AgentRuns []AgentRunDTO `json:"agentRuns"`
-	Bias      []BiasDTO     `json:"bias"`
-	Macro     *MacroDTO     `json:"macro"`
-	News      []NewsItemDTO `json:"news"`
-	Budget    *BudgetDTO    `json:"budget"`
-	Heartbeat string        `json:"heartbeat"`
+	Quotes        []QuoteDTO       `json:"quotes"`
+	Positions     []PositionDTO    `json:"positions"`
+	Proposals     []ProposalDTO    `json:"proposals"`
+	Logs          []LogDTO         `json:"logs"`
+	AgentRuns     []AgentRunDTO    `json:"agentRuns"`
+	Bias          []BiasDTO        `json:"bias"`
+	Macro         *MacroDTO        `json:"macro"`
+	News          []NewsItemDTO    `json:"news"`
+	Budget        *BudgetDTO       `json:"budget"`
+	Heartbeat     string           `json:"heartbeat"`
+	Opportunities []OpportunityDTO `json:"opportunities"`
+	Config        *ConfigDTO       `json:"config"`
+	RecentIntents []OrderIntentDTO `json:"recentIntents"`
+	RecentTrades  []TradeDTO       `json:"recentTrades"`
 }
 
 // Snapshot returns a deep-ish copy of the current state for /api/state and the
@@ -278,14 +393,17 @@ func (s *Server) Snapshot() snapshot {
 		bias = append(bias, s.bias[sym])
 	}
 	snap := snapshot{
-		Quotes:    quotes,
-		Positions: append([]PositionDTO(nil), s.positions...),
-		Proposals: append([]ProposalDTO(nil), s.proposals...),
-		Logs:      append([]LogDTO(nil), s.logs...),
-		AgentRuns: runs,
-		Bias:      bias,
-		News:      append([]NewsItemDTO(nil), s.news...),
-		Heartbeat: s.heartbeat,
+		Quotes:        quotes,
+		Positions:     append([]PositionDTO(nil), s.positions...),
+		Proposals:     append([]ProposalDTO(nil), s.proposals...),
+		Logs:          append([]LogDTO(nil), s.logs...),
+		AgentRuns:     runs,
+		Bias:          bias,
+		News:          append([]NewsItemDTO(nil), s.news...),
+		Heartbeat:     s.heartbeat,
+		Opportunities: append([]OpportunityDTO(nil), s.opps...),
+		RecentIntents: append([]OrderIntentDTO(nil), s.recentIntents...),
+		RecentTrades:  append([]TradeDTO(nil), s.recentTrades...),
 	}
 	if s.macroSet {
 		m := s.macro
@@ -294,6 +412,10 @@ func (s *Server) Snapshot() snapshot {
 	if s.budgetSet {
 		b := s.budget
 		snap.Budget = &b
+	}
+	if s.configDTO != nil {
+		c := *s.configDTO
+		snap.Config = &c
 	}
 	return snap
 }

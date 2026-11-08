@@ -24,4 +24,8 @@ type Cache interface {
 
 	// Exists returns true if the key exists.
 	Exists(ctx context.Context, key string) (bool, error)
+
+	// SetNX sets the value only if the key does not already exist.
+	// Returns true if the key was set, false if it already existed.
+	SetNX(ctx context.Context, key string, val []byte, ttl time.Duration) (bool, error)
 }

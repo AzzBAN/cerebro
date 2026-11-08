@@ -13,9 +13,9 @@ type mockStrategy struct {
 	symbols []domain.Symbol
 }
 
-func (m *mockStrategy) Name() domain.StrategyName        { return m.name }
-func (m *mockStrategy) Symbols() []domain.Symbol          { return m.symbols }
-func (m *mockStrategy) Timeframes() []domain.Timeframe    { return nil }
+func (m *mockStrategy) Name() domain.StrategyName      { return m.name }
+func (m *mockStrategy) Symbols() []domain.Symbol       { return m.symbols }
+func (m *mockStrategy) Timeframes() []domain.Timeframe { return nil }
 func (m *mockStrategy) OnCandle(_ context.Context, _ domain.Candle) (domain.Signal, bool) {
 	return domain.Signal{}, false
 }

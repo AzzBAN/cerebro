@@ -83,6 +83,21 @@ func (m *Matcher) PlaceBracket(_ context.Context, req domain.BracketRequest) (do
 	if !req.TakeProfit.IsZero() {
 		tpID = "paper-brT-" + req.ParentIntentID
 	}
+	var strat domain.StrategyName
+	for _, p := range m.book.Positions() {
+		if p.Symbol == req.Symbol {
+			strat = p.Strategy
+			break
+		}
+	}
+	if strat == "" {
+		for _, o := range m.book.OpenOrders() {
+			if o.Intent.ID == req.ParentIntentID || o.Intent.Symbol == req.Symbol {
+				strat = o.Intent.Strategy
+				break
+			}
+		}
+	}
 
 	m.book.AddBracket(PaperBracket{
 		ListID:            listID,
@@ -95,8 +110,8 @@ func (m *Matcher) PlaceBracket(_ context.Context, req domain.BracketRequest) (do
 		TakeProfit:        req.TakeProfit,
 		ParentIntentID:    req.ParentIntentID,
 		CorrelationID:     req.CorrelationID,
+		Strategy:          strat,
 	})
-
 	slog.Info("paper bracket placed",
 		"symbol", req.Symbol,
 		"parent", req.ParentIntentID,
@@ -153,6 +168,16 @@ func (m *Matcher) CancelOrder(_ context.Context, req domain.CancelRequest) error
 // Positions returns current paper positions.
 func (m *Matcher) Positions(_ context.Context) ([]domain.Position, error) {
 	return m.book.Positions(), nil
+}
+
+// Book returns the underlying paper book.
+func (m *Matcher) Book() *Book {
+	return m.book
+}
+
+// OpenOrders returns all pending paper orders.
+func (m *Matcher) OpenOrders() []PaperOrder {
+	return m.book.OpenOrders()
 }
 
 // Balance returns the paper account balance.
@@ -218,6 +243,27 @@ func (m *Matcher) recordBracketExit(ctx context.Context, trig BracketTrigger) {
 		exitSide = domain.SideBuy
 	}
 	fees := trig.Bracket.Quantity.Mul(trig.FillPrice).Mul(m.commission)
+	var realizedPnL *decimal.Decimal
+	if !trig.EntryPrice.IsZero() {
+		var gross decimal.Decimal
+		if trig.Bracket.EntrySide == domain.SideBuy {
+			gross = trig.FillPrice.Sub(trig.EntryPrice).Mul(trig.Bracket.Quantity)
+		} else {
+			gross = trig.EntryPrice.Sub(trig.FillPrice).Mul(trig.Bracket.Quantity)
+		}
+		realized := gross.Sub(fees)
+		realizedPnL = &realized
+		if m.pnl != nil {
+			m.pnl.UpdatePnL(realized)
+		}
+		slog.Debug("paper: realised PnL reported to risk gate",
+			"symbol", trig.Bracket.Symbol,
+			"entry", trig.EntryPrice.String(),
+			"exit", trig.FillPrice.String(),
+			"realized", realized.String(),
+		)
+	}
+
 	trade := domain.Trade{
 		ID:            uuid.New().String(),
 		IntentID:      trig.Bracket.ParentIntentID,
@@ -227,6 +273,7 @@ func (m *Matcher) recordBracketExit(ctx context.Context, trig BracketTrigger) {
 		Quantity:      trig.Bracket.Quantity,
 		FillPrice:     trig.FillPrice,
 		Fees:          fees,
+		PnL:           realizedPnL,
 		Strategy:      trig.Bracket.Strategy,
 		Venue:         domain.VenueBinanceSpot,
 		CreatedAt:     trig.FillTime,
@@ -235,27 +282,6 @@ func (m *Matcher) recordBracketExit(ctx context.Context, trig BracketTrigger) {
 	if err := m.store.SaveTrade(ctx, trade); err != nil {
 		slog.Error("paper: save bracket exit failed", "error", err, "symbol", trig.Bracket.Symbol)
 		return
-	}
-
-	// Feed realised PnL into the risk gate so drawdown / daily-loss limits
-	// can trip. PnL is signed from the position holder's perspective:
-	// for a long (entry side BUY) it is (exit - entry) * qty; for a short it
-	// is (entry - exit) * qty. Commission on the exit leg is netted out.
-	if m.pnl != nil && !trig.EntryPrice.IsZero() {
-		var gross decimal.Decimal
-		if trig.Bracket.EntrySide == domain.SideBuy {
-			gross = trig.FillPrice.Sub(trig.EntryPrice).Mul(trig.Bracket.Quantity)
-		} else {
-			gross = trig.EntryPrice.Sub(trig.FillPrice).Mul(trig.Bracket.Quantity)
-		}
-		realized := gross.Sub(fees)
-		m.pnl.UpdatePnL(realized)
-		slog.Debug("paper: realised PnL reported to risk gate",
-			"symbol", trig.Bracket.Symbol,
-			"entry", trig.EntryPrice.String(),
-			"exit", trig.FillPrice.String(),
-			"realized", realized.String(),
-		)
 	}
 
 	slog.Info("paper bracket fired",

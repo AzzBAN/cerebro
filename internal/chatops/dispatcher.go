@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
-
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/azhar/cerebro/internal/risk"
@@ -56,12 +56,12 @@ type Deps struct {
 // Dispatcher is the unified command router for CLI, Telegram, and Discord.
 // It enforces operator allowlist checking, permission validation, and audit logging.
 type Dispatcher struct {
+	mu               sync.Mutex
 	deps             Deps
 	pendingFlattenAt *time.Time           // non-nil when awaiting /flatten confirmation
 	pendingCloseAt   map[string]time.Time // symbol → timestamp for /close confirmation
 	confirmTimeoutS  int
 }
-
 // New creates a Dispatcher.
 func New(deps Deps, flattenConfirmTimeoutS int) *Dispatcher {
 	return &Dispatcher{
@@ -230,15 +230,17 @@ func (d *Dispatcher) handleFlatten(ctx context.Context, actorID, _ string) strin
 	now := time.Now()
 	window := time.Duration(d.confirmTimeoutS) * time.Second
 
+	d.mu.Lock()
 	if d.pendingFlattenAt == nil || now.Sub(*d.pendingFlattenAt) > window {
 		// First call (or expired) — arm confirmation.
 		d.pendingFlattenAt = &now
+		d.mu.Unlock()
 		return fmt.Sprintf("⚠️ Are you sure? Send /flatten again within %ds to confirm. This will close ALL open positions.", d.confirmTimeoutS)
 	}
 
 	// Confirmation received.
 	d.pendingFlattenAt = nil
-
+	d.mu.Unlock()
 	if d.deps.CloseFn == nil {
 		slog.Error("flatten requested but CloseFn not wired")
 		return "❌ Flatten unavailable: execution router not wired."
@@ -288,8 +290,11 @@ func (d *Dispatcher) handleClose(ctx context.Context, actorID, arg string) strin
 	key := strings.ToUpper(string(match.Symbol))
 	now := time.Now()
 	window := time.Duration(d.confirmTimeoutS) * time.Second
+
+	d.mu.Lock()
 	if at, pending := d.pendingCloseAt[key]; !pending || now.Sub(at) > window {
 		d.pendingCloseAt[key] = now
+		d.mu.Unlock()
 		return fmt.Sprintf(
 			"⚠️ Close %s %s %s? Send `/close %s` again within %ds to confirm.",
 			match.Symbol, match.Side, match.Quantity.String(),
@@ -297,7 +302,7 @@ func (d *Dispatcher) handleClose(ctx context.Context, actorID, arg string) strin
 		)
 	}
 	delete(d.pendingCloseAt, key)
-
+	d.mu.Unlock()
 	orderID, cerr := d.deps.CloseFn(ctx, match)
 	if cerr != nil {
 		slog.Error("chatops: close failed", "symbol", match.Symbol, "error", cerr)

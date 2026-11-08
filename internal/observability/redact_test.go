@@ -9,42 +9,42 @@ import (
 
 func TestRedactURL(t *testing.T) {
 	tests := []struct {
-		name    string
-		in      string
-		want    string
-		exact   bool
+		name     string
+		in       string
+		want     string
+		exact    bool
 		mustHave []string
 		mustNot  []string
 	}{
 		{
-			name:    "finnhub-style token leaks",
-			in:      "https://finnhub.io/api/v1/calendar/economic?from=2026-04-19&to=2026-04-20&token=d7gk911r01qmqj45n520",
+			name:     "finnhub-style token leaks",
+			in:       "https://finnhub.io/api/v1/calendar/economic?from=2026-04-19&to=2026-04-20&token=d7gk911r01qmqj45n520",
 			mustHave: []string{"token=REDACTED", "from=2026-04-19", "to=2026-04-20"},
 			mustNot:  []string{"d7gk911r01qmqj45n520"},
 		},
 		{
-			name:    "no query string is unchanged",
-			in:      "https://example.com/path",
-			want:    "https://example.com/path",
-			exact:   true,
+			name:  "no query string is unchanged",
+			in:    "https://example.com/path",
+			want:  "https://example.com/path",
+			exact: true,
 		},
 		{
-			name:    "case-insensitive parameter name",
-			in:      "https://example.com/?ApiKey=hunter2&q=ok",
+			name:     "case-insensitive parameter name",
+			in:       "https://example.com/?ApiKey=hunter2&q=ok",
 			mustHave: []string{"ApiKey=REDACTED", "q=ok"},
 			mustNot:  []string{"hunter2"},
 		},
 		{
-			name:    "non-sensitive params survive",
-			in:      "https://example.com/x?from=a&to=b",
-			want:    "https://example.com/x?from=a&to=b",
-			exact:   true,
+			name:  "non-sensitive params survive",
+			in:    "https://example.com/x?from=a&to=b",
+			want:  "https://example.com/x?from=a&to=b",
+			exact: true,
 		},
 		{
-			name:    "non-URL string passes through",
-			in:      "this is not a url",
-			want:    "this is not a url",
-			exact:   true,
+			name:  "non-URL string passes through",
+			in:    "this is not a url",
+			want:  "this is not a url",
+			exact: true,
 		},
 	}
 	for _, tt := range tests {

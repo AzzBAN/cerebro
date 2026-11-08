@@ -42,6 +42,12 @@ type ReconcilerDeps struct {
 	Positions func() []domain.Position
 	// IntervalMS is the tick cadence; 0 defaults to 5000.
 	IntervalMS int
+	// FlattenGraceSec is how long (in seconds) the reconciler waits after
+	// first seeing an unprotected, bracket-less position before it will
+	// flatten for "no protective levels". This gives the REST open-orders
+	// resync time to detect an SL/TP that was placed externally (e.g. on
+	// the Binance website). 0 defaults to 30.
+	FlattenGraceSec int
 
 	// ── Job B (optional) — review triggers + agent judgment ────────────────
 	// When all three of Detector, Decider, and Queue are non-nil, the
@@ -71,6 +77,10 @@ type ReconcilerDeps struct {
 // even when the LLM is down.
 type Reconciler struct {
 	deps ReconcilerDeps
+	// firstSeen records when an unprotected, bracket-less position was first
+	// encountered. Used by the flatten grace period to give the REST open-
+	// orders resync time to detect externally-placed SL/TP before flattening.
+	firstSeen map[domain.Symbol]time.Time
 }
 
 // NewReconciler builds a Reconciler.
@@ -78,7 +88,7 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 	if deps.IntervalMS <= 0 {
 		deps.IntervalMS = 5000
 	}
-	return &Reconciler{deps: deps}
+	return &Reconciler{deps: deps, firstSeen: make(map[domain.Symbol]time.Time)}
 }
 
 // Run ticks Job A until ctx is cancelled. Job B (LLM-backed position review)
@@ -158,11 +168,33 @@ func (r *Reconciler) enforceBrackets(ctx context.Context) {
 					continue
 				}
 			}
+
+			// Grace period: give the REST open-orders resync time to detect
+			// externally-placed SL/TP before flattening. This runs after the
+			// protection refresh so we can still detect protection during grace.
+			firstSeen, ok := r.firstSeen[pos.Symbol]
+			if !ok {
+				r.firstSeen[pos.Symbol] = time.Now()
+				slog.DebugContext(ctx, "reconciler: new unprotected position; starting grace period",
+					"symbol", pos.Symbol, "grace_sec", r.deps.FlattenGraceSec)
+				continue
+			}
+			elapsed := time.Since(firstSeen)
+			if elapsed < time.Duration(r.deps.FlattenGraceSec)*time.Second {
+				slog.DebugContext(ctx, "reconciler: position still in grace period; deferring flatten",
+					"symbol", pos.Symbol, "elapsed_sec", int(elapsed.Seconds()),
+					"grace_sec", r.deps.FlattenGraceSec)
+				continue
+			}
+			delete(r.firstSeen, pos.Symbol)
+
 			slog.Warn("reconciler: position has no SL/TP levels to attach; flattening",
 				"symbol", pos.Symbol)
 			r.flatten(ctx, pos, "no_protective_levels")
 			continue
 		}
+		// Position has SL/TP — remove from firstSeen if present.
+		delete(r.firstSeen, pos.Symbol)
 		req := domain.BracketRequest{
 			ParentIntentID: pos.CorrelationID,
 			CorrelationID:  pos.CorrelationID,

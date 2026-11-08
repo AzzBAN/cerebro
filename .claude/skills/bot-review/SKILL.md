@@ -60,10 +60,8 @@ reviewed as an independent slice, then cross-cutting concerns are audited.
   cache hit-rate sane.
 
 ### 7. Ingest & news — `internal/ingest/`
-- `news/cryptopanic/` (RE + headless fallback + circuit — see AGENTS.md),
-  `calendar/`, `coinglass/`, `scrape/`
-- Verify: CryptoPanic AES key/bundle hash current; fallback cooldown wired;
-  Redis cache keys (`news:latest`, `news:by_asset:<CODE>`) + TTLs; agent
+- `scrape/financialjuice.go` (RSS news feed), `calendar/`, `coinglass/`, `scrape/`
+- Verify: Redis cache keys (`news:latest`) + TTLs; agent
   `fetch_latest_news` reads cache first.
 
 ### 8. Persistence — `internal/adapter/postgres/`, migrations
@@ -131,7 +129,6 @@ make check      # dry-run config validation
 Optional, when the change set touches those areas:
 ```bash
 make test-int                                   # integration (needs DB)
-go test -tags=live ./internal/ingest/news/cryptopanic -run TestLive -v
 ```
 
 Report any build/lint/test failures as **critical** findings.

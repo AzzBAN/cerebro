@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
@@ -143,8 +144,8 @@ func TestReconciler_RefreshFindsProtection_SkipsFlatten(t *testing.T) {
 	broker := &stubReconBroker{refreshProtected: true}
 	r := NewReconciler(ReconcilerDeps{
 		Venue: domain.VenueBinanceFutures, Broker: broker, Tracker: NewBracketTracker(),
-		Router: nil, // flatten must NOT be reached (nil router would panic on Route)
-		Env:    domain.EnvironmentPaper,
+		Router:    nil, // flatten must NOT be reached (nil router would panic on Route)
+		Env:       domain.EnvironmentPaper,
 		Positions: func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
 	})
 
@@ -162,8 +163,8 @@ func TestReconciler_RefreshErrors_DefersFlatten(t *testing.T) {
 	broker := &stubReconBroker{refreshErr: errReconTest}
 	r := NewReconciler(ReconcilerDeps{
 		Venue: domain.VenueBinanceFutures, Broker: broker, Tracker: NewBracketTracker(),
-		Router: nil, // an inconclusive re-check must fail safe: no flatten this tick
-		Env:    domain.EnvironmentPaper,
+		Router:    nil, // an inconclusive re-check must fail safe: no flatten this tick
+		Env:       domain.EnvironmentPaper,
 		Positions: func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
 	})
 
@@ -210,6 +211,114 @@ type stubDecider struct {
 func (s *stubDecider) Review(_ context.Context, _ domain.PositionReview) (domain.ManagedAction, error) {
 	s.calls++
 	return s.action, nil
+}
+
+func TestReconciler_FlattenGracePeriod(t *testing.T) {
+	t.Run("does not flatten within grace period", func(t *testing.T) {
+		broker := &stubReconBroker{}
+		r := NewReconciler(ReconcilerDeps{
+			Venue:           domain.VenueBinanceFutures,
+			Broker:          broker,
+			Tracker:         NewBracketTracker(),
+			Router:          nil, // nil would panic if flatten reached — proves it is NOT reached
+			Env:             domain.EnvironmentPaper,
+			Positions:       func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
+			FlattenGraceSec: 30,
+		})
+
+		// First call should record firstSeen but not flatten
+		r.enforceBrackets(context.Background())
+		if len(broker.placedOrders) != 0 {
+			t.Errorf("expected no flatten within grace period, got %d orders", len(broker.placedOrders))
+		}
+		// firstSeen must be set
+		if _, ok := r.firstSeen["BTCUSDT"]; !ok {
+			t.Error("expected firstSeen to be recorded on first encounter")
+		}
+
+		// Second call still within grace period
+		r.enforceBrackets(context.Background())
+		if len(broker.placedOrders) != 0 {
+			t.Errorf("expected no flatten within grace period, got %d orders", len(broker.placedOrders))
+		}
+	})
+
+	t.Run("flattens after grace period expires", func(t *testing.T) {
+		broker := &stubReconBroker{}
+		router := NewRouter([]domain.Venue{domain.VenueBinanceFutures})
+		ch, _ := router.Channel(domain.VenueBinanceFutures)
+		go func() {
+			for req := range ch {
+				req.RespCh <- OrderResponse{BrokerOrderID: "flattened"}
+			}
+		}()
+		r := NewReconciler(ReconcilerDeps{
+			Venue:           domain.VenueBinanceFutures,
+			Broker:          broker,
+			Tracker:         NewBracketTracker(),
+			Router:          router,
+			Env:             domain.EnvironmentPaper,
+			Positions:       func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
+			FlattenGraceSec: 30,
+		})
+
+		// Manually set firstSeen to the past
+		r.firstSeen[domain.Symbol("BTCUSDT")] = time.Now().Add(-31 * time.Second)
+
+		r.enforceBrackets(context.Background())
+		// After grace period, it should reach the flatten path and route an order
+		if len(broker.placedBrackets) != 0 {
+			t.Errorf("expected no bracket after grace period, got %d", len(broker.placedBrackets))
+		}
+		// firstSeen must be cleared
+		if _, ok := r.firstSeen[domain.Symbol("BTCUSDT")]; ok {
+			t.Error("expected firstSeen to be cleared after flatten")
+		}
+	})
+
+	t.Run("clears firstSeen when position gains protection", func(t *testing.T) {
+		broker := &stubReconBroker{}
+		r := NewReconciler(ReconcilerDeps{
+			Venue:           domain.VenueBinanceFutures,
+			Broker:          broker,
+			Tracker:         NewBracketTracker(),
+			Router:          nil,
+			Env:             domain.EnvironmentPaper,
+			Positions:       func() []domain.Position { return []domain.Position{zeroProtPos("BTCUSDT")} },
+			FlattenGraceSec: 30,
+		})
+
+		// First call: record firstSeen
+		r.enforceBrackets(context.Background())
+		if _, ok := r.firstSeen[domain.Symbol("BTCUSDT")]; !ok {
+			t.Fatal("expected firstSeen to be recorded")
+		}
+
+		// Now position has protection (SL/TP set)
+		r.deps.Positions = func() []domain.Position { return []domain.Position{longPos("BTCUSDT")} }
+
+		r.enforceBrackets(context.Background())
+		if _, ok := r.firstSeen[domain.Symbol("BTCUSDT")]; ok {
+			t.Error("expected firstSeen to be cleared when position has protection")
+		}
+	})
+}
+
+func TestReconciler_FlattenGracePeriod_ZeroMeansNoGrace(t *testing.T) {
+	r := NewReconciler(ReconcilerDeps{
+		Venue:      domain.VenueBinanceFutures,
+		Broker:     &stubReconBroker{},
+		Tracker:    NewBracketTracker(),
+		Router:     NewRouter([]domain.Venue{domain.VenueBinanceFutures}),
+		Env:        domain.EnvironmentPaper,
+		Positions:  func() []domain.Position { return nil },
+		IntervalMS: 0,
+		// FlattenGraceSec not set (zero value) means no grace period
+	})
+
+	if r.deps.FlattenGraceSec != 0 {
+		t.Errorf("expected FlattenGraceSec=0 when not set, got %d", r.deps.FlattenGraceSec)
+	}
 }
 
 func TestReconciler_JobB_EnqueuesNonHoldDecision(t *testing.T) {

@@ -129,3 +129,33 @@ func TestFairEconomy_PreservesCtxDeadlineSentinel(t *testing.T) {
 		t.Fatalf("expected DeadlineExceeded, got: %v", err)
 	}
 }
+func TestFairEconomyCalendar_CachesEventsAcrossCalls(t *testing.T) {
+	requestsCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		when := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+		_, _ = w.Write([]byte(fmt.Sprintf(`[{"title":"Fed Chair Speaks","country":"USD","date":%q,"impact":"High"}]`, when)))
+	}))
+	defer srv.Close()
+
+	oldURL := faireconomyURL
+	faireconomyURL = srv.URL
+	defer func() { faireconomyURL = oldURL }()
+
+	cal := NewFairEconomy()
+	_, err1 := cal.UpcomingEvents(context.Background(), 24)
+	if err1 != nil {
+		t.Fatalf("first call failed: %v", err1)
+	}
+	_, err2 := cal.UpcomingEvents(context.Background(), 24)
+	if err2 != nil {
+		t.Fatalf("second call failed: %v", err2)
+	}
+
+	if requestsCount != 1 {
+		t.Errorf("expected 1 HTTP request due to caching, got %d", requestsCount)
+	}
+}
+

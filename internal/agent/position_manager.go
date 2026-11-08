@@ -91,7 +91,14 @@ func (p *PositionManagerAgent) Review(ctx context.Context, review domain.Positio
 		return p.llmFallback(review.Position, "template render failed"), nil
 	}
 
-	invokeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// Use configurable LLM timeout (default 120s). The hardcoded 60s was too
+	// tight for slow proxies and reasoning models — the FallbackChain splits
+	// the deadline across providers, leaving only ~30s each with 2 providers.
+	llmTimeoutSec := p.cfg.LLMTimeoutSec
+	if llmTimeoutSec <= 0 {
+		llmTimeoutSec = 120
+	}
+	invokeCtx, cancel := context.WithTimeout(ctx, time.Duration(llmTimeoutSec)*time.Second)
 	defer cancel()
 
 	result := p.runtime.Invoke(

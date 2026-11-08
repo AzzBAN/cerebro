@@ -12,6 +12,7 @@ import (
 
 	gobinance "github.com/adshao/go-binance/v2"
 	commonws "github.com/adshao/go-binance/v2/common/websocket"
+	"github.com/azhar/cerebro/internal/adapter/binance"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/google/uuid"
@@ -55,11 +56,11 @@ type spotProtectiveOrders struct {
 
 // SpotBroker implements port.Broker for Binance Spot REST calls.
 type SpotBroker struct {
-	client   *gobinance.Client
-	mode     spotMode
-	symbols  map[domain.Symbol]bool            // allowed trading pairs from config
-	minLots  map[domain.Symbol]decimal.Decimal // minimum tradeable qty per symbol (dust filter)
-	filters  *SpotExchangeInfo                 // symbol filter cache (PRICE/LOT/NOTIONAL)
+	client  *gobinance.Client
+	mode    spotMode
+	symbols map[domain.Symbol]bool            // allowed trading pairs from config
+	minLots map[domain.Symbol]decimal.Decimal // minimum tradeable qty per symbol (dust filter)
+	filters *SpotExchangeInfo                 // symbol filter cache (PRICE/LOT/NOTIONAL)
 
 	// resyncInterval overrides defaultPositionResyncInterval when positive.
 	resyncInterval time.Duration
@@ -366,6 +367,11 @@ func (b *SpotBroker) CancelBracket(ctx context.Context, resp domain.BracketRespo
 			Symbol(sym).
 			OrderListID(listID).
 			Do(ctx)
+		if binance.IsOrderNotFound(err) {
+			// OCO list already gone (filled/expired/cancelled) — cancel is
+			// idempotent, so the desired end state already holds.
+			return nil
+		}
 		return err
 	}
 
@@ -375,7 +381,8 @@ func (b *SpotBroker) CancelBracket(ctx context.Context, resp domain.BracketRespo
 		if id == "" {
 			continue
 		}
-		if err := b.cancelSpotByID(ctx, sym, id); err != nil && firstErr == nil {
+		if err := b.cancelSpotByID(ctx, sym, id); err != nil &&
+			!binance.IsOrderNotFound(err) && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -682,8 +689,11 @@ func (b *SpotBroker) runUserDataSession(ctx context.Context) error {
 		return fmt.Errorf("subscribe user data stream: %w", err)
 	}
 
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	go func() {
-		<-ctx.Done()
+		<-sessionCtx.Done()
 		_ = conn.Close()
 	}()
 

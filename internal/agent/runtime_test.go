@@ -19,10 +19,10 @@ func TestWrapAgentTimeout(t *testing.T) {
 	plain := errors.New("tool returned malformed JSON")
 
 	tests := []struct {
-		name           string
-		in             error
-		wantNil        bool
-		wantIsTimeout  bool
+		name          string
+		in            error
+		wantNil       bool
+		wantIsTimeout bool
 		// When wantIsTimeout is true, we additionally assert the deadline
 		// sentinel appears at most once in the formatted error.
 	}{

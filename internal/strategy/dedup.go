@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -8,38 +9,55 @@ import (
 	"github.com/azhar/cerebro/internal/domain"
 )
 
-// DedupWindow rejects signals that fire for the same symbol within a configurable
-// window. This prevents double exposure when multiple strategies agree simultaneously.
+// DedupWindow rejects repeat signals for the same (symbol, strategy, side) tuple
+// within a per-strategy window.
 type DedupWindow struct {
-	mu      sync.Mutex
-	window  time.Duration
-	lastSig map[domain.Symbol]time.Time
+	mu         sync.Mutex
+	defaultWin time.Duration
+	lastSig    map[string]time.Time
 }
 
-// NewDedupWindow creates a window with the given duration.
-func NewDedupWindow(window time.Duration) *DedupWindow {
+// NewDedupWindow creates a dedup tracker. defaultWindow is used for any signal
+// whose strategy does not supply a positive window via Allow.
+func NewDedupWindow(defaultWindow time.Duration) *DedupWindow {
+	if defaultWindow <= 0 {
+		defaultWindow = time.Minute
+	}
 	return &DedupWindow{
-		window:  window,
-		lastSig: make(map[domain.Symbol]time.Time),
+		defaultWin: defaultWindow,
+		lastSig:    make(map[string]time.Time),
 	}
 }
 
-// Allow returns true if the signal should be forwarded, false if it is a duplicate.
-// Records the current time for accepted signals.
-func (d *DedupWindow) Allow(sig domain.Signal) bool {
+// Allow reports whether sig should be forwarded, recording the time for
+// accepted signals. window is the strategy's configured dedup window; values
+// <= 0 fall back to the tracker's default.
+func (d *DedupWindow) Allow(sig domain.Signal, window time.Duration) bool {
+	if window <= 0 {
+		window = d.defaultWin
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	last, seen := d.lastSig[sig.Symbol]
-	if seen && time.Since(last) < d.window {
+	genAt := sig.GeneratedAt
+	if genAt.IsZero() {
+		genAt = time.Now().UTC()
+	}
+
+	key := fmt.Sprintf("%s:%s:%s", sig.Symbol, sig.Strategy, sig.Side)
+	last, seen := d.lastSig[key]
+	if seen && genAt.Sub(last) < window && genAt.Sub(last) >= 0 {
 		slog.Debug("signal deduplicated",
 			"symbol", sig.Symbol,
 			"strategy", sig.Strategy,
-			"last_signal_ago", time.Since(last).Round(time.Second),
+			"side", sig.Side,
+			"window", window,
+			"last_signal_ago", genAt.Sub(last).Round(time.Second),
 		)
 		return false
 	}
-	d.lastSig[sig.Symbol] = time.Now()
+	d.lastSig[key] = genAt
 	return true
 }
 
@@ -47,5 +65,5 @@ func (d *DedupWindow) Allow(sig domain.Signal) bool {
 func (d *DedupWindow) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.lastSig = make(map[domain.Symbol]time.Time)
+	d.lastSig = make(map[string]time.Time)
 }

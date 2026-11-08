@@ -50,24 +50,39 @@ type cachedTable struct {
 	fetched time.Time
 }
 
+type cachedLongShort struct {
+	ratio   domain.LongShortRatio
+	fetched time.Time
+}
+
 // CoinglassScraper implements port.DerivativesFeed by scraping the Coinglass
 // website using a headless Chromium instance via chromedp.
 // The homepage table is scraped via DOM extraction (API responses are encrypted).
 // Per-symbol pages are scraped via DOM extraction.
 type CoinglassScraper struct {
-	allocCtx   context.Context
-	cancel     context.CancelFunc
-	timeout    time.Duration
-	mu         sync.Mutex    // guards tableCache reads/writes
-	scrapeMu   sync.Mutex    // serializes homepage scrapes to prevent concurrent tab stampede
-	tableCache *cachedTable
-	cacheTTL   time.Duration
+	allocCtx      context.Context
+	allocCancel   context.CancelFunc
+	browserCtx    context.Context
+	browserCancel context.CancelFunc
+	browserMu     sync.Mutex
+	timeout       time.Duration
+	mu            sync.Mutex // guards tableCache, fgCache, and lsCache
+	scrapeMu      sync.Mutex // serializes homepage scrapes to prevent concurrent tab stampede
+	tableCache    *cachedTable
+	cacheTTL      time.Duration
+
+	fgCache   *domain.FearGreedIndex
+	fgFetched time.Time
+	fgTTL     time.Duration
+
+	lsCache map[string]*cachedLongShort
+	lsTTL   time.Duration
 }
 
 // NewCoinglassScraper creates a scraper backed by a headless Chromium process.
 func NewCoinglassScraper(timeout time.Duration) (*CoinglassScraper, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
+		chromedp.Flag("headless", "new"),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -75,21 +90,25 @@ func NewCoinglassScraper(timeout time.Duration) (*CoinglassScraper, error) {
 		chromedp.WindowSize(1920, 1080),
 	)
 
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-
-	s := &CoinglassScraper{
-		allocCtx: allocCtx,
-		cancel:   cancel,
-		timeout:  timeout,
-		cacheTTL: 2 * time.Minute,
-	}
-
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-	defer browserCancel()
 
 	if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
-		cancel()
+		browserCancel()
+		allocCancel()
 		return nil, fmt.Errorf("coinglass scraper: chromium launch: %w", err)
+	}
+
+	s := &CoinglassScraper{
+		allocCtx:      allocCtx,
+		allocCancel:   allocCancel,
+		browserCtx:    browserCtx,
+		browserCancel: browserCancel,
+		timeout:       timeout,
+		cacheTTL:      2 * time.Minute,
+		fgTTL:         15 * time.Minute,
+		lsCache:       make(map[string]*cachedLongShort),
+		lsTTL:         5 * time.Minute,
 	}
 
 	slog.Info("coinglass scraper: headless Chromium started")
@@ -97,8 +116,57 @@ func NewCoinglassScraper(timeout time.Duration) (*CoinglassScraper, error) {
 }
 
 func (s *CoinglassScraper) Close() {
-	s.cancel()
+	s.browserMu.Lock()
+	defer s.browserMu.Unlock()
+	if s.browserCancel != nil {
+		s.browserCancel()
+		s.browserCancel = nil
+	}
+	if s.allocCancel != nil {
+		s.allocCancel()
+		s.allocCancel = nil
+	}
 	slog.Info("coinglass scraper: Chromium process terminated")
+}
+
+func (s *CoinglassScraper) tabContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	s.browserMu.Lock()
+	defer s.browserMu.Unlock()
+
+	if s.browserCtx == nil || s.browserCtx.Err() != nil {
+		if s.allocCtx == nil || s.allocCtx.Err() != nil {
+			opts := append(chromedp.DefaultExecAllocatorOptions[:],
+				chromedp.Flag("headless", "new"),
+				chromedp.Flag("disable-gpu", true),
+				chromedp.Flag("no-sandbox", true),
+				chromedp.Flag("disable-dev-shm-usage", true),
+				chromedp.Flag("disable-blink-features", "AutomationControlled"),
+				chromedp.WindowSize(1920, 1080),
+			)
+			s.allocCtx, s.allocCancel = chromedp.NewExecAllocator(context.Background(), opts...)
+		}
+		bCtx, bCancel := chromedp.NewContext(s.allocCtx)
+		if err := chromedp.Run(bCtx, chromedp.Navigate("about:blank")); err != nil {
+			bCancel()
+			return nil, nil, fmt.Errorf("coinglass scraper: revive chromium: %w", err)
+		}
+		s.browserCtx = bCtx
+		s.browserCancel = bCancel
+	}
+
+	tabCtx, tabCancel := chromedp.NewContext(s.browserCtx)
+	scrapeCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
+	stop := context.AfterFunc(ctx, func() {
+		timeoutCancel()
+	})
+
+	cancel := func() {
+		stop()
+		timeoutCancel()
+		tabCancel()
+	}
+
+	return scrapeCtx, cancel, nil
 }
 
 func (s *CoinglassScraper) FundingRate(ctx context.Context, symbol domain.Symbol) (*domain.FundingRate, error) {
@@ -146,11 +214,11 @@ func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.S
 	coin := coinGlassSymbol(symbol)
 	url := coinglassBaseURL + "/LiquidationData"
 
-	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
+	tabCtx, tabCancel, err := s.tabContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer tabCancel()
-
-	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
-	defer timeoutCancel()
 
 	var raw string
 	if err := chromedp.Run(tabCtx,
@@ -162,21 +230,20 @@ func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.S
 		chromedp.Evaluate(`
 			(() => {
 				const tables = document.querySelectorAll('table');
-				for (const table of tables) {
-					const ths = Array.from(table.querySelectorAll('thead th'));
-					const headers = ths.map(th => th.textContent.trim());
+				for (let i = 0; i < tables.length; i++) {
+					const headers = Array.from(tables[i].querySelectorAll('th')).map(th => th.textContent.trim());
 					if (headers.length < 6) continue;
 					const hasSymbol = headers.some(h => /symbol|coin/i.test(h));
 					const hasLong = headers.some(h => /long/i.test(h));
 					const hasShort = headers.some(h => /short/i.test(h));
 					if (!hasSymbol || !hasLong || !hasShort) continue;
-					const rows = table.querySelectorAll('tbody tr');
-					const entries = [];
-					for (const row of rows) {
-						const cells = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
-						entries.push(cells);
+					let rows = Array.from(tables[i].querySelectorAll('tr')).map(r => Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim())).filter(r => r.length > 0 && r.some(c => c !== ''));
+					if (rows.length === 0 && i + 1 < tables.length) {
+						rows = Array.from(tables[i+1].querySelectorAll('tr')).map(r => Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim())).filter(r => r.length > 0 && r.some(c => c !== ''));
 					}
-					return JSON.stringify({headers, entries});
+					if (rows.length > 0) {
+						return JSON.stringify({headers, entries: rows});
+					}
 				}
 				return JSON.stringify({error: 'liquidation table not found'});
 			})()
@@ -189,6 +256,14 @@ func (s *CoinglassScraper) LiquidationZones(ctx context.Context, symbol domain.S
 }
 
 func (s *CoinglassScraper) FearGreed(ctx context.Context) (*domain.FearGreedIndex, error) {
+	s.mu.Lock()
+	if s.fgCache != nil && time.Since(s.fgFetched) < s.fgTTL {
+		cached := *s.fgCache
+		s.mu.Unlock()
+		return &cached, nil
+	}
+	s.mu.Unlock()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.alternative.me/fng/?limit=1", nil)
 	if err != nil {
 		return nil, fmt.Errorf("coinglass scraper: fear greed request: %w", err)
@@ -196,6 +271,14 @@ func (s *CoinglassScraper) FearGreed(ctx context.Context) (*domain.FearGreedInde
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		s.mu.Lock()
+		if s.fgCache != nil {
+			cached := *s.fgCache
+			s.mu.Unlock()
+			slog.Debug("coinglass scraper: fear greed fetch failed, serving stale cache", "error", err)
+			return &cached, nil
+		}
+		s.mu.Unlock()
 		return nil, fmt.Errorf("coinglass scraper: fear greed fetch: %w", err)
 	}
 	defer resp.Body.Close()
@@ -205,7 +288,14 @@ func (s *CoinglassScraper) FearGreed(ctx context.Context) (*domain.FearGreedInde
 		return nil, fmt.Errorf("coinglass scraper: fear greed read: %w", err)
 	}
 
-	return parseAlternativeMeFearGreed(body), nil
+	parsed := parseAlternativeMeFearGreed(body)
+	if parsed != nil && parsed.Value > 0 {
+		s.mu.Lock()
+		s.fgCache = parsed
+		s.fgFetched = time.Now()
+		s.mu.Unlock()
+	}
+	return parsed, nil
 }
 
 func (s *CoinglassScraper) Snapshot(ctx context.Context, symbol domain.Symbol) (*domain.DerivativesSnapshot, error) {
@@ -315,6 +405,15 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 	coin := coinGlassSymbol(symbol)
 
 	// Fast-path: skip non-crypto tickers (e.g. XAU, the gold synthetic)
+	s.mu.Lock()
+	if cached, ok := s.lsCache[coin]; ok && time.Since(cached.fetched) < s.lsTTL {
+		res := cached.ratio
+		res.Symbol = symbol
+		s.mu.Unlock()
+		return &res, nil
+	}
+	s.mu.Unlock()
+
 	// outright — Coinglass does not list them and the per-symbol page
 	// just returns an empty shell.
 	if !isCoinglassSupportedCoin(coin) {
@@ -335,11 +434,11 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 
 	url := coinglassBaseURL + "/LongShortRatio/" + coin
 
-	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
+	tabCtx, tabCancel, err := s.tabContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer tabCancel()
-
-	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
-	defer timeoutCancel()
 
 	// DOM scan: as of 2026 the LongShortRatio page serves a compact
 	// summary table with columns roughly shaped like:
@@ -364,31 +463,56 @@ func (s *CoinglassScraper) fetchLongShortRatio(ctx context.Context, symbol domai
 		chromedp.Evaluate(`
 			(() => {
 				const allTables = [];
-				for (const table of document.querySelectorAll('table')) {
-					const ths = Array.from(table.querySelectorAll('thead th'));
-					const headers = ths.map(th => th.textContent.trim());
-					const rows = table.querySelectorAll('tbody tr');
-					const entries = [];
-					for (const row of rows) {
-						const cells = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
-						entries.push(cells);
+				const tables = document.querySelectorAll('table');
+				for (let i = 0; i < tables.length; i++) {
+					const headers = Array.from(tables[i].querySelectorAll('th')).map(th => th.textContent.trim());
+					let rows = Array.from(tables[i].querySelectorAll('tr')).map(r => Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim())).filter(r => r.length > 0 && r.some(c => c !== ''));
+					if (rows.length === 0 && i + 1 < tables.length) {
+						rows = Array.from(tables[i+1].querySelectorAll('tr')).map(r => Array.from(r.querySelectorAll('td')).map(c => c.textContent.trim())).filter(r => r.length > 0 && r.some(c => c !== ''));
 					}
-					allTables.push({headers, entries});
+					allTables.push({headers, entries: rows});
 					const hasLongShort = headers.some(h => /long\s*\/\s*short/i.test(h) || (/long/i.test(h) && /short/i.test(h)));
-					if (hasLongShort && entries.length > 0) {
-						return JSON.stringify({headers, entries});
+					if (hasLongShort && rows.length > 0) {
+						return JSON.stringify({headers, entries: rows});
 					}
 				}
 				return JSON.stringify({error: 'long/short table not found', seen: allTables});
 			})()
 		`, &raw),
 	); err != nil {
+		s.mu.Lock()
+		if cached, ok := s.lsCache[coin]; ok {
+			res := cached.ratio
+			res.Symbol = symbol
+			s.mu.Unlock()
+			slog.Debug("coinglass scraper: long/short scrape failed, serving stale cache", "coin", coin, "error", err)
+			return &res, nil
+		}
+		s.mu.Unlock()
 		return nil, fmt.Errorf("coinglass scraper: long/short %s: %w", coin, err)
 	}
 
-	return parseLongShortDOM(raw, symbol), nil
+	parsed := parseLongShortDOM(raw, symbol)
+	if parsed != nil && parsed.GlobalRatio > 0 {
+		s.mu.Lock()
+		s.lsCache[coin] = &cachedLongShort{
+			ratio:   *parsed,
+			fetched: time.Now(),
+		}
+		s.mu.Unlock()
+	} else {
+		s.mu.Lock()
+		if cached, ok := s.lsCache[coin]; ok {
+			res := cached.ratio
+			res.Symbol = symbol
+			s.mu.Unlock()
+			slog.Debug("coinglass scraper: long/short parsed empty, serving stale cache", "coin", coin)
+			return &res, nil
+		}
+		s.mu.Unlock()
+	}
+	return parsed, nil
 }
-
 // isCoinglassSupportedCoin filters obvious non-crypto symbols out of the
 // Coinglass pipeline. The Coinglass universe is crypto derivatives only
 // (BTC, ETH, SOL, …) — synthetic/commodity tickers such as XAU (gold)
@@ -421,11 +545,11 @@ func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[strin
 		return cached, nil
 	}
 
-	tabCtx, tabCancel := chromedp.NewContext(s.allocCtx)
+	tabCtx, tabCancel, err := s.tabContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer tabCancel()
-
-	tabCtx, timeoutCancel := context.WithTimeout(tabCtx, s.timeout)
-	defer timeoutCancel()
 
 	var tableJSON string
 	if err := chromedp.Run(tabCtx,
@@ -437,14 +561,34 @@ func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[strin
 		// Falls back to a fixed sleep if the selector doesn't appear in time
 		// (Coinglass sometimes renders via client-side hydration).
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			waitCtx, waitCancel := context.WithTimeout(ctx, 8*time.Second)
+			waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer waitCancel()
-			err := chromedp.WaitVisible("table tbody tr", chromedp.ByQuery).Do(waitCtx)
-			if err != nil {
-				slog.Debug("coinglass scraper: WaitVisible timed out; falling back to sleep", "error", err)
-				chromedp.Sleep(5 * time.Second).Do(ctx)
+			for {
+				select {
+				case <-waitCtx.Done():
+					return nil
+				default:
+				}
+				var ready bool
+				_ = chromedp.Evaluate(`
+					(() => {
+						const tables = document.querySelectorAll('table');
+						if (tables.length < 2) return false;
+						const rows = tables[1].querySelectorAll('tr');
+						for (const r of rows) {
+							const cells = r.querySelectorAll('td');
+							if (cells.length > 2 && cells[2].textContent.trim().length > 0) {
+								return true;
+							}
+						}
+						return false;
+					})()
+				`, &ready).Do(waitCtx)
+				if ready {
+					return nil
+				}
+				time.Sleep(200 * time.Millisecond)
 			}
-			return nil
 		}),
 
 		// Extract table[1] rows (the derivatives table with data rows).
@@ -455,7 +599,7 @@ func (s *CoinglassScraper) fetchDerivativesTable(ctx context.Context) (map[strin
 			(() => {
 				const tables = document.querySelectorAll('table');
 				if (tables.length < 2) return JSON.stringify({error: 'table not found', count: tables.length});
-				const rows = tables[1].querySelectorAll('tbody tr');
+				const rows = tables[1].querySelectorAll('tr');
 				const entries = [];
 				for (const row of rows) {
 					const cells = row.querySelectorAll('td');

@@ -5,7 +5,7 @@ configs/markets.yaml
 configs/strategies.yaml
 
 # Binaries
-cerebro
+/cerebro
 /dist/
 
 # Embedded web frontend build output (rebuilt by `make web`; keep the
@@ -24,7 +24,17 @@ testdata/real/
 
 # OS
 .DS_Store
+**/.DS_Store
 Thumbs.db
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# Graphify knowledge graph cache
+graphify-out/
+
+# Agent runtime state
+configs/pending_symbols.jsonl
 
 # Go
 vendor/
@@ -35,3 +45,5 @@ logs/*.log
 
 # MCP server config (contains API keys)
 .mcp.json
+# Backtest reports
+*_report.json

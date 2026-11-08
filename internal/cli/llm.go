@@ -167,11 +167,11 @@ func printBudgetSnapshot(w io.Writer, snap agent.BudgetSnapshot) {
 
 func newLLMBudgetResetCommand() *cobra.Command {
 	var (
-		provider     string
-		date         string
-		resetTokens  bool
-		resetCost    bool
-		resetAll     bool
+		provider    string
+		date        string
+		resetTokens bool
+		resetCost   bool
+		resetAll    bool
 	)
 
 	cmd := &cobra.Command{

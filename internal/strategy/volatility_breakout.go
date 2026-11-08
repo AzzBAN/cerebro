@@ -18,13 +18,14 @@ type VolatilityBreakout struct {
 	cfg     config.StrategyConfig
 	symbols []domain.Symbol
 
-	atr      map[domain.Symbol]*indicators.ATR
+	atr       map[domain.Symbol]*indicators.ATR
 	bollinger map[domain.Symbol]*indicators.Bollinger
-	warmup   map[domain.Symbol]int
+	warmup    map[domain.Symbol]int
 
 	// Track the consolidation range within the current session window.
 	sessionHigh map[domain.Symbol]decimal.Decimal
 	sessionLow  map[domain.Symbol]decimal.Decimal
+	sessionDay  map[domain.Symbol]time.Time
 }
 
 // NewVolatilityBreakout creates a VolatilityBreakout strategy from config.
@@ -41,6 +42,7 @@ func NewVolatilityBreakout(cfg config.StrategyConfig) *VolatilityBreakout {
 		warmup:      make(map[domain.Symbol]int),
 		sessionHigh: make(map[domain.Symbol]decimal.Decimal),
 		sessionLow:  make(map[domain.Symbol]decimal.Decimal),
+		sessionDay:  make(map[domain.Symbol]time.Time),
 	}
 	for _, sym := range syms {
 		s.atr[sym] = indicators.NewATR(cfg.Indicators.ATR.Period)
@@ -51,8 +53,8 @@ func NewVolatilityBreakout(cfg config.StrategyConfig) *VolatilityBreakout {
 	return s
 }
 
-func (v *VolatilityBreakout) Name() domain.StrategyName  { return v.cfg.Name }
-func (v *VolatilityBreakout) Symbols() []domain.Symbol    { return v.symbols }
+func (v *VolatilityBreakout) Name() domain.StrategyName { return v.cfg.Name }
+func (v *VolatilityBreakout) Symbols() []domain.Symbol  { return v.symbols }
 func (v *VolatilityBreakout) Timeframes() []domain.Timeframe {
 	return []domain.Timeframe{v.cfg.PrimaryTimeframe}
 }
@@ -66,6 +68,11 @@ func (v *VolatilityBreakout) OnCandle(_ context.Context, c domain.Candle) (domai
 		return domain.Signal{}, false
 	}
 
+	currentDay := c.CloseTime.UTC().Truncate(24 * time.Hour)
+	if lastDay, ok := v.sessionDay[c.Symbol]; !ok || !currentDay.Equal(lastDay) {
+		v.sessionDay[c.Symbol] = currentDay
+		v.resetSessionRange(c)
+	}
 	atr := v.atr[c.Symbol]
 	bb := v.bollinger[c.Symbol]
 
@@ -138,6 +145,10 @@ func (v *VolatilityBreakout) resetSessionRange(c domain.Candle) {
 
 func (v *VolatilityBreakout) newSignal(c domain.Candle, side domain.Side, reason string) domain.Signal {
 	id := uuid.New().String()
+	genAt := c.CloseTime
+	if genAt.IsZero() {
+		genAt = time.Now().UTC()
+	}
 	return domain.Signal{
 		ID:            id,
 		CorrelationID: id,
@@ -146,7 +157,7 @@ func (v *VolatilityBreakout) newSignal(c domain.Candle, side domain.Side, reason
 		Side:          side,
 		Timeframe:     c.Timeframe,
 		Reason:        reason,
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   genAt,
 	}
 }
 

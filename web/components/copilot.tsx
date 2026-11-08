@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Panel } from "./shared";
 import { postCommand } from "@/lib/api";
+import { useStore } from "@/lib/store";
 
 interface ChatMsg {
   role: "user" | "assistant";
@@ -11,7 +12,8 @@ interface ChatMsg {
 
 /** Copilot is the chat transcript + command input that calls /api/command. */
 export function Copilot() {
-  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const msgs = useStore((s) => s.chatMsgs);
+  const addMsg = useStore((s) => s.addChatMsg);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
@@ -23,7 +25,7 @@ export function Copilot() {
   const send = async () => {
     const q = input.trim();
     if (!q || loading) return;
-    setMsgs((m) => [...m, { role: "user", text: q }]);
+    addMsg({ role: "user", text: q });
     setInput("");
     setLoading(true);
     try {
@@ -31,9 +33,9 @@ export function Copilot() {
       // pass through verbatim.
       const cmd = q.startsWith("/") ? q : `/ask ${q}`;
       const reply = await postCommand(cmd);
-      setMsgs((m) => [...m, { role: "assistant", text: reply }]);
+      addMsg({ role: "assistant", text: reply });
     } catch (e) {
-      setMsgs((m) => [...m, { role: "assistant", text: `Error: ${(e as Error).message}` }]);
+      addMsg({ role: "assistant", text: `Error: ${(e as Error).message}` });
     } finally {
       setLoading(false);
     }

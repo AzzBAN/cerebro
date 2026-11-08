@@ -22,7 +22,7 @@ type stubBroker struct {
 	posErr    error
 }
 
-func (s *stubBroker) Connect(_ context.Context) error                                 { return nil }
+func (s *stubBroker) Connect(_ context.Context) error { return nil }
 func (s *stubBroker) StreamQuotes(_ context.Context, _ []domain.Symbol) (<-chan domain.Quote, error) {
 	return nil, nil
 }
@@ -32,8 +32,8 @@ func (s *stubBroker) PlaceOrder(_ context.Context, _ domain.OrderIntent) (string
 func (s *stubBroker) PlaceBracket(_ context.Context, _ domain.BracketRequest) (domain.BracketResponse, error) {
 	return domain.BracketResponse{}, nil
 }
-func (s *stubBroker) CancelOrder(_ context.Context, _ domain.CancelRequest) error       { return nil }
-func (s *stubBroker) CancelBracket(_ context.Context, _ domain.BracketResponse) error   { return nil }
+func (s *stubBroker) CancelOrder(_ context.Context, _ domain.CancelRequest) error     { return nil }
+func (s *stubBroker) CancelBracket(_ context.Context, _ domain.BracketResponse) error { return nil }
 func (s *stubBroker) Positions(_ context.Context) ([]domain.Position, error) {
 	if s.posErr != nil {
 		return nil, s.posErr

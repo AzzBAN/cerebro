@@ -13,6 +13,9 @@ type EMA struct {
 
 // NewEMA creates an EMA calculator for the given period.
 func NewEMA(period int) *EMA {
+	if period <= 0 {
+		period = 50
+	}
 	k := decimal.NewFromInt(2).Div(decimal.NewFromInt(int64(period + 1)))
 	return &EMA{period: period, k: k}
 }

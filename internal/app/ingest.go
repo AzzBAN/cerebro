@@ -3,21 +3,19 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/azhar/cerebro/internal/config"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/execution/paper"
-	"github.com/azhar/cerebro/internal/ingest/news/cryptopanic"
 	"github.com/azhar/cerebro/internal/ingest/scrape"
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/azhar/cerebro/internal/risk"
 	"github.com/azhar/cerebro/internal/tui"
 	"github.com/shopspring/decimal"
 	"golang.org/x/sync/errgroup"
@@ -190,16 +188,14 @@ func runFillMonitor(
 }
 
 // startIngestRunners launches periodic ingest goroutines for CoinGlass,
-// CryptoPanic + FinancialJuice (combined), and Finnhub feeds. tuiRunner is
-// optional; when non-nil, macro indicators are pushed to the TUI's Macro
-// panel after each CoinGlass cycle and the merged news digest is pushed to
-// the News panel after each news cycle.
+// FinancialJuice, and Finnhub feeds. tuiRunner is optional; when non-nil,
+// macro indicators are pushed to the TUI's Macro panel after each CoinGlass
+// cycle and the news digest is pushed to the News panel after each news cycle.
 //
-// newsFeed is the CryptoPanic feed (nil when disabled). fjFeed is the
-// FinancialJuice feed (nil when disabled). When both are enabled they run
-// inside a single news runner: the combined refresher pulls from each in
-// turn, dedupes by ID, sorts newest-first, writes the merged stream to
-// `news:latest`, and pushes the top 10 to the TUI.
+// fjFeed is the FinancialJuice feed (nil when disabled). When enabled it runs
+// inside the news runner: the refresher pulls items, dedupes by ID, sorts
+// newest-first, writes the stream to `news:latest`, and pushes the top 10 to
+// the TUI.
 func startIngestRunners(
 	ctx context.Context,
 	g *errgroup.Group,
@@ -209,13 +205,18 @@ func startIngestRunners(
 	newsFeed port.NewsFeed,
 	fjFeed port.NewsFeed,
 	calFeed port.CalendarFeed,
+	cal *risk.CalendarBlackout,
 	uiSink multiSink,
 ) {
 	symbols := collectSymbolList(cfg.Markets)
 
-	if cfg.Ingest.CoinGlass.Enabled && derivFeed != nil {
+	if (cfg.Ingest.CoinGlass.Enabled || cfg.Ingest.CoinGlassScraper.Enabled) && derivFeed != nil {
 		interval := durOrDefault(cfg.Ingest.CoinGlass.IntervalMinutes, 30) * time.Minute
 		timeout := durOrDefault(cfg.Ingest.CoinGlass.TimeoutSeconds, 10) * time.Second
+		if !cfg.Ingest.CoinGlass.Enabled && cfg.Ingest.CoinGlassScraper.Enabled {
+			interval = durOrDefault(cfg.Ingest.CoinGlassScraper.IntervalMinutes, 5) * time.Minute
+			timeout = durOrDefault(cfg.Ingest.CoinGlassScraper.TimeoutSeconds, 90) * time.Second
+		}
 		runner := scrape.NewRunner("coinglass", interval, timeout, func(ctx context.Context) error {
 			snaps := make(map[domain.Symbol]*domain.DerivativesSnapshot, len(symbols))
 			for _, sym := range symbols {
@@ -239,48 +240,14 @@ func startIngestRunners(
 		g.Go(func() error { return runner.Run(ctx) })
 	}
 
-	// News runner — combines CryptoPanic + FinancialJuice when both are
-	// enabled. Picks interval/timeout from the primary (CryptoPanic if on,
-	// else FinancialJuice). When both are enabled, FinancialJuice is
-	// scraped on the CryptoPanic cadence, which is fine — its RSS endpoint
-	// has no published rate limit beyond Cloudflare's generic 429 backoff.
-	cpEnabled := cfg.Ingest.CryptoPanic.Enabled && newsFeed != nil
+	// News runner — FinancialJuice RSS feed.
 	fjEnabled := cfg.Ingest.FinancialJuice.Enabled && fjFeed != nil
-	if cpEnabled || fjEnabled {
-		var (
-			interval time.Duration
-			timeout  time.Duration
-			name     string
-		)
-		switch {
-		case cpEnabled && fjEnabled:
-			interval = durOrDefault(cfg.Ingest.CryptoPanic.IntervalMinutes, 15) * time.Minute
-			timeout = durOrDefault(cfg.Ingest.CryptoPanic.TimeoutSeconds, 15) * time.Second
-			name = "news"
-		case cpEnabled:
-			interval = durOrDefault(cfg.Ingest.CryptoPanic.IntervalMinutes, 15) * time.Minute
-			timeout = durOrDefault(cfg.Ingest.CryptoPanic.TimeoutSeconds, 15) * time.Second
-			name = "cryptopanic"
-		default: // fjEnabled
-			interval = durOrDefault(cfg.Ingest.FinancialJuice.IntervalMinutes, 10) * time.Minute
-			timeout = durOrDefault(cfg.Ingest.FinancialJuice.TimeoutSeconds, 30) * time.Second
-			name = "financialjuice"
-		}
-		maxItems := cfg.Ingest.CryptoPanic.MaxItems
-		if maxItems <= 0 {
-			maxItems = 50
-		}
-		currencies := cfg.Ingest.CryptoPanic.Currencies
-		cpFeed := newsFeed
-		if !cpEnabled {
-			cpFeed = nil
-		}
-		fjArg := fjFeed
-		if !fjEnabled {
-			fjArg = nil
-		}
-		runner := scrape.NewRunner(name, interval, timeout, func(ctx context.Context) error {
-			return refreshNewsCache(ctx, cpFeed, fjArg, cache, uiSink, currencies, maxItems, interval)
+	if fjEnabled {
+		interval := durOrDefault(cfg.Ingest.FinancialJuice.IntervalMinutes, 10) * time.Minute
+		timeout := durOrDefault(cfg.Ingest.FinancialJuice.TimeoutSeconds, 30) * time.Second
+		const maxItems = 50
+		runner := scrape.NewRunner("financialjuice", interval, timeout, func(ctx context.Context) error {
+			return refreshNewsCache(ctx, fjFeed, cache, uiSink, maxItems, interval)
 		})
 		g.Go(func() error { return runner.Run(ctx) })
 	}
@@ -295,6 +262,9 @@ func startIngestRunners(
 			}
 			b, _ := json.Marshal(events)
 			_ = cache.Set(ctx, "calendar:upcoming", b, interval*2)
+			if cal != nil {
+				cal.Update(events)
+			}
 			slog.Debug("finnhub: calendar cached", "events", len(events))
 			return nil
 		})
@@ -390,33 +360,27 @@ func containsFold(s, sub string) bool {
 	return false
 }
 
-// refreshNewsCache runs one combined news ingest tick. It pulls from the
-// CryptoPanic feed (when set) — global stream plus any per-currency feeds
-// listed in config — and from the FinancialJuice feed (when set), then
-// dedupes the combined result by NewsItem.ID, sorts newest-first, caps to
-// maxItems and writes the result to Redis under "news:latest" plus per-asset
-// keys "news:by_asset:<CODE>" (CryptoPanic only — FJ has no asset-keyed
-// query). When tuiRunner is non-nil the top 10 merged items are pushed to
-// the TUI's News panel.
+// refreshNewsCache runs one news ingest tick. It pulls from the
+// FinancialJuice feed, dedupes by NewsItem.ID, sorts newest-first, caps to
+// maxItems and writes the result to Redis under "news:latest". When uiSink is
+// non-empty the top 10 items are pushed to the TUI's News panel.
 //
-// Either feed may be nil; passing both nil is a no-op.
+// fjFeed may be nil, in which case this is a no-op.
 func refreshNewsCache(
 	ctx context.Context,
-	cpFeed port.NewsFeed,
 	fjFeed port.NewsFeed,
 	cache port.Cache,
 	uiSink multiSink,
-	currencies []string,
 	maxItems int,
 	interval time.Duration,
 ) error {
-	if cpFeed == nil && fjFeed == nil {
+	if fjFeed == nil {
 		return nil
 	}
 
 	seen := make(map[string]struct{}, maxItems*2)
 	var combined []port.NewsItem
-	var cpCount, fjCount int
+	var fjCount int
 
 	appendUnique := func(items []port.NewsItem) int {
 		added := 0
@@ -437,60 +401,11 @@ func refreshNewsCache(
 		return added
 	}
 
-	// 1) CryptoPanic global feed + per-currency feeds.
-	//
-	// When the client is inside a 429 cooldown, the global call returns
-	// ErrRateLimited immediately and every per-asset call would do the
-	// same. Skip the per-asset loop in that case: the Redis cache (TTL =
-	// interval × 3) continues to serve the previous tick's snapshot to
-	// the agent and the TUI, and we log a single INFO line instead of
-	// spraying WARN for every asset.
-	if cpFeed != nil {
-		rateLimited := false
-		items, err := cpFeed.FetchLatest(ctx, "", maxItems)
-		switch {
-		case err == nil:
-			cpCount += appendUnique(items)
-		case errors.Is(err, cryptopanic.ErrRateLimited):
-			rateLimited = true
-			slog.Info("cryptopanic: rate-limited, skipping tick (cache still warm)", "error", err)
-		default:
-			slog.Warn("cryptopanic: global fetch failed", "error", err)
-		}
-
-		if !rateLimited {
-			for _, asset := range currencies {
-				asset = strings.ToUpper(strings.TrimSpace(asset))
-				if asset == "" {
-					continue
-				}
-				assetItems, err := cpFeed.FetchLatest(ctx, asset, maxItems)
-				if err != nil {
-					if errors.Is(err, cryptopanic.ErrRateLimited) {
-						// Global succeeded but we tripped mid-loop —
-						// stop; the rest would only hit the cooldown.
-						slog.Info("cryptopanic: rate-limited mid-tick, stopping per-asset fetches", "asset", asset)
-						break
-					}
-					slog.Warn("cryptopanic: asset fetch failed", "asset", asset, "error", err)
-					continue
-				}
-				if b, err := json.Marshal(assetItems); err == nil {
-					_ = cache.Set(ctx, "news:by_asset:"+asset, b, interval*3)
-				}
-				cpCount += appendUnique(assetItems)
-			}
-		}
-	}
-
-	// 2) FinancialJuice — single global RSS pull (no asset-keyed query).
-	if fjFeed != nil {
-		items, err := fjFeed.FetchLatest(ctx, "", maxItems)
-		if err != nil {
-			slog.Warn("financialjuice: fetch failed", "error", err)
-		} else {
-			fjCount += appendUnique(items)
-		}
+	// FinancialJuice — single global RSS pull (no asset-keyed query).
+	if items, err := fjFeed.FetchLatest(ctx, "", maxItems); err != nil {
+		slog.Warn("financialjuice: fetch failed", "error", err)
+	} else {
+		fjCount += appendUnique(items)
 	}
 
 	if len(combined) == 0 {
@@ -525,8 +440,6 @@ func refreshNewsCache(
 
 	slog.Info("news: cache refreshed",
 		"items", len(combined),
-		"cryptopanic", cpCount,
-		"financialjuice", fjCount,
-		"assets", len(currencies))
+		"financialjuice", fjCount)
 	return nil
 }

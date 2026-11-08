@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -25,20 +26,26 @@ var faireconomyURL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 // FairEconomyCalendar implements port.CalendarFeed using the free FairEconomy
 // weekly economic calendar feed. No API key is required.
 type FairEconomyCalendar struct {
-	client *http.Client
+	client    *http.Client
+	mu        sync.RWMutex
+	cachedRaw []faireconomyEvent
+	cachedAt  time.Time
+	cacheTTL  time.Duration
 }
 
-// NewFairEconomy creates a FairEconomyCalendar with a default timeout.
+// NewFairEconomy creates a FairEconomyCalendar with a default timeout and 1h cache TTL.
 func NewFairEconomy() *FairEconomyCalendar {
 	return &FairEconomyCalendar{
-		client: &http.Client{Timeout: 15 * time.Second},
+		client:   &http.Client{Timeout: 15 * time.Second},
+		cacheTTL: 1 * time.Hour,
 	}
 }
 
-// NewFairEconomyWithTimeout creates a FairEconomyCalendar with a custom timeout.
+// NewFairEconomyWithTimeout creates a FairEconomyCalendar with a custom timeout and 1h cache TTL.
 func NewFairEconomyWithTimeout(timeout time.Duration) *FairEconomyCalendar {
 	return &FairEconomyCalendar{
-		client: &http.Client{Timeout: timeout},
+		client:   &http.Client{Timeout: timeout},
+		cacheTTL: 1 * time.Hour,
 	}
 }
 
@@ -56,48 +63,78 @@ type faireconomyEvent struct {
 
 // UpcomingEvents returns economic events scheduled within the next hours hours.
 func (f *FairEconomyCalendar) UpcomingEvents(ctx context.Context, hours int) ([]domain.EconomicEvent, error) {
+	f.mu.RLock()
+	hasCache := len(f.cachedRaw) > 0
+	isFresh := time.Since(f.cachedAt) < f.cacheTTL
+	raw := f.cachedRaw
+	f.mu.RUnlock()
+
+	if !hasCache || !isFresh {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, faireconomyURL, nil)
+		if err != nil {
+			if hasCache {
+				return f.filterEvents(raw, hours), nil
+			}
+			return nil, fmt.Errorf("faireconomy calendar: build request: %w", err)
+		}
+		// A browser-like User-Agent avoids the upstream CDN returning 403 to
+		// default Go transport agents.
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+
+		resp, err := f.client.Do(req)
+		if err != nil {
+			if hasCache {
+				slog.Warn("faireconomy calendar: fetch failed; returning stale cache", "error", err)
+				return f.filterEvents(raw, hours), nil
+			}
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return nil, fmt.Errorf("faireconomy calendar: http: %w", context.DeadlineExceeded)
+			case errors.Is(err, context.Canceled):
+				return nil, fmt.Errorf("faireconomy calendar: http: %w", context.Canceled)
+			default:
+				return nil, fmt.Errorf("faireconomy calendar: http: %w", err)
+			}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			if hasCache {
+				slog.Warn("faireconomy calendar: non-200 status; returning stale cache", "status", resp.StatusCode)
+				return f.filterEvents(raw, hours), nil
+			}
+			return nil, fmt.Errorf("faireconomy calendar: status %d", resp.StatusCode)
+		}
+
+		var fetched []faireconomyEvent
+		if err := json.NewDecoder(resp.Body).Decode(&fetched); err != nil {
+			if hasCache {
+				return f.filterEvents(raw, hours), nil
+			}
+			return nil, fmt.Errorf("faireconomy calendar: decode: %w", err)
+		}
+
+		f.mu.Lock()
+		f.cachedRaw = fetched
+		f.cachedAt = time.Now().UTC()
+		raw = fetched
+		f.mu.Unlock()
+	}
+
+	events := f.filterEvents(raw, hours)
+	slog.DebugContext(ctx, "faireconomy calendar: parsed events", "total", len(raw), "upcoming", len(events))
+	return events, nil
+}
+
+func (f *FairEconomyCalendar) filterEvents(raw []faireconomyEvent, hours int) []domain.EconomicEvent {
 	now := time.Now().UTC()
 	to := now.Add(time.Duration(hours) * time.Hour)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, faireconomyURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("faireconomy calendar: build request: %w", err)
-	}
-	// A browser-like User-Agent avoids the upstream CDN returning 403 to
-	// default Go transport agents.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-
-	resp, err := f.client.Do(req)
-	if err != nil {
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			return nil, fmt.Errorf("faireconomy calendar: http: %w", context.DeadlineExceeded)
-		case errors.Is(err, context.Canceled):
-			return nil, fmt.Errorf("faireconomy calendar: http: %w", context.Canceled)
-		default:
-			return nil, fmt.Errorf("faireconomy calendar: http: %w", err)
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("faireconomy calendar: status %d", resp.StatusCode)
-	}
-
-	var raw []faireconomyEvent
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("faireconomy calendar: decode: %w", err)
-	}
-
 	var events []domain.EconomicEvent
 	for _, e := range raw {
 		if strings.TrimSpace(e.Title) == "" {
 			continue
 		}
-		// The feed dates carry a numeric timezone offset (e.g. -04:00),
-		// so RFC3339 parses them directly. Normalise to UTC for window
-		// comparison.
 		t, err := time.Parse(time.RFC3339, e.Date)
 		if err != nil {
 			continue
@@ -113,9 +150,7 @@ func (f *FairEconomyCalendar) UpcomingEvents(ctx context.Context, hours int) ([]
 			ScheduledAt: t,
 		})
 	}
-
-	slog.DebugContext(ctx, "faireconomy calendar: parsed events", "total", len(raw), "upcoming", len(events))
-	return events, nil
+	return events
 }
 
 // normalizeImpact maps the feed's impact labels (High/Medium/Low/Holiday) to

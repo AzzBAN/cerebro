@@ -25,8 +25,8 @@ func currentBaseURL() string {
 // All requests carry the CG-API-KEY header.
 // Retry policy: 3 attempts with exponential backoff (100ms, 200ms, 400ms).
 type Client struct {
-	apiKey  string
-	http    *http.Client
+	apiKey string
+	http   *http.Client
 }
 
 // New creates a CoinGlass client.

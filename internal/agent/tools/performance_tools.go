@@ -13,14 +13,14 @@ import (
 
 // StrategyPerformance holds aggregated performance metrics for a strategy+symbol pair.
 type StrategyPerformance struct {
-	Strategy            string          `json:"strategy"`
-	Symbol              string          `json:"symbol"`
-	TotalTrades         int             `json:"total_trades"`
-	WinRate             float64         `json:"win_rate"`
-	AvgPnL              string          `json:"avg_pnl"`
-	ConsecutiveLosses   int             `json:"consecutive_losses"`
-	NetPnL              string          `json:"net_pnl"`
-	ConsecutiveLossesEnd *time.Time     `json:"consecutive_losses_end,omitempty"`
+	Strategy             string     `json:"strategy"`
+	Symbol               string     `json:"symbol"`
+	TotalTrades          int        `json:"total_trades"`
+	WinRate              float64    `json:"win_rate"`
+	AvgPnL               string     `json:"avg_pnl"`
+	ConsecutiveLosses    int        `json:"consecutive_losses"`
+	NetPnL               string     `json:"net_pnl"`
+	ConsecutiveLossesEnd *time.Time `json:"consecutive_losses_end,omitempty"`
 }
 
 // GetStrategyPerformance returns a tool that queries recent trade performance
@@ -115,13 +115,13 @@ func AggregatePerformance(trades []domain.Trade) []StrategyPerformance {
 		consec, consecEnd := countConsecutiveLosses(acc.trades)
 
 		result = append(result, StrategyPerformance{
-			Strategy:            key.strategy,
-			Symbol:              key.symbol,
-			TotalTrades:         total,
-			WinRate:             winRate,
-			AvgPnL:              avgPnL.StringFixed(4),
-			NetPnL:              acc.totalPnL.StringFixed(4),
-			ConsecutiveLosses:   consec,
+			Strategy:             key.strategy,
+			Symbol:               key.symbol,
+			TotalTrades:          total,
+			WinRate:              winRate,
+			AvgPnL:               avgPnL.StringFixed(4),
+			NetPnL:               acc.totalPnL.StringFixed(4),
+			ConsecutiveLosses:    consec,
 			ConsecutiveLossesEnd: consecEnd,
 		})
 	}

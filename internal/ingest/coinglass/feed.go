@@ -25,9 +25,9 @@ func NewFeed(client *Client) *Feed {
 func (f *Feed) FundingRate(ctx context.Context, symbol domain.Symbol) (*domain.FundingRate, error) {
 	var resp apiResponse
 	if err := f.client.get(ctx, "/api/futures/funding-rate/oi-weight-history", map[string]string{
-		"symbol":    coinGlassSymbol(symbol),
-		"interval":  "h8",
-		"limit":     "1",
+		"symbol":   coinGlassSymbol(symbol),
+		"interval": "h8",
+		"limit":    "1",
 	}, &resp); err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func (f *Feed) FundingRate(ctx context.Context, symbol domain.Symbol) (*domain.F
 func (f *Feed) OpenInterest(ctx context.Context, symbol domain.Symbol) (*domain.OpenInterest, error) {
 	var resp apiResponse
 	if err := f.client.get(ctx, "/api/futures/open-interest/aggregated-history", map[string]string{
-		"symbol": coinGlassSymbol(symbol),
+		"symbol":   coinGlassSymbol(symbol),
 		"interval": "h1",
 		"limit":    "1",
 	}, &resp); err != nil {

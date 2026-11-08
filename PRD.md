@@ -54,7 +54,7 @@ A **tool policy table** in `app.yaml` gates which agents may invoke which tools.
 
 * `fetch_latest_news(asset string)`: Triggers the Go scraper to pull the last 10 headlines for a specific asset from FinancialJuice or Marketaux.
 * `get_economic_events(timeframe string)`: Queries the parsed FairEconomy/ForexFactory calendar to see if high-volatility events (like NFP or CPI) are happening soon.
-* `get_social_sentiment(asset string)`: Pings the CryptoPanic API for recent sentiment metrics.
+* `get_social_sentiment(asset string)`: Pings a crypto news/sentiment source for recent sentiment metrics.
 * `get_derivatives_data(symbol string)`: Queries the CoinGlass API for a snapshot of on-chain derivatives state — open interest, funding rate, long/short ratio, recent liquidations, and fear & greed index. Returns a structured `DerivativesSnapshot` that the Screening Agent uses to calibrate its bias score (e.g., extreme funding + crowded longs → bearish tilt even if price action looks bullish).
 
 **Management & Risk Agent Skills (Read/Write):**
@@ -113,7 +113,7 @@ To provide the "Screening Agent" with context, the bot will pull data from the f
 | :---- | :---- | :---- | :---- |
 | **Global Breaking News** | **FinancialJuice** | Headless Scraping (chromedp via Go) | Up-to-the-second market squawks; catches sudden geopolitical or macro shifts. |
 | **Economic Calendar** | **FairEconomy / ForexFactory** | Free keyless JSON feed | High-impact macro events (CPI, NFP, FOMC). Parsed to know *when* not to trade. |
-| **Crypto Sentiment** | **CryptoPanic API** | REST API (JSON) | Crypto-specific news aggregator; structured JSON of trending headlines fed to LLM. |
+| **Crypto Sentiment** | **FinancialJuice** | RSS feed | Crypto and macro news headlines fed to LLM. |
 | **Derivatives Intelligence** | **CoinGlass API v4** | REST API (`CG-API-KEY` header) | The primary quantitative sentiment layer. Polled every 5 minutes; data cached in Redis with 5-min TTL. See §3.3 for full data taxonomy. |
 
 ### **3.3 CoinGlass — Derivatives Data Taxonomy**
@@ -344,7 +344,7 @@ All operator commands (CLI, Telegram, Discord) are routed through a **unified Ch
 * **Discord Integration (discordgo):**
   * **Organized Logging Hub:** Acts as an organized server for system observability, routing different event severities into specific channels:
     * `#trade-execution`: Logs buy/sell orders with size, entry prices, and timestamps.
-    * `#ai-reasoning`: A live feed of the Screening and Risk Agents' logic, bias score changes, and macro news summaries pulled from FinancialJuice/CryptoPanic.
+    * `#ai-reasoning`: A live feed of the Screening and Risk Agents' logic, bias score changes, and macro news summaries pulled from FinancialJuice.
     * `#system-alerts`: Warnings regarding API rate limits, WebSocket disconnects, or VPS resource usage.
   * **Visual Embeds:** Utilizes Discord's rich embeds with color coding (Green for profit/longs, Red for losses/shorts) to create an at-a-glance portfolio dashboard.
 

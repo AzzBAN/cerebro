@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/azhar/cerebro/internal/adapter/binance/futures"
 	"github.com/azhar/cerebro/internal/adapter/llm"
-	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/adapter/postgres"
 	rediscache "github.com/azhar/cerebro/internal/adapter/redis"
 	"github.com/azhar/cerebro/internal/adapter/telegram"
@@ -26,11 +26,11 @@ import (
 	"github.com/azhar/cerebro/internal/execution/paper"
 	"github.com/azhar/cerebro/internal/ingest/calendar"
 	"github.com/azhar/cerebro/internal/ingest/coinglass"
-	"github.com/azhar/cerebro/internal/ingest/news/cryptopanic"
 	"github.com/azhar/cerebro/internal/ingest/scrape"
 	"github.com/azhar/cerebro/internal/marketdata"
 	"github.com/azhar/cerebro/internal/observability"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/azhar/cerebro/internal/positionproposal"
 	"github.com/azhar/cerebro/internal/risk"
 	"github.com/azhar/cerebro/internal/strategy"
 	"github.com/azhar/cerebro/internal/tui"
@@ -121,20 +121,20 @@ func (a *App) runRuntime(ctx context.Context) error {
 				"error", redacted)
 			dbFallback.active = true
 			dbFallback.reason = redacted
-			trades = newMemoryTradeStore()
+			trades = newBroadcastingTradeStore(newMemoryTradeStore())
 			audit = &memoryAuditStore{}
 			agentLog = &memoryAgentLogStore{}
 		} else {
 			defer pool.Close()
 			slog.Info("database connected")
 
-			trades = postgres.NewTradeStore(pool)
+			trades = newBroadcastingTradeStore(postgres.NewTradeStore(pool))
 			audit = postgres.NewAuditStore(pool)
 			agentLog = postgres.NewAgentLogStore(pool)
 			slog.Info("stores wired: postgres")
 		}
 	} else {
-		trades = newMemoryTradeStore()
+		trades = newBroadcastingTradeStore(newMemoryTradeStore())
 		audit = &memoryAuditStore{}
 		agentLog = &memoryAgentLogStore{}
 		slog.Warn("DATABASE_URL not set; using in-memory stores — data will not persist")
@@ -174,6 +174,18 @@ func (a *App) runRuntime(ctx context.Context) error {
 	cal := risk.NewCalendarBlackout()
 	gate := risk.NewGate(a.cfg.Risk, cache, cal)
 	gate.SetStartingEquity(decimal.NewFromFloat(paperStartingEquity))
+	if env != domain.EnvironmentPaper && len(brokerList) > 0 {
+		var liveEquity decimal.Decimal
+		for _, b := range brokerList {
+			if bal, err := b.Balance(ctx); err == nil && bal.TotalUSDT.IsPositive() {
+				liveEquity = liveEquity.Add(bal.TotalUSDT)
+			}
+		}
+		if liveEquity.IsPositive() {
+			gate.SetStartingEquity(liveEquity)
+			slog.Info("live starting equity configured", "equity", liveEquity.StringFixed(2))
+		}
+	}
 	// Lock the executable-symbol set to markets.yaml so discovery-surfaced
 	// symbols (Phase 0) are screening-only and cannot reach a broker.
 	gate.SetAllowedSymbols(collectSymbolList(a.cfg.Markets))
@@ -184,12 +196,16 @@ func (a *App) runRuntime(ctx context.Context) error {
 	}
 
 	// Feed realised PnL from paper closes back into the SAME gate instance so
-	// drawdown / daily-loss limits actually trip. The live broker path will
-	// wire its own fill-event PnL source when implemented (Phase D.2).
+	// drawdown / daily-loss limits actually trip.
 	if matcher != nil {
 		matcher.SetPnLReporter(gate)
 	}
-
+	for _, b := range brokerList {
+		if fb, ok := b.(*futures.FuturesBroker); ok {
+			fb.SetTradeStore(trades)
+			fb.SetPnLSink(gate)
+		}
+	}
 	// ── Watchdog ─────────────────────────────────────────────────────────────
 	minOrphanNotional := collectMinNotional(a.cfg.Markets)
 	wd := watchdog.New(brokerList, cache, audit, minOrphanNotional)
@@ -203,6 +219,11 @@ func (a *App) runRuntime(ctx context.Context) error {
 
 	// ── Strategy registry ─────────────────────────────────────────────────────
 	registry := registerStrategies(a.cfg)
+	// The live strategy set is held behind an atomic.Pointer so the web
+	// dashboard can hot-swap it (see strategyReloader) without racing the
+	// engine's candle loop, which Loads it once per event.
+	var strategiesPtr atomic.Pointer[[]strategyCandidate]
+	strategiesPtr.Store(&registry)
 	dedup := strategy.NewDedupWindow(time.Minute)
 
 	evalInterval := time.Duration(a.cfg.Engine.EvaluationIntervalMS) * time.Millisecond
@@ -214,10 +235,22 @@ func (a *App) runRuntime(ctx context.Context) error {
 	var metrics runtimeMetrics
 
 	// ── TUI ───────────────────────────────────────────────────────────────────
+	// The TUI mounts only in RunModeTUI (the default when unset) and only when
+	// an interactive terminal is attached. RunModeWeb — selected at the startup
+	// menu, via --mode web, or as the headless default — keeps the terminal in
+	// log-only mode while the web dashboard serves as the UI.
+	wantTUI := a.runMode != domain.RunModeWeb
 	var tuiRunner *tui.Runner
-	if a.cfg.TUI.MaxAgentLogLines > 0 && hasTTY() {
+	if a.cfg.TUI.MaxAgentLogLines > 0 && wantTUI && hasTTY() {
 		tuiRunner = tui.NewRunner(hub, a.cfg.TUI.MaxAgentLogLines)
+		if a.cfgDir != "" {
+			tuiRunner.SetConfigDir(a.cfgDir)
+			tuiRunner.LoadChatHistory()
+			slog.Debug("chat history loaded for TUI", "config_dir", a.cfgDir)
+		}
 		slog.Debug("TUI runner created", "max_log_lines", a.cfg.TUI.MaxAgentLogLines)
+	} else if a.cfg.TUI.MaxAgentLogLines > 0 && !wantTUI {
+		slog.Info("run mode is web — TUI disabled; logs stream to stderr, dashboard serves the UI")
 	} else if a.cfg.TUI.MaxAgentLogLines > 0 {
 		slog.Info("no interactive terminal detected — TUI disabled; all output goes to stderr")
 	}
@@ -233,6 +266,17 @@ func (a *App) runRuntime(ctx context.Context) error {
 			AuthToken:      a.cfg.Secrets.WebAuthToken,
 			AllowedOrigins: a.cfg.Web.AllowedOrigins,
 		}, hub, nil, nil, a.cfg.TUI.MaxAgentLogLines)
+		webServer.SetConfig(webadapter.ConfigToDTO(a.cfg))
+		// Wire live strategy editing only when the config dir is known (set by
+		// the CLI). Without it, the dashboard shows config read-only.
+		if a.cfgDir != "" {
+			reloader := newStrategyReloader(&strategiesPtr, a.cfgDir, a.cfg, env, kc, symbolMeta, webServer)
+			webServer.SetStrategyEditor(reloader)
+			fileEditor := newConfigFileEditor(&strategiesPtr, a.cfgDir, a.cfg, env, kc, symbolMeta, webServer)
+			webServer.SetConfigFileEditor(fileEditor)
+		} else {
+			slog.Warn("web dashboard: config dir unknown; strategy editing disabled")
+		}
 		slog.Info("web dashboard enabled", "addr", a.cfg.Web.ListenAddr)
 	}
 
@@ -282,11 +326,8 @@ func (a *App) runRuntime(ctx context.Context) error {
 		slog.Debug("ingest: CoinGlass disabled (no API key or scraper configured)")
 	}
 
-	// CryptoPanic news feed is instantiated later (after notifiers) so the
-	// scraper's circuit-breaker can alert operators when the AES key
-	// rotates. FinancialJuice can be wired immediately and runs in parallel
-	// with CryptoPanic when both are enabled — the combined refresher merges
-	// both streams into a single news:latest cache and TUI digest.
+	// FinancialJuice news scraper runs as the sole news feed: it merges
+	// into the news:latest cache and TUI digest.
 	var fjFeed port.NewsFeed
 	if a.cfg.Ingest.FinancialJuice.Enabled {
 		fjFeed = scrape.NewFinancialJuice()
@@ -340,38 +381,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 		}(dbFallback.reason, notifiers[0])
 	}
 
-	// ── CryptoPanic (RE primary + headless Chromium fallback) ─────────────────
-	// Instantiated here so the fallback circuit-breaker can alert via the
-	// notifier set up above when CryptoPanic rotates their AES key. The RE
-	// path is AES-CBC + zlib over the /web-api/posts/ endpoint; the browser
-	// path hooks JSON.parse to capture the decrypted payload from the SPA.
-	if a.cfg.Ingest.CryptoPanic.Enabled {
-		cpTimeout := time.Duration(a.cfg.Ingest.CryptoPanic.TimeoutSeconds) * time.Second
-		if cpTimeout == 0 {
-			cpTimeout = 15 * time.Second
-		}
-		reClient, err := cryptopanic.NewClient(cpTimeout)
-		if err != nil {
-			slog.Warn("cryptopanic: RE client init failed; news feed unavailable", "error", err)
-		} else {
-			reFeed := cryptopanic.NewFeed(reClient, a.cfg.Ingest.CryptoPanic.Filter)
-			browser := cryptopanic.NewBrowser(60 * time.Second)
-			var alertNotifier port.Notifier
-			if len(notifiers) > 0 {
-				alertNotifier = notifiers[0]
-			}
-			fallback := cryptopanic.NewFallbackFeed(reFeed, cryptopanic.NewBrowserFeed(browser), cryptopanic.Options{
-				Notifier: alertNotifier,
-			})
-			newsFeed = fallback
-			defer fallback.Close()
-			slog.Info("ingest: CryptoPanic news feed enabled (RE primary + Chromium fallback)",
-				"filter", a.cfg.Ingest.CryptoPanic.Filter)
-		}
-	}
-	// Fall back to FinancialJuice for the agent tool when CryptoPanic isn't
-	// available — both ingest runners share the news:latest cache, but the
-	// agent tool also needs a live-fetch path for cache misses.
+	// FinancialJuice is the sole news feed for the agent tool and TUI.
 	if newsFeed == nil && fjFeed != nil {
 		newsFeed = fjFeed
 	}
@@ -388,7 +398,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 	var symbolSource port.SymbolSource = staticSrc
 	var discoveryFeeds map[domain.Venue]port.UniverseFeed
 	if a.cfg.Agent.Discovery.Enabled {
-		discoveryFeeds = buildUniverseFeeds(a.cfg.Agent.Discovery)
+		discoveryFeeds = BuildUniverseFeeds(a.cfg.Agent.Discovery)
 		if len(discoveryFeeds) > 0 {
 			discSrc := NewDiscoverySource(cache)
 			symbolSource = NewUnionSource(staticSrc, discSrc)
@@ -400,16 +410,22 @@ func (a *App) runRuntime(ctx context.Context) error {
 		}
 	}
 
+	// ── Trigger channel for on-demand screening ────────────────────────────────
+	// Copilot's trigger_screening tool sends to this channel; the screening
+	// agent's Run loop selects on it alongside the scheduled timer.
+	screeningTriggerCh := make(agenttools.ScreeningTrigger, 1)
+
 	// ── Tool registry ─────────────────────────────────────────────────────────
 	quoteFallback := buildQuoteFallback(discoveryFeeds)
 	toolReg := buildToolRegistry(
 		a.cfg, hub, cache, trades, agentLog, audit, gate,
-		brokerList, buildRouteOrderFn(router, gate, brokersByVenue, symbolMeta, env, uiSink), derivFeed, newsFeed, calFeed, notifiers,
+		brokerList, buildRouteOrderFn(router, gate, brokersByVenue, symbolMeta, env, uiSink, a.cfg.Agent.RiskAgent, hub), derivFeed, newsFeed, calFeed, notifiers,
 		symbolSource.Symbols, quoteFallback,
+		kc, screeningTriggerCh,
 	)
 
 	// ── LLM runtime + agents ──────────────────────────────────────────────────
-	llmProviders := buildLLMProviders(a.cfg)
+	llmProviders := BuildLLMProviders(a.cfg)
 	var agentRuntime *agentpkg.Runtime
 	var copilotFn func(ctx context.Context, query string) (string, error)
 	var costTracker *agentpkg.CostTracker
@@ -549,6 +565,13 @@ func (a *App) runRuntime(ctx context.Context) error {
 	if webServer != nil {
 		webServer.SetDispatcher(chatopsDispatcher)
 		webServer.SetTradeStore(trades)
+		// Register the web dashboard as a TradeSink so the order-history
+		// panel receives every fill over the existing WebSocket without
+		// polling. The broadcastingTradeStore was wrapped around the inner
+		// store at startup; here we just push the sink reference into it.
+		if bcast, ok := trades.(*broadcastingTradeStore); ok {
+			bcast.AddSink(webServer)
+		}
 	}
 
 	// ── errgroup ──────────────────────────────────────────────────────────────
@@ -578,12 +601,22 @@ func (a *App) runRuntime(ctx context.Context) error {
 			return runFillMonitor(gctx, hub, matcher, uiSink, &metrics)
 		})
 	} else {
-		spawnLiveKlinesWS(g, gctx, a.cfg, hub)
+		klineConns := spawnLiveKlinesWS(g, gctx, a.cfg, hub)
+
+		// Discovery watcher: polls Redis for new candidates and dynamically
+		// updates WebSocket subscriptions so strategies can process discovery-surfaced symbols.
+		if a.cfg.Agent.Discovery.Enabled && klineConns != nil && cache != nil {
+			staticSymbols := collectSymbolList(a.cfg.Markets)
+			g.Go(func() error {
+				return runDiscoveryWatcher(gctx, klineConns, cache, gate, a.cfg.Agent.Discovery, staticSymbols)
+			})
+		}
 	}
 
 	// Strategy engine
 	g.Go(func() error {
-		return runStrategyEngine(gctx, hub, registry, dedup, gate, brokersByVenue, env, a.cfg.Agent.LLM, router, symbolMeta, uiSink, &metrics, kc, a.cfg.Markets, agentRuntime, toolReg, trades)
+		configuredSymbols := collectSymbolList(a.cfg.Markets)
+		return runStrategyEngine(gctx, hub, &strategiesPtr, dedup, gate, brokersByVenue, env, a.cfg.Agent.LLM, router, symbolMeta, uiSink, &metrics, kc, a.cfg.Markets, agentRuntime, toolReg, trades, configuredSymbols)
 	})
 
 	// Heartbeat: prints full metrics summary every 10 s
@@ -736,13 +769,18 @@ func (a *App) runRuntime(ctx context.Context) error {
 					}
 				}
 			})
+			flattenGrace := pmCfg.FlattenGraceSec
+			if flattenGrace <= 0 {
+				flattenGrace = 30 // default 30-second grace before flattening unprotected positions
+			}
 			recon := execution.NewReconciler(execution.ReconcilerDeps{
-				Venue:      venue,
-				Broker:     brokersByVenue[venue],
-				Tracker:    bracketTracker,
-				Router:     router,
-				Env:        env,
-				IntervalMS: pmCfg.ReconcileIntervalMS,
+				Venue:           venue,
+				Broker:          brokersByVenue[venue],
+				Tracker:         bracketTracker,
+				Router:          router,
+				Env:             env,
+				IntervalMS:      pmCfg.ReconcileIntervalMS,
+				FlattenGraceSec: flattenGrace,
 				Positions: func() []domain.Position {
 					return positionsForVenue(gctx, brokersByVenue[venue], venue)
 				},
@@ -779,6 +817,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 			a.cfg.Agent, symbolSource, biasTTL,
 			notifiers,
 		)
+		screeningAgent.SetTriggerChannel(screeningTriggerCh)
 
 		// Attach discovery Phase 0 if configured.
 		if len(discoveryFeeds) > 0 {
@@ -808,6 +847,10 @@ func (a *App) runRuntime(ctx context.Context) error {
 		// are mounted) — not only the TUI.
 		if len(uiSink) > 0 {
 			screeningAgent.SetBiasPublisher(uiSink)
+			// Forward ranked Phase 2 opportunities to surfaces that implement
+			// the optional opportunitySink capability (the web dashboard). The
+			// TUI does not, so multiSink simply skips it.
+			screeningAgent.SetOpportunityPublisher(uiSink)
 		}
 		g.Go(func() error {
 			slog.Info("screening agent starting",
@@ -872,7 +915,7 @@ func (a *App) runRuntime(ctx context.Context) error {
 	}
 
 	// Ingest scheduled runners
-	startIngestRunners(gctx, g, a.cfg, cache, derivFeed, newsFeed, fjFeed, calFeed, uiSink)
+	startIngestRunners(gctx, g, a.cfg, cache, derivFeed, newsFeed, fjFeed, calFeed, cal, uiSink)
 
 	// Log archival (conditional — requires Postgres pool, nil when no database)
 	if logArchiver := buildLogArchiver(pool, a.cfg); logArchiver != nil {
@@ -1009,7 +1052,8 @@ func runHeartbeat(
 
 // ── Builder helpers ───────────────────────────────────────────────────────────
 
-func buildLLMProviders(cfg *config.Config) []port.LLM {
+// BuildLLMProviders instantiates all configured and credentialed LLM providers.
+func BuildLLMProviders(cfg *config.Config) []port.LLM {
 	var providers []port.LLM
 	for _, name := range cfg.Agent.LLM.Providers {
 		switch strings.ToLower(name) {
@@ -1085,6 +1129,8 @@ func buildToolRegistry(
 	notifiers []port.Notifier,
 	symbolsFn agenttools.SymbolsProvider,
 	quoteFallback agenttools.QuoteFallback,
+	kc *klineClients,
+	screeningTriggerCh agenttools.ScreeningTrigger,
 ) *agenttools.Registry {
 	reg := agenttools.NewRegistry(cfg.Agent.ToolPolicy)
 	reg.Register("get_active_positions", agenttools.GetActivePositions(brokers))
@@ -1112,6 +1158,17 @@ func buildToolRegistry(
 	if calFeed != nil {
 		reg.Register("get_economic_events", agenttools.GetEconomicEvents(calFeed))
 	}
+
+	// Register on-demand copilot tools for symbol analysis and monitoring
+	if kc != nil {
+		reg.Register("analyze_symbol", agenttools.AnalyzeSymbol(kc.spotClient, kc.futuresClient))
+		reg.Register("generate_trade_plan", agenttools.GenerateTradePlan(kc.spotClient, kc.futuresClient))
+	}
+	reg.Register("request_symbol_monitor", agenttools.RequestSymbolMonitor("configs"))
+	if screeningTriggerCh != nil {
+		reg.Register("trigger_screening", agenttools.TriggerScreening(screeningTriggerCh))
+	}
+
 	slog.Debug("tool registry built")
 	return reg
 }

@@ -13,6 +13,21 @@ type TradeStore interface {
 	UpdateIntentStatus(ctx context.Context, id string, status domain.OrderStatus, brokerID string) error
 	SaveTrade(ctx context.Context, t domain.Trade) error
 	TradesByWindow(ctx context.Context, from, to time.Time) ([]domain.Trade, error)
+	// IntentsByWindow returns every order intent whose created_at falls in
+	// [from, to). Returned newest-first so the dashboard can render the
+	// most recent activity at the top. Used by the order history view to
+	// show pending/submitted/filled/rejected/cancelled intent lifecycle
+	// alongside the closed-trade list. When the underlying store has no
+	// intent log (e.g. legacy backends) it returns nil, nil.
+	IntentsByWindow(ctx context.Context, from, to time.Time) ([]domain.OrderIntent, error)
+}
+
+// TradeSink receives a push notification every time a fill is recorded. The
+// composition root wires the web dashboard as a sink so it can broadcast a
+// "trade" frame to connected clients without polling. The push is best-effort
+// and never blocks the caller; sinks must not perform I/O on the hot path.
+type TradeSink interface {
+	SendTrade(t domain.Trade)
 }
 
 // AgentLogStore persists agent run records and conversation messages.

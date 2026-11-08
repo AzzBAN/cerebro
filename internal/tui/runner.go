@@ -19,8 +19,8 @@ import (
 // Runner also implements observability.LogSink — pass it to observability.Setup
 // so that every slog line is forwarded to the TUI system-log panel.
 type Runner struct {
-	hub  *marketdata.Hub
-	prog *tea.Program
+	hub   *marketdata.Hub
+	prog  *tea.Program
 	msgCh chan tea.Msg
 	model *Model
 }
@@ -50,6 +50,17 @@ func NewRunner(hub *marketdata.Hub, maxLogLines int) *Runner {
 	}()
 
 	return r
+}
+
+// SetConfigDir sets the configuration directory for the TUI model.
+// This is needed for persisting chat history.
+func (r *Runner) SetConfigDir(configDir string) {
+	r.model.SetConfigDir(configDir)
+}
+
+// LoadChatHistory loads persisted chat messages from disk into the model.
+func (r *Runner) LoadChatHistory() {
+	r.model.LoadChatHistory()
 }
 
 // Push sends any tea.Msg to the running program.
@@ -142,7 +153,7 @@ func (r *Runner) SendMacro(s MacroSnapshot) {
 	r.Push(MacroSnapshotMsg{Snapshot: s})
 }
 
-// SendNews pushes a fresh news snapshot (CryptoPanic headlines) into the
+// SendNews pushes a fresh news snapshot (FinancialJuice headlines) into the
 // TUI's News panel. Safe to call from any goroutine.
 func (r *Runner) SendNews(s NewsSnapshot) {
 	r.Push(NewsSnapshotMsg{Snapshot: s})

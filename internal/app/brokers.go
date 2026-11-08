@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	gobinance "github.com/adshao/go-binance/v2"
@@ -134,17 +135,56 @@ func buildLiveBrokers(ctx context.Context, cfg *config.Config, env domain.Enviro
 	return brokers, unique, &kc, nil
 }
 
+// klineConnectors holds references to active WebSocket kline streams so they
+// can be dynamically updated with new symbols from discovery candidates.
+type klineConnectors struct {
+	mu         sync.Mutex
+	spotKlines map[domain.Timeframe]*spot.KlinesWS
+	futKlines  map[domain.Timeframe]*futures.KlinesWS
+}
+
+// newKlineConnectors creates an empty connector registry.
+func newKlineConnectors() *klineConnectors {
+	return &klineConnectors{
+		spotKlines: make(map[domain.Timeframe]*spot.KlinesWS),
+		futKlines:  make(map[domain.Timeframe]*futures.KlinesWS),
+	}
+}
+
+// updateSpotSymbols updates all spot kline streams with the given symbols.
+func (kc *klineConnectors) updateSpotSymbols(symbols []domain.Symbol) {
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	for tf, ws := range kc.spotKlines {
+		slog.Debug("updating spot klines symbols", "timeframe", tf, "count", len(symbols))
+		ws.UpdateSymbols(symbols)
+	}
+}
+
+// updateFuturesSymbols updates all futures kline streams with the given symbols.
+func (kc *klineConnectors) updateFuturesSymbols(symbols []domain.Symbol) {
+	kc.mu.Lock()
+	defer kc.mu.Unlock()
+	for tf, ws := range kc.futKlines {
+		slog.Debug("updating futures klines symbols", "timeframe", tf, "count", len(symbols))
+		ws.UpdateSymbols(symbols)
+	}
+}
+
 // spawnLiveKlinesWS starts one Binance WebSocket kline stream per
 // (venue, timeframe) pair found in markets config, publishing closed candles
 // to the hub.
 // Also spawns bookTicker and 24hr ticker streams for real-time bid/ask and
 // change/volume data used by the TUI market watch panel.
+//
+// Returns a klineConnectors registry for dynamic symbol updates (or nil if no streams created).
 func spawnLiveKlinesWS(
 	g *errgroup.Group,
 	ctx context.Context,
 	cfg *config.Config,
 	hub *marketdata.Hub,
-) {
+) *klineConnectors {
+	connectors := newKlineConnectors()
 	for _, venueCfg := range cfg.Markets {
 		tfSymbols := groupSymbolsByTimeframe(venueCfg)
 		allSymbols := collectEnabledSymbolsFromVenue(venueCfg)
@@ -157,6 +197,9 @@ func spawnLiveKlinesWS(
 			for tf, syms := range tfSymbols {
 				tf, syms := tf, syms
 				ws := spot.NewKlinesWS(hub, syms, tf, nil)
+				connectors.mu.Lock()
+				connectors.spotKlines[tf] = ws
+				connectors.mu.Unlock()
 				g.Go(func() error {
 					if err := ws.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 						return fmt.Errorf("spot klines WS %s: %w", tf, err)
@@ -185,6 +228,9 @@ func spawnLiveKlinesWS(
 			for tf, syms := range tfSymbols {
 				tf, syms := tf, syms
 				ws := futures.NewKlinesWS(hub, syms, tf, nil)
+				connectors.mu.Lock()
+				connectors.futKlines[tf] = ws
+				connectors.mu.Unlock()
 				g.Go(func() error {
 					if err := ws.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 						return fmt.Errorf("futures klines WS %s: %w", tf, err)
@@ -213,6 +259,7 @@ func spawnLiveKlinesWS(
 			slog.Warn("unknown venue in markets config; skipping live WS", "venue", venueCfg.Venue)
 		}
 	}
+	return connectors
 }
 
 // collectEnabledSymbolsFromVenue returns all enabled symbols for a single venue config.
@@ -293,6 +340,12 @@ func countPositionsByVenue(positions []domain.Position, venue domain.Venue) int 
 //   - Leverage on futures inherits meta.cfg.Leverage
 //   - When StopLoss is set, the Worker attaches a broker-side bracket
 //     (OCO on spot, STOP_MARKET + TAKE_PROFIT_MARKET on futures).
+//   - When StopLoss is zero on a non-reduce-only entry, the safety net
+//     derives SL/TP from cfg.RiskAgent.{DefaultSLPct,DefaultTPPct} applied
+//     to the live mark price (hub.LatestQuote). This closes the
+//     "no SL/TP levels to attach" flatten race the reconciler would
+//     otherwise force-close within the 30s grace window. Reduce-only
+//     (position-exit) orders are intentionally untouched.
 func buildRouteOrderFn(
 	router *execution.Router,
 	gate *risk.Gate,
@@ -300,6 +353,8 @@ func buildRouteOrderFn(
 	symbolMeta map[domain.Symbol]symbolMeta,
 	env domain.Environment,
 	uiSink multiSink,
+	cfg config.RiskAgentConfig,
+	hub *marketdata.Hub,
 ) func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 	return func(ctx context.Context, req agenttools.AgentOrderRequest) error {
 		meta, resolved, err := resolveRouteSymbol(req.Symbol, symbolMeta)
@@ -317,10 +372,12 @@ func buildRouteOrderFn(
 		//
 		// Reduce-only orders are position EXITS: they must never be blocked on
 		// position / notional / drawdown limits (same rule as ChatOps /close),
-		// so they skip the gate here. Everything else opens new risk and must
-		// clear the full gate, which also rejects while the kill-switch / halt
-		// is active.
-		if !req.ReduceOnly {
+		// so they skip the gate here only on Binance Futures. Spot does not
+		// support reduce-only, so reject it to prevent bypassing the risk gate.
+		if req.ReduceOnly && meta.venue == domain.VenueBinanceSpot {
+			return fmt.Errorf("reduce-only orders are not supported on spot")
+		}
+		if !(req.ReduceOnly && meta.venue == domain.VenueBinanceFutures) {
 			sig := domain.Signal{
 				CorrelationID: req.CorrelationID,
 				Strategy:      domain.StrategyName("risk_agent"),
@@ -356,6 +413,28 @@ func buildRouteOrderFn(
 			leverage = meta.cfg.Leverage
 		}
 
+		// ── SL/TP safety net ─────────────────────────────────────────────
+		// If the LLM approved the order without supplying stop_loss, derive
+		// it (and take_profit) from the live mark price and the configured
+		// defaults. Without this the reconciler would flatten the entry as
+		// "no SL/TP levels to attach" within the 30s grace window.
+		stopLoss := req.StopLoss
+		takeProfit := req.TakeProfit1
+		if !req.ReduceOnly && stopLoss.IsZero() && (cfg.DefaultSLPct > 0 || cfg.DefaultTPPct > 0) {
+			derivedSL, derivedTP, derived := deriveSafetyBracket(resolved, req.Side, hub, cfg)
+			if derived {
+				stopLoss = derivedSL
+				takeProfit = derivedTP
+				slog.Warn("agent order approved without stop_loss; applied safety bracket from mark price",
+					"symbol", resolved, "side", req.Side,
+					"stop_loss", stopLoss.String(), "take_profit", takeProfit.String(),
+					"sl_pct", cfg.DefaultSLPct, "tp_pct", cfg.DefaultTPPct)
+			} else {
+				slog.Warn("agent order approved without stop_loss and no live quote available; reconciler will flatten",
+					"symbol", resolved, "side", req.Side)
+			}
+		}
+
 		intent := domain.OrderIntent{
 			ID:            uuid.New().String(),
 			CorrelationID: req.CorrelationID,
@@ -367,8 +446,8 @@ func buildRouteOrderFn(
 			LimitPrice:    req.LimitPrice,
 			StopPrice:     req.StopPrice,
 			TIF:           tif,
-			StopLoss:      req.StopLoss,
-			TakeProfit1:   req.TakeProfit1,
+			StopLoss:      stopLoss,
+			TakeProfit1:   takeProfit,
 			ScaleOutPct:   req.ScaleOutPct,
 			ReduceOnly:    req.ReduceOnly,
 			PositionSide:  req.PositionSide,
@@ -385,15 +464,79 @@ func buildRouteOrderFn(
 		// present so operators can see what the agent actually did.
 		summary := fmt.Sprintf("AGENT %s %s %s %.6f {%s}",
 			orderType, req.Side, resolved, req.Size, meta.venue)
-		if !req.StopLoss.IsZero() {
-			summary += fmt.Sprintf(" SL=%s", req.StopLoss.StringFixed(4))
+		if !stopLoss.IsZero() {
+			summary += fmt.Sprintf(" SL=%s", stopLoss.StringFixed(4))
 		}
-		if !req.TakeProfit1.IsZero() {
-			summary += fmt.Sprintf(" TP=%s", req.TakeProfit1.StringFixed(4))
+		if !takeProfit.IsZero() {
+			summary += fmt.Sprintf(" TP=%s", takeProfit.StringFixed(4))
+		}
+		// Flag safety-net-derived brackets so the operator sees the LLM
+		// omitted them. The "(safety)" tag is appended AFTER the SL/TP fields
+		// so existing parser-friendly layouts stay intact.
+		if !req.StopLoss.IsZero() {
+			// nothing to flag — LLM supplied the bracket
+		} else if !stopLoss.IsZero() {
+			summary += " (safety)"
 		}
 		pushTUIOrder(uiSink, summary)
 		return nil
 	}
+}
+
+// deriveSafetyBracket returns a (sl, tp, derived) triple anchored on the
+// live mark price for sym when one is available. Returns derived=false when
+// the hub is nil, the quote is missing, or the mark price is zero — in which
+// case the caller logs and lets the request through with zero bracket so the
+// reconciler's flatten-grace path is the only safety net (mirrors behaviour
+// before this helper existed).
+func deriveSafetyBracket(
+	sym domain.Symbol,
+	side domain.Side,
+	hub *marketdata.Hub,
+	cfg config.RiskAgentConfig,
+) (decimal.Decimal, decimal.Decimal, bool) {
+	if hub == nil {
+		return decimal.Zero, decimal.Zero, false
+	}
+	q, ok := hub.LatestQuote(sym)
+	if !ok {
+		return decimal.Zero, decimal.Zero, false
+	}
+	mark := q.Last
+	if mark.IsZero() {
+		mark = q.Mid
+	}
+	if mark.IsZero() {
+		return decimal.Zero, decimal.Zero, false
+	}
+	var sl, tp decimal.Decimal
+	if cfg.DefaultSLPct > 0 {
+		// Stop loss: BUY → below entry, SELL → above entry.
+		sl = applyBracketOffset(mark, cfg.DefaultSLPct, side == domain.SideSell)
+	}
+	if cfg.DefaultTPPct > 0 {
+		// Take profit: BUY → above entry, SELL → below entry.
+		tp = applyBracketOffset(mark, cfg.DefaultTPPct, side == domain.SideBuy)
+	}
+	if sl.IsZero() && tp.IsZero() {
+		return decimal.Zero, decimal.Zero, false
+	}
+	return sl, tp, true
+}
+
+// applyBracketOffset shifts price by pct% above (above=true) or below
+// (above=false) the mark price. Used for both SL and TP derivation:
+//   - BUY stop loss:  above=false → mark × (1 - pct/100)
+//   - SELL stop loss: above=true  → mark × (1 + pct/100)
+//   - BUY take profit: above=true  → mark × (1 + pct/100)
+//   - SELL take profit: above=false → mark × (1 - pct/100)
+func applyBracketOffset(price decimal.Decimal, pct float64, above bool) decimal.Decimal {
+	factor := decimal.NewFromFloat(pct / 100)
+	delta := price.Mul(factor)
+	if above {
+		return price.Add(delta)
+	}
+	return price.Sub(delta)
 }
 
 // buildCloseFn returns a ClosePositionFn the chatops dispatcher can use to

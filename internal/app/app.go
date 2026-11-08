@@ -14,12 +14,35 @@ import (
 // App is the composition root. It wires all adapters and services together
 // and manages the application lifecycle via an errgroup.
 type App struct {
-	cfg *config.Config
+	cfg     *config.Config
+	runMode domain.RunMode
+	cfgDir  string
+}
+
+// Option customises an App at construction.
+type Option func(*App)
+
+// WithRunMode sets the terminal presentation mode resolved at startup
+// (see ResolveRunMode). When unset, runRuntime falls back to tui on a TTY
+// and web when headless.
+func WithRunMode(m domain.RunMode) Option {
+	return func(a *App) { a.runMode = m }
+}
+
+// WithConfigDir records the directory the config files were loaded from, so
+// the runtime can write edits back (web dashboard strategy edits) and re-load
+// them live. When unset, live config editing is disabled.
+func WithConfigDir(dir string) Option {
+	return func(a *App) { a.cfgDir = dir }
 }
 
 // New builds the App from the loaded, validated config.
-func New(cfg *config.Config) *App {
-	return &App{cfg: cfg}
+func New(cfg *config.Config, opts ...Option) *App {
+	a := &App{cfg: cfg}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
 }
 
 // Run starts all long-running goroutines and blocks until ctx is cancelled

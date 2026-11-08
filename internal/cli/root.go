@@ -24,6 +24,7 @@ Common commands:
   cerebro run --paper            start the engine with synthetic market data
   cerebro run --demo             start the engine against Binance Demo
   cerebro run --live             start the engine against Binance mainnet
+  cerebro discovery run          manually trigger one discovery cycle
   cerebro check --dry-run        validate config and credential presence
   cerebro backtest ...           replay a strategy over historical CSV data
   cerebro llm budget reset ...   clear the daily LLM budget counters
@@ -45,6 +46,7 @@ Use "cerebro <command> --help" for details on any command.`,
 		newCheckCommand(),
 		newBacktestCommand(),
 		newLLMCommand(),
+		newDiscoveryCommand(),
 	)
 
 	return root

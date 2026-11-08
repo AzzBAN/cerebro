@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -53,9 +54,10 @@ type Model struct {
 	positionRows []domain.Position
 
 	// Scrollable log
-	logs        []logEntry
-	maxLogLines int
-	logScrollY  int // 0 = bottom (latest), increases = scroll up
+	logs                []logEntry
+	maxLogLines         int
+	logScrollY          int       // 0 = bottom (latest), increases = scroll up
+	logLastUserScrollAt time.Time // last time the user manually scrolled the log
 
 	// Agent panel
 	agentRuns            map[string]*agentRunState
@@ -85,6 +87,12 @@ type Model struct {
 	askScrollY  int // 0 = bottom, increases = scroll up
 	askLines    int // total rendered lines of current response
 
+	// Copilot chat history (persistent session)
+	chatMessages []ChatMessage // full conversation history
+	chatScrollY  int           // scroll offset for chat view
+	agentsSubTab int           // 0 = Agent Activity, 1 = Copilot Chat
+	configDir    string        // directory for persisting chat history
+
 	// Mouse mode toggle: enabled = scroll wheel captured by TUI;
 	// disabled = terminal handles mouse (allows text selection to copy).
 	mouseEnabled bool
@@ -110,7 +118,7 @@ type Model struct {
 	macro    MacroSnapshot
 	macroSet bool
 
-	// News panel state (LG breakpoint and up). Populated from CryptoPanic.
+	// News panel state (LG breakpoint and up). Populated from FinancialJuice.
 	news    NewsSnapshot
 	newsSet bool
 
@@ -173,6 +181,25 @@ func newInputTextarea() textarea.Model {
 // SetCopilotFn injects the copilot function for /ask queries.
 func (m *Model) SetCopilotFn(fn func(ctx context.Context, query string) (string, error)) {
 	m.copilotFn = fn
+}
+
+// SetConfigDir sets the directory where chat history is persisted.
+func (m *Model) SetConfigDir(dir string) {
+	m.configDir = dir
+}
+
+// LoadChatHistory loads persisted chat messages from disk.
+func (m *Model) LoadChatHistory() {
+	if m.configDir == "" {
+		return
+	}
+	messages, err := loadChatHistory(m.configDir)
+	if err != nil {
+		return // fail-open, start with empty history
+	}
+	// Archive old messages and cap the list.
+	messages, _ = archiveOldMessages(m.configDir, messages, chatArchiveAgeDays)
+	m.chatMessages = capMessages(messages, chatMaxMessages)
 }
 
 // Init satisfies the tea.Model interface.
@@ -245,15 +272,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SysLogMsg:
 		m.appendLog(logEntry{ts: msg.At, level: msg.Level, text: msg.Line})
-		m.logScrollY = 0
+		if !m.logUserScrolledRecently() {
+			m.logScrollY = 0
+		}
 
 	case AgentLogMsg:
 		m.appendLog(logEntry{ts: time.Now(), level: "AGENT", text: msg.Line})
-		m.logScrollY = 0
+		if !m.logUserScrolledRecently() {
+			m.logScrollY = 0
+		}
 
 	case OrderMsg:
 		m.appendLog(logEntry{ts: time.Now(), level: "ORDER", text: msg.Line})
-		m.logScrollY = 0
+		if !m.logUserScrolledRecently() {
+			m.logScrollY = 0
+		}
 
 	case PositionsMsg:
 		m.positionRows = append([]domain.Position(nil), msg.Positions...)
@@ -320,6 +353,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.askResponse = msg.Response
 		}
 		m.askLines = countRenderedLines(m.askResponse, max(20, m.width-frameH))
+
+		// Append to chat history for the Copilot Chat sub-tab.
+		now := time.Now()
+		m.chatMessages = append(m.chatMessages,
+			ChatMessage{Role: "user", Content: msg.Query, Timestamp: now},
+			ChatMessage{Role: "assistant", Content: m.askResponse, Timestamp: now},
+		)
+		// Cap to prevent unbounded growth in memory.
+		m.chatMessages = capMessages(m.chatMessages, chatMaxMessages)
+		slog.Debug("[copilot] AskResponseMsg: appended to chatMessages", "count", len(m.chatMessages), "configDir", m.configDir)
+
+		// Auto-switch to the Copilot sub-tab so the user immediately sees
+		// their conversation. Also switch to the Agents tab itself so the
+		// Copilot panel is visible — regardless of which tab the user was on.
+		m.activeTab = tabAgents
+		m.agentsSubTab = 1
+
+		// Persist asynchronously (non-blocking).
+		var persistCmd tea.Cmd
+		if m.configDir != "" {
+			msgs := m.chatMessages
+			dir := m.configDir
+			persistCmd = func() tea.Msg {
+				_ = saveChatHistory(dir, msgs)
+				return nil
+			}
+		}
+		return m, persistCmd
 
 	case tea.KeyMsg:
 		if m.askResponse != "" {
@@ -418,34 +479,53 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selecting = false
 			return m, tea.DisableMouse
 		case tea.KeyUp:
-			if m.focusedPanel == focusWatch {
+			// Scroll active panel based on context
+			if m.activeTab == tabAgents && m.agentsSubTab == 1 {
+				m.scrollChatUp(1)
+			} else if m.focusedPanel == focusWatch {
 				m.scrollWatchUp(1)
 			} else {
 				m.scrollLogUp(1)
 			}
 		case tea.KeyDown:
-			if m.focusedPanel == focusWatch {
+			if m.activeTab == tabAgents && m.agentsSubTab == 1 {
+				m.scrollChatDown(1)
+			} else if m.focusedPanel == focusWatch {
 				m.scrollWatchDown(1)
 			} else {
 				m.scrollLogDown(1)
 			}
 		case tea.KeyPgUp:
-			if m.focusedPanel == focusWatch {
+			if m.activeTab == tabAgents && m.agentsSubTab == 1 {
+				m.scrollChatUp(20)
+			} else if m.focusedPanel == focusWatch {
 				m.scrollWatchUp(maxWatchLines)
 			} else {
 				m.scrollLogUp(m.visibleLogLines())
 			}
 		case tea.KeyPgDown:
-			if m.focusedPanel == focusWatch {
+			if m.activeTab == tabAgents && m.agentsSubTab == 1 {
+				m.scrollChatDown(20)
+			} else if m.focusedPanel == focusWatch {
 				m.scrollWatchDown(maxWatchLines)
 			} else {
 				m.scrollLogDown(m.visibleLogLines())
 			}
 		case tea.KeyLeft:
+			// Switch to Activity sub-tab when on Agents tab
+			if m.activeTab == tabAgents && m.agentsSubTab == 1 {
+				m.agentsSubTab = 0
+				return m, nil
+			}
 			if m.focusedPanel == focusWatch {
 				m.scrollWatchLeft(watchScrollXStep)
 			}
 		case tea.KeyRight:
+			// Switch to Chat sub-tab when on Agents tab
+			if m.activeTab == tabAgents && m.agentsSubTab == 0 {
+				m.agentsSubTab = 1
+				return m, nil
+			}
 			if m.focusedPanel == focusWatch {
 				m.scrollWatchRight(watchScrollXStep)
 			}
@@ -550,6 +630,7 @@ func clockTick() tea.Cmd {
 // honoring the XS breakpoint's separate tab set. Shared by the focused-input
 // and navigation key paths so Tab behaves identically in both.
 func (m *Model) cycleTab(forward bool) {
+	slog.Debug("[cycleTab] before", "activeTab", m.activeTab, "agentsSubTab", m.agentsSubTab, "chatMessages", len(m.chatMessages), "forward", forward)
 	if m.breakpoint() == bpXS {
 		if forward {
 			m.xsTab = (m.xsTab + 1) % xsTabCount
@@ -563,6 +644,7 @@ func (m *Model) cycleTab(forward bool) {
 	} else {
 		m.activeTab = (m.activeTab + tabCount - 1) % tabCount
 	}
+	slog.Debug("[cycleTab] after", "activeTab", m.activeTab, "agentsSubTab", m.agentsSubTab, "chatMessages", len(m.chatMessages))
 }
 
 // ─── Layout calculations ─────────────────────────────────────────────────────
@@ -633,11 +715,13 @@ func (m *Model) clampLogScroll() {
 
 func (m *Model) scrollLogUp(n int) {
 	m.logScrollY += n
+	m.markLogUserScrolled()
 	m.clampLogScroll()
 }
 
 func (m *Model) scrollLogDown(n int) {
 	m.logScrollY -= n
+	m.markLogUserScrolled()
 	m.clampLogScroll()
 }
 
@@ -965,11 +1049,50 @@ func (m *Model) clampAskScroll() {
 	}
 }
 
+// scrollChatUp scrolls the copilot chat view up by n lines.
+func (m *Model) scrollChatUp(n int) {
+	m.chatScrollY += n
+	m.clampChatScroll()
+}
+
+// scrollChatDown scrolls the copilot chat view down by n lines.
+func (m *Model) scrollChatDown(n int) {
+	m.chatScrollY -= n
+	m.clampChatScroll()
+}
+
+func (m *Model) clampChatScroll() {
+	if m.chatScrollY < 0 {
+		m.chatScrollY = 0
+	}
+}
+
 func (m *Model) appendLog(e logEntry) {
 	m.logs = append(m.logs, e)
 	if len(m.logs) > m.maxLogLines {
 		m.logs = m.logs[len(m.logs)-m.maxLogLines:]
 	}
+}
+
+// logAutoScrollIdle is how long the user must leave the log panel untouched
+// before new log lines auto-snap the viewport back to the bottom. Matches the
+// standard chat/log UX: "snap-to-bottom after 30s of idle reading".
+const logAutoScrollIdle = 30 * time.Second
+
+// markLogUserScrolled records that the user just interacted with the log
+// viewport, suppressing auto-snap-to-bottom on the next incoming log line.
+func (m *Model) markLogUserScrolled() {
+	m.logLastUserScrollAt = time.Now()
+}
+
+// logUserScrolledRecently reports whether the user interacted with the log
+// viewport within the auto-scroll idle window. While true, incoming log lines
+// preserve the user's scroll position instead of snapping to the latest.
+func (m *Model) logUserScrolledRecently() bool {
+	if m.logLastUserScrollAt.IsZero() {
+		return false
+	}
+	return time.Since(m.logLastUserScrollAt) < logAutoScrollIdle
 }
 
 // computedWatchH returns the outer height of the watch panel.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/azhar/cerebro/internal/domain"
@@ -43,17 +44,44 @@ func CalculatePositionSize() port.Tool {
 			var args struct {
 				RiskPct          float64 `json:"risk_pct"`
 				StopLossDistance float64 `json:"stop_loss_distance"`
+				StopLoss         float64 `json:"stop_loss"`
 				Equity           float64 `json:"equity"`
 				EntryPrice       float64 `json:"entry_price"`
+				Side             string  `json:"side"`
+				MMR              float64 `json:"mmr"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return nil, fmt.Errorf("calculate_position_size: bad args: %w", err)
 			}
+
+			side := domain.SideBuy
+			if strings.EqualFold(args.Side, "sell") {
+				side = domain.SideSell
+			}
+
+			entryPrice := decimal.NewFromFloat(args.EntryPrice)
+			var stopLoss decimal.Decimal
+			if args.StopLoss > 0 {
+				stopLoss = decimal.NewFromFloat(args.StopLoss)
+			} else if args.StopLossDistance > 0 {
+				slDist := decimal.NewFromFloat(args.StopLossDistance)
+				if side == domain.SideSell {
+					stopLoss = entryPrice.Add(slDist)
+				} else {
+					stopLoss = entryPrice.Sub(slDist)
+				}
+			} else {
+				return nil, fmt.Errorf("calculate_position_size: either stop_loss or stop_loss_distance must be provided")
+			}
+
+			equity := decimal.NewFromFloat(args.Equity)
+			mmr := decimal.NewFromFloat(args.MMR)
+
 			params, err := risk.CalculatePositionSize(
-				decimal.NewFromFloat(args.Equity),
+				equity,
 				args.RiskPct,
-				decimal.NewFromFloat(args.EntryPrice),
-				decimal.NewFromFloat(args.EntryPrice-args.StopLossDistance),
+				entryPrice,
+				stopLoss,
 				decimal.Zero,
 				decimal.Zero,
 				decimal.Zero,
@@ -61,23 +89,50 @@ func CalculatePositionSize() port.Tool {
 			if err != nil {
 				return nil, fmt.Errorf("calculate_position_size: %w", err)
 			}
+
+			levRes, levErr := risk.CalculateSafeLeverage(
+				entryPrice,
+				stopLoss,
+				side,
+				equity,
+				args.RiskPct,
+				mmr,
+			)
+			if levErr != nil {
+				// Fallback to basic sizing output if leverage calc fails
+				return json.Marshal(map[string]any{
+					"quantity":          params.Quantity.String(),
+					"risk_amount_quote": params.RiskAmountQuote.String(),
+				})
+			}
+
 			return json.Marshal(map[string]any{
-				"quantity":          params.Quantity.String(),
-				"risk_amount_quote": params.RiskAmountQuote.String(),
+				"quantity":                    params.Quantity.String(),
+				"risk_amount_quote":           params.RiskAmountQuote.String(),
+				"notional":                    levRes.Notional.StringFixed(2),
+				"max_safe_leverage":           levRes.MaxSafeLeverage,
+				"recommended_leverage":        levRes.RecommendedLeverage,
+				"estimated_liquidation_price": levRes.LiquidationPrice.StringFixed(4),
+				"required_margin":             levRes.RequiredMargin.StringFixed(2),
+				"stop_loss_distance_pct":      levRes.StopLossDistancePct.StringFixed(2),
 			})
 		},
 		Definition: port.ToolDefinition{
-			Name:        "calculate_position_size",
-			Description: "Calculate the appropriate position size given risk parameters.",
+			Name: "calculate_position_size",
+			Description: "Calculate the appropriate position size, safe leverage, and liquidation price given risk parameters. " +
+				"Ensures liquidation price is safely beyond stop-loss distance.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"risk_pct":            map[string]any{"type": "number", "description": "Risk percentage per trade (e.g. 0.5)"},
-					"stop_loss_distance":  map[string]any{"type": "number", "description": "Stop loss distance from entry price in quote units"},
-					"equity":              map[string]any{"type": "number", "description": "Account equity in quote currency"},
-					"entry_price":         map[string]any{"type": "number", "description": "Entry price"},
+					"risk_pct":           map[string]any{"type": "number", "description": "Risk percentage per trade (e.g. 0.5 or 1.0)"},
+					"stop_loss_distance": map[string]any{"type": "number", "description": "Stop loss distance from entry price in quote units (optional if stop_loss provided)"},
+					"stop_loss":          map[string]any{"type": "number", "description": "Absolute stop loss price (optional if stop_loss_distance provided)"},
+					"equity":             map[string]any{"type": "number", "description": "Account equity in quote currency"},
+					"entry_price":        map[string]any{"type": "number", "description": "Entry price"},
+					"side":               map[string]any{"type": "string", "enum": []string{"buy", "sell"}, "description": "Trade side (buy/sell). Defaults to buy."},
+					"mmr":                map[string]any{"type": "number", "description": "Maintenance margin rate (default 0.005)"},
 				},
-				"required": []string{"risk_pct", "stop_loss_distance", "equity", "entry_price"},
+				"required": []string{"risk_pct", "equity", "entry_price"},
 			},
 		},
 	}

@@ -122,10 +122,10 @@ func TestNewsSourceLabel(t *testing.T) {
 	tests := []struct {
 		domain, source, want string
 	}{
-		{"coindesk.com", "cryptopanic", "coindesk.com"},
+		{"coindesk.com", "newsfeed", "coindesk.com"},
 		{"www.financialjuice.com", "financialjuice", "financialjuice.com"},
 		{"", "financialjuice", "financialjuice"},
-		{"  ", "  cryptopanic  ", "cryptopanic"},
+		{"  ", "  newsfeed  ", "newsfeed"},
 		{"", "", ""},
 	}
 	for _, tc := range tests {
@@ -147,7 +147,7 @@ func TestRenderNewsPanelLayout(t *testing.T) {
 			{
 				Title:       "Bitcoin ETF approved by SEC",
 				Domain:      "coindesk.com",
-				Source:      "cryptopanic",
+				Source:      "financialjuice",
 				Sentiment:   "bullish",
 				PublishedAt: time.Now().Add(-5 * time.Minute),
 			},

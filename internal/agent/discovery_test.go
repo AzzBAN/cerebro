@@ -84,6 +84,15 @@ func (c *fakeCache) Exists(_ context.Context, key string) (bool, error) {
 func (c *fakeCache) IncrBy(_ context.Context, _ string, _ int64, _ time.Duration) (int64, error) {
 	return 0, nil
 }
+func (c *fakeCache) SetNX(_ context.Context, key string, v []byte, _ time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.data[key]; ok {
+		return false, nil
+	}
+	c.data[key] = append([]byte(nil), v...)
+	return true, nil
+}
 
 // --- fixtures ----------------------------------------------------------------
 

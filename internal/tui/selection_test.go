@@ -39,9 +39,9 @@ func TestClampToRect(t *testing.T) {
 
 func TestNormalizeSelection(t *testing.T) {
 	tests := []struct {
-		name                   string
-		a, b                   point
-		wx0, wy0, wx1, wy1     int
+		name               string
+		a, b               point
+		wx0, wy0, wx1, wy1 int
 	}{
 		{"top-left to bottom-right", point{2, 3}, point{8, 6}, 2, 3, 8, 6},
 		{"bottom-right to top-left", point{8, 6}, point{2, 3}, 2, 3, 8, 6},

@@ -6,10 +6,10 @@ import "context"
 type NotifyChannel string
 
 const (
-	ChannelTradeExecution   NotifyChannel = "trade_execution"
-	ChannelAIReasoning      NotifyChannel = "ai_reasoning"
-	ChannelSystemAlerts     NotifyChannel = "system_alerts"
-	ChannelDefault          NotifyChannel = "default"
+	ChannelTradeExecution NotifyChannel = "trade_execution"
+	ChannelAIReasoning    NotifyChannel = "ai_reasoning"
+	ChannelSystemAlerts   NotifyChannel = "system_alerts"
+	ChannelDefault        NotifyChannel = "default"
 )
 
 // Notifier sends operator alerts and trade notifications.

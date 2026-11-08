@@ -17,9 +17,9 @@ import (
 type contextKey string
 
 const (
-	maxTurnsKey       contextKey = "max_turns"
-	turnTimeoutKey    contextKey = "turn_timeout"
-	maxTokensKey      contextKey = "max_tokens"
+	maxTurnsKey    contextKey = "max_turns"
+	turnTimeoutKey contextKey = "turn_timeout"
+	maxTokensKey   contextKey = "max_tokens"
 )
 
 // WithMaxTurns stores the configured turn limit in the context for LLM adapters.

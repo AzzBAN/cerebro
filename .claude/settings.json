@@ -1,5 +1,27 @@
 {
   "enabledPlugins": {
     "supabase@claude-plugins-official": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/azhar/.pyenv/versions/3.12.7/bin/graphify hook-guard search"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/azhar/.pyenv/versions/3.12.7/bin/graphify hook-guard read"
+          }
+        ]
+      }
+    ]
   }
 }

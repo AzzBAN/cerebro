@@ -13,7 +13,7 @@ import (
 //   - Entry: Side, OrderType, Quantity, LimitPrice, StopPrice, TIF.
 //   - Bracket request: StopLoss, TakeProfit1, ScaleOutPct. When non-zero, the
 //     execution layer attaches a bracket (OCO on spot, reduce-only STOP_MARKET
-//     + TAKE_PROFIT_MARKET on futures) immediately after the entry order is
+//   - TAKE_PROFIT_MARKET on futures) immediately after the entry order is
 //     accepted. See port.Broker.PlaceBracket.
 //   - Futures: ReduceOnly, PositionSide, Leverage. Leverage of 0 means
 //     "use whatever the venue has already configured for this symbol".
@@ -48,6 +48,11 @@ type OrderIntent struct {
 	ReduceOnly   bool
 	PositionSide PositionSide // zero value (empty) = BOTH / one-way mode
 	Leverage     int          // 0 = do not change existing venue leverage
+
+	// Status mirrors order_intents.status so the order-history view can
+	// render the full lifecycle (pending → submitted → filled/rejected/
+	// cancelled) without a second round-trip. Zero value = pending.
+	Status OrderStatus
 }
 
 // OrderTypeOrDefault returns OrderType, falling back to market when unset.

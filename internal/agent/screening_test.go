@@ -21,8 +21,8 @@ func TestParseOpportunitiesOutput(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "valid JSON with markdown fences",
-			input: "```json\n{\"opportunities\": [{\"symbol\": \"BTCUSDT\", \"venue\": \"binance_spot\", \"side\": \"BUY\", \"confidence\": 0.7, \"reasoning\": \"test\", \"correlations\": [], \"avoided\": false}]}\n```",
+			name:    "valid JSON with markdown fences",
+			input:   "```json\n{\"opportunities\": [{\"symbol\": \"BTCUSDT\", \"venue\": \"binance_spot\", \"side\": \"BUY\", \"confidence\": 0.7, \"reasoning\": \"test\", \"correlations\": [], \"avoided\": false}]}\n```",
 			wantLen: 1,
 			wantErr: false,
 		},
@@ -71,8 +71,8 @@ func TestParseOpportunitiesOutput(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "truncation before any complete entry returns error",
-			input: `{"opportunities": [{"symbol": "BTC`,
+			name:    "truncation before any complete entry returns error",
+			input:   `{"opportunities": [{"symbol": "BTC`,
 			wantErr: true,
 		},
 		{

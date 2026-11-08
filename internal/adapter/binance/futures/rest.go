@@ -11,11 +11,18 @@ import (
 	"time"
 
 	gobinancefutures "github.com/adshao/go-binance/v2/futures"
+	"github.com/azhar/cerebro/internal/adapter/binance"
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/shopspring/decimal"
 )
+
+// PnLReceiver receives realized PnL updates from trade executions.
+type PnLReceiver interface {
+	UpdatePnL(pnl decimal.Decimal)
+}
 
 type futuresMode string
 
@@ -44,7 +51,7 @@ const (
 // OrderType values for conditional close legs. The SDK only pre-declares Limit,
 // Market and Liquidation — these two are cast from their wire strings.
 const (
-	orderTypeStopMarket      = gobinancefutures.OrderType("STOP_MARKET")
+	orderTypeStopMarket       = gobinancefutures.OrderType("STOP_MARKET")
 	orderTypeTakeProfitMarket = gobinancefutures.OrderType("TAKE_PROFIT_MARKET")
 )
 
@@ -65,6 +72,19 @@ type FuturesBroker struct {
 	// STOP_MARKET / TAKE_PROFIT_MARKET orders per symbol, so a confirmed
 	// adjustment can cancel the exact orders. Guarded by b.mu.
 	protective map[domain.Symbol]protectiveOrders
+
+	tradeStore port.TradeStore
+	pnlSink    PnLReceiver
+}
+
+// SetTradeStore wires a persistent store for filled trades.
+func (b *FuturesBroker) SetTradeStore(ts port.TradeStore) {
+	b.tradeStore = ts
+}
+
+// SetPnLSink wires a receiver for realized PnL updates.
+func (b *FuturesBroker) SetPnLSink(sink PnLReceiver) {
+	b.pnlSink = sink
 }
 
 // SetResyncInterval overrides the periodic REST position-resync cadence. A
@@ -349,6 +369,7 @@ func (b *FuturesBroker) placeProtectiveLeg(
 	}
 	return strconv.FormatInt(resp.OrderID, 10), nil
 }
+
 // Each leg is cancelled independently; errors are aggregated so that one
 // failed cancel doesn't leave the other leg live unnoticed.
 func (b *FuturesBroker) CancelBracket(ctx context.Context, resp domain.BracketResponse) error {
@@ -373,7 +394,7 @@ func (b *FuturesBroker) CancelBracket(ctx context.Context, resp domain.BracketRe
 		if b.mode == futuresModeDemo {
 			if _, cerr := b.client.NewCancelAlgoOrderService().
 				AlgoID(orderID).
-				Do(ctx); cerr != nil {
+				Do(ctx); cerr != nil && !binance.IsOrderNotFound(cerr) {
 				errs = append(errs, fmt.Sprintf("%s: %v", id, cerr))
 			}
 			continue
@@ -381,7 +402,7 @@ func (b *FuturesBroker) CancelBracket(ctx context.Context, resp domain.BracketRe
 		if _, cerr := b.client.NewCancelOrderService().
 			Symbol(sym).
 			OrderID(orderID).
-			Do(ctx); cerr != nil {
+			Do(ctx); cerr != nil && !binance.IsOrderNotFound(cerr) {
 			errs = append(errs, fmt.Sprintf("%s: %v", id, cerr))
 		}
 	}
@@ -491,12 +512,22 @@ func (b *FuturesBroker) Positions(_ context.Context) ([]domain.Position, error) 
 // user-data position open (no open-orders payload) and the next REST resync.
 // The network call runs outside b.mu; only the cache mutation holds the lock.
 func (b *FuturesBroker) RefreshProtection(ctx context.Context, sym domain.Symbol) (bool, error) {
-	openOrders, err := b.client.NewListOpenOrdersService().Do(ctx)
-	if err != nil {
-		return false, fmt.Errorf("futures open-orders refresh for %s: %w", sym, err)
-	}
-	stops, tps, ids := detectProtectiveLevels(openOrders)
+	var stops, tps map[string]decimal.Decimal
+	var ids map[string]protectiveOrders
 
+	if b.mode == futuresModeDemo {
+		algoOrders, err := b.client.NewListOpenAlgoOrdersService().Do(ctx)
+		if err != nil {
+			return false, fmt.Errorf("futures demo open-algo-orders refresh for %s: %w", sym, err)
+		}
+		stops, tps, ids = detectProtectiveAlgoLevels(algoOrders)
+	} else {
+		openOrders, err := b.client.NewListOpenOrdersService().Do(ctx)
+		if err != nil {
+			return false, fmt.Errorf("futures open-orders refresh for %s: %w", sym, err)
+		}
+		stops, tps, ids = detectProtectiveLevels(openOrders)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	pos, ok := b.positions[sym]
@@ -629,12 +660,23 @@ func (b *FuturesBroker) fetchPositionSnapshot(ctx context.Context) (map[domain.S
 		next[pos.Symbol] = pos
 	}
 
-	openOrders, ooErr := b.client.NewListOpenOrdersService().Do(ctx)
-	if ooErr != nil {
-		slog.WarnContext(ctx, "futures open-orders fetch for SL/TP detection failed", "err", ooErr)
-		return next, nil, nil
+	var stops, tps map[string]decimal.Decimal
+	var ids map[string]protectiveOrders
+	if b.mode == futuresModeDemo {
+		algoOrders, aoErr := b.client.NewListOpenAlgoOrdersService().Do(ctx)
+		if aoErr != nil {
+			slog.WarnContext(ctx, "futures demo open-algo-orders fetch for SL/TP detection failed", "err", aoErr)
+			return next, nil, nil
+		}
+		stops, tps, ids = detectProtectiveAlgoLevels(algoOrders)
+	} else {
+		openOrders, ooErr := b.client.NewListOpenOrdersService().Do(ctx)
+		if ooErr != nil {
+			slog.WarnContext(ctx, "futures open-orders fetch for SL/TP detection failed", "err", ooErr)
+			return next, nil, nil
+		}
+		stops, tps, ids = detectProtectiveLevels(openOrders)
 	}
-	stops, tps, ids := detectProtectiveLevels(openOrders)
 	detected := make(map[domain.Symbol]protectiveOrders, len(ids))
 	for rawSym, po := range ids {
 		sym := domain.Symbol(normaliseFuturesSymbol(rawSym))
@@ -712,8 +754,11 @@ func (b *FuturesBroker) runUserDataSession(ctx context.Context) error {
 	go b.keepaliveUserStream(ctx, listenKey, keepaliveDone)
 	defer close(keepaliveDone)
 
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	go func() {
-		<-ctx.Done()
+		<-sessionCtx.Done()
 		_ = conn.Close()
 	}()
 
@@ -766,7 +811,99 @@ func (b *FuturesBroker) handleUserDataMessage(message []byte) error {
 		return b.handleAccountUpdate(message)
 	case "ACCOUNT_CONFIG_UPDATE":
 		return b.handleAccountConfigUpdate(message)
+	case "ORDER_TRADE_UPDATE":
+		return b.handleOrderTradeUpdate(message)
 	}
+	return nil
+}
+
+func (b *FuturesBroker) handleOrderTradeUpdate(message []byte) error {
+	var evt struct {
+		Event     string `json:"e"`
+		EventTime int64  `json:"E"`
+		Order     struct {
+			Symbol          string `json:"s"`
+			ClientOrderID   string `json:"c"`
+			Side            string `json:"S"`
+			OrderType       string `json:"o"`
+			OriginalQty     string `json:"q"`
+			AveragePrice    string `json:"ap"`
+			ExecutionType   string `json:"x"`
+			OrderStatus     string `json:"X"`
+			LastFilledQty   string `json:"l"`
+			CumulativeQty   string `json:"z"`
+			LastFilledPrice string `json:"L"`
+			Commission      string `json:"n"`
+			RealizedProfit  string `json:"rp"`
+		} `json:"o"`
+	}
+	if err := json.Unmarshal(message, &evt); err != nil {
+		return err
+	}
+
+	o := evt.Order
+	if o.ExecutionType != "TRADE" && o.OrderStatus != "FILLED" && o.OrderStatus != "PARTIALLY_FILLED" {
+		return nil
+	}
+
+	sym, err := domain.NormalizeExchangeSymbol(o.Symbol, domain.ContractFuturesPerp)
+	if err != nil {
+		return nil
+	}
+
+	qty, _ := decimal.NewFromString(o.LastFilledQty)
+	if qty.IsZero() {
+		qty, _ = decimal.NewFromString(o.CumulativeQty)
+	}
+	if qty.IsZero() {
+		qty, _ = decimal.NewFromString(o.OriginalQty)
+	}
+
+	price, _ := decimal.NewFromString(o.LastFilledPrice)
+	if price.IsZero() {
+		price, _ = decimal.NewFromString(o.AveragePrice)
+	}
+
+	fees, _ := decimal.NewFromString(o.Commission)
+
+	var pnlPtr *decimal.Decimal
+	if o.RealizedProfit != "" {
+		if rp, rpErr := decimal.NewFromString(o.RealizedProfit); rpErr == nil && !rp.IsZero() {
+			pnlPtr = &rp
+			if b.pnlSink != nil {
+				b.pnlSink.UpdatePnL(rp)
+			}
+		}
+	}
+
+	tradeTime := time.Now().UTC()
+	if evt.EventTime > 0 {
+		tradeTime = time.UnixMilli(evt.EventTime)
+	}
+
+	trade := domain.Trade{
+		ID:            uuid.New().String(),
+		CorrelationID: o.ClientOrderID,
+		Symbol:        sym,
+		Side:          domain.Side(strings.ToLower(o.Side)),
+		Quantity:      qty,
+		FillPrice:     price,
+		Fees:          fees,
+		PnL:           pnlPtr,
+		Venue:         domain.VenueBinanceFutures,
+		CreatedAt:     tradeTime,
+	}
+
+	if b.tradeStore != nil {
+		if err := b.tradeStore.SaveTrade(context.Background(), trade); err != nil {
+			slog.Error("futures: failed to save trade from order update", "error", err, "symbol", sym)
+			return err
+		}
+		slog.Info("futures: trade fill recorded",
+			"symbol", sym, "side", trade.Side, "qty", qty.String(),
+			"price", price.String(), "pnl", o.RealizedProfit)
+	}
+
 	return nil
 }
 
@@ -956,6 +1093,42 @@ func detectProtectiveLevels(orders []*gobinancefutures.Order) (
 		case orderTypeTakeProfitMarket:
 			tps[o.Symbol] = px
 			cur.TakeProfitOrderID = strconv.FormatInt(o.OrderID, 10)
+		default:
+			continue
+		}
+		ids[o.Symbol] = cur
+	}
+	return stops, tps, ids
+}
+
+func detectProtectiveAlgoLevels(orders []gobinancefutures.GetAlgoOrderResp) (
+	stops map[string]decimal.Decimal,
+	tps map[string]decimal.Decimal,
+	ids map[string]protectiveOrders,
+) {
+	stops = make(map[string]decimal.Decimal)
+	tps = make(map[string]decimal.Decimal)
+	ids = make(map[string]protectiveOrders)
+	for _, o := range orders {
+		if !o.ClosePosition && !o.ReduceOnly {
+			continue
+		}
+		pxStr := o.TriggerPrice
+		if pxStr == "" || pxStr == "0" {
+			pxStr = o.Price
+		}
+		px, err := decimal.NewFromString(pxStr)
+		if err != nil || px.IsZero() {
+			continue
+		}
+		cur := ids[o.Symbol]
+		switch string(o.OrderType) {
+		case "STOP_MARKET", "STOP":
+			stops[o.Symbol] = px
+			cur.StopOrderID = strconv.FormatInt(o.AlgoId, 10)
+		case "TAKE_PROFIT_MARKET", "TAKE_PROFIT":
+			tps[o.Symbol] = px
+			cur.TakeProfitOrderID = strconv.FormatInt(o.AlgoId, 10)
 		default:
 			continue
 		}

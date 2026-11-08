@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +32,11 @@ func (m *memoryTradeStore) SaveIntent(_ context.Context, i domain.OrderIntent) e
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.intents[i.ID] = i
-	m.status[i.ID] = domain.OrderStatusPending
+	if i.Status == "" {
+		m.status[i.ID] = domain.OrderStatusPending
+	} else {
+		m.status[i.ID] = i.Status
+	}
 	slog.Debug("trade store: intent saved", "id", i.ID, "symbol", i.Symbol, "side", i.Side)
 	return nil
 }
@@ -40,6 +45,10 @@ func (m *memoryTradeStore) UpdateIntentStatus(_ context.Context, id string, stat
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.status[id] = status
+	if i, ok := m.intents[id]; ok {
+		i.Status = status
+		m.intents[id] = i
+	}
 	slog.Debug("trade store: status updated", "id", id, "status", status, "broker_id", brokerID)
 	return nil
 }
@@ -63,6 +72,31 @@ func (m *memoryTradeStore) TradesByWindow(_ context.Context, from, to time.Time)
 			out = append(out, t)
 		}
 	}
+	return out, nil
+}
+
+// IntentsByWindow mirrors TradesByWindow for the order-history view: every
+// intent whose created_at falls in [from, to), newest-first, with the current
+// status attached. The in-memory store keeps the status map updated by
+// UpdateIntentStatus so the returned OrderIntent always reflects the latest
+// lifecycle state.
+func (m *memoryTradeStore) IntentsByWindow(_ context.Context, from, to time.Time) ([]domain.OrderIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]domain.OrderIntent, 0, len(m.intents))
+	for _, i := range m.intents {
+		if i.CreatedAt.Before(from) || i.CreatedAt.After(to) {
+			continue
+		}
+		if s, ok := m.status[i.ID]; ok {
+			i.Status = s
+		}
+		out = append(out, i)
+	}
+	// Newest-first: simple in-place sort by created_at desc.
+	sort.Slice(out, func(a, b int) bool {
+		return out[a].CreatedAt.After(out[b].CreatedAt)
+	})
 	return out, nil
 }
 
@@ -155,18 +189,24 @@ func (m *memoryCache) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-func (m *memoryCache) IncrBy(ctx context.Context, key string, delta int64, ttl time.Duration) (int64, error) {
-	curr, err := m.Get(ctx, key)
-	if err != nil {
-		return 0, err
-	}
+func (m *memoryCache) IncrBy(_ context.Context, key string, delta int64, ttl time.Duration) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	var n int64
-	if len(curr) > 0 {
-		_ = json.Unmarshal(curr, &n)
+	if v, ok := m.data[key]; ok {
+		if v.expiresAt.IsZero() || time.Now().Before(v.expiresAt) {
+			_ = json.Unmarshal(v.payload, &n)
+		}
 	}
 	n += delta
 	b, _ := json.Marshal(n)
-	return n, m.Set(ctx, key, b, ttl)
+	v := memoryValue{payload: b}
+	if ttl > 0 {
+		v.expiresAt = time.Now().Add(ttl)
+	}
+	m.data[key] = v
+	return n, nil
 }
 
 func (m *memoryCache) Keys(_ context.Context, patternExpr string) ([]string, error) {
@@ -233,5 +273,22 @@ func (m *memoryCache) Exists(_ context.Context, key string) (bool, error) {
 		delete(m.data, key)
 		return false, nil
 	}
+	return true, nil
+}
+
+func (m *memoryCache) SetNX(_ context.Context, key string, val []byte, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if v, ok := m.data[key]; ok {
+		if v.expiresAt.IsZero() || time.Now().Before(v.expiresAt) {
+			return false, nil
+		}
+	}
+	v := memoryValue{payload: append([]byte(nil), val...)}
+	if ttl > 0 {
+		v.expiresAt = time.Now().Add(ttl)
+	}
+	m.data[key] = v
 	return true, nil
 }

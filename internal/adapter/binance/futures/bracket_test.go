@@ -88,8 +88,54 @@ func TestPlaceBracket_DemoUsesAlgoEndpoint(t *testing.T) {
 	}
 }
 
-// TestPlaceBracket_MainnetUsesStandardEndpoint verifies the proven standard
-// /fapi/v1/order path is unchanged for live trading.
+// TestCancelBracket_OrderAlreadyGone verifies that a -2011 ("Unknown order
+// sent") response — the order was already filled/cancelled/expired on the
+// exchange — is treated as a successful, idempotent cancel rather than a hard
+// error. This is the fix for proposal-adjust failures where the cached
+// protective order is no longer live by the time the operator confirms.
+func TestCancelBracket_OrderAlreadyGone(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code int
+	}{
+		{"unknown order -2011", `{"code":-2011,"msg":"Unknown order sent."}`, http.StatusBadRequest},
+		{"order does not exist -2013", `{"code":-2013,"msg":"Order does not exist."}`, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, sym := brokerWithMockServer(t, "mainnet", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.code)
+				_, _ = w.Write([]byte(tt.body))
+			})
+			err := b.CancelBracket(context.Background(), domain.BracketResponse{
+				Symbol:            sym,
+				StopOrderID:       "111",
+				TakeProfitOrderID: "222",
+			})
+			if err != nil {
+				t.Errorf("CancelBracket() = %v, want nil (already-gone is idempotent)", err)
+			}
+		})
+	}
+}
+
+// TestCancelBracket_RealErrorSurfaces verifies a genuine cancel failure (not an
+// already-gone code) is still aggregated and returned, so a live leg is never
+// silently left unprotected.
+func TestCancelBracket_RealErrorSurfaces(t *testing.T) {
+	b, sym := brokerWithMockServer(t, "mainnet", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}`))
+	})
+	err := b.CancelBracket(context.Background(), domain.BracketResponse{
+		Symbol:      sym,
+		StopOrderID: "111",
+	})
+	if err == nil {
+		t.Fatal("CancelBracket() = nil, want error for genuine cancel failure")
+	}
+}
 func TestPlaceBracket_MainnetUsesStandardEndpoint(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string

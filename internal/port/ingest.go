@@ -7,9 +7,8 @@ import (
 	"github.com/azhar/cerebro/internal/domain"
 )
 
-// NewsVotes holds the provider-reported reaction counts for a post. Fields
-// map 1:1 to CryptoPanic's vote schema; other news sources populate only the
-// subset they expose (unused fields remain zero).
+// NewsVotes holds the provider-reported reaction counts for a post. News
+// sources populate only the subset they expose (unused fields remain zero).
 type NewsVotes struct {
 	Positive  int
 	Negative  int
@@ -24,15 +23,15 @@ type NewsVotes struct {
 
 // NewsItem is a single headline or market squawk.
 type NewsItem struct {
-	// ID is the provider-stable identifier used for deduplication. Required
-	// for CryptoPanic; sources without a stable ID may synthesise one from
+	// ID is the provider-stable identifier used for deduplication. Sources
+	// without a stable ID may synthesise one from
 	// URL + title (e.g. FinancialJuice uses <guid> / hashed title).
 	ID string
 	// Title is the headline text.
 	Title string
 	// Summary is the short body/description where available.
 	Summary string
-	// Source is the ingest adapter name ("cryptopanic", "financialjuice", ...).
+	// Source is the ingest adapter name ("financialjuice", ...).
 	Source string
 	// Domain is the upstream publisher domain (e.g. "coindesk.com").
 	Domain string

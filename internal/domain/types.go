@@ -18,6 +18,22 @@ const (
 	EnvironmentLive Environment = "live"
 )
 
+// RunMode controls the terminal presentation of the engine at startup.
+// It governs only the local terminal surface; the web dashboard is controlled
+// independently by web.enabled in app.yaml and runs in any mode.
+type RunMode string
+
+const (
+	// RunModeTUI renders the full Bubble Tea terminal UI on the alt-screen.
+	// Requires an interactive terminal (TTY).
+	RunModeTUI RunMode = "tui"
+
+	// RunModeWeb skips the TUI and streams structured logs to stderr. The web
+	// dashboard (when web.enabled) remains the primary UI. This is the only
+	// usable mode when no TTY is attached (VPS / systemd / docker / nohup).
+	RunModeWeb RunMode = "web"
+)
+
 // Symbol is an exchange-native trading pair identifier (e.g. "BTCUSDT").
 type Symbol string
 
@@ -126,6 +142,21 @@ const (
 	SessionNYOpen    SessionFilter = "ny_open"    // 12:00–14:00 UTC
 	SessionAsianOpen SessionFilter = "asian_open" // 00:00–02:00 UTC
 	SessionOverlap   SessionFilter = "overlap"    // 12:00–16:00 UTC
+)
+
+// Aggressiveness is a global dial that scales how often and how large the
+// engine trades, layered on top of each strategy's own parameters. It is
+// advisory tuning only — it never relaxes the hard limits in the risk gate
+// (internal/risk) or the global `risk:` caps in app.yaml.
+//
+// An empty value is treated as Balanced (identity), so existing configs that
+// omit the field behave exactly as before.
+type Aggressiveness string
+
+const (
+	AggressivenessConservative Aggressiveness = "conservative"
+	AggressivenessBalanced     Aggressiveness = "balanced"
+	AggressivenessAggressive   Aggressiveness = "aggressive"
 )
 
 // StopLossType determines how a stop-loss distance is calculated.

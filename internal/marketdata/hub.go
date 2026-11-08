@@ -38,10 +38,10 @@ type subscriber struct {
 // merges partial updates into a per-symbol accumulated state before fanning
 // out so subscribers always see the full picture.
 type Hub struct {
-	mu            sync.RWMutex
-	subscribers   []*subscriber
-	latestQuotes  map[string]domain.Quote
-	quotesMu      sync.Mutex
+	mu           sync.RWMutex
+	subscribers  []*subscriber
+	latestQuotes map[string]domain.Quote
+	quotesMu     sync.Mutex
 }
 
 // NewHub creates an empty Hub.

@@ -145,6 +145,8 @@ func (m *Model) renderXSBody(contentH int) string {
 		return m.renderMacroPanel(m.width, contentH)
 	case 5: // Agents
 		return m.renderAgentRunsPanel(m.width, contentH)
+	case 6: // Chat
+		return m.renderCopilotChat(m.width, contentH)
 	default:
 		return dimStyle.Render("  (unknown tab)")
 	}
@@ -424,7 +426,7 @@ func (m *Model) middleHeight() int {
 	watchH := m.computedWatchH()
 	agentH := m.computedAgentPanelH()
 	statusH := 1
-	inputH := 3 // bordered input box: top border + content + bottom border
+	inputH := 3  // bordered input box: top border + content + bottom border
 	tabBarH := 1 // main tab bar
 
 	askH := 0
@@ -577,7 +579,7 @@ func (m *Model) renderTabLogs() string {
 	return style.Width(contentW).MaxHeight(bodyH).Render(truncateLines(logContent, contentH))
 }
 
-// renderTabAgents renders a full-height agent activity view.
+// renderTabAgents renders a full-height agent activity view with sub-tabs.
 func (m *Model) renderTabAgents() string {
 	bodyH := m.bodyHeight()
 	contentH := bodyH - 2 // border
@@ -586,6 +588,45 @@ func (m *Model) renderTabAgents() string {
 	}
 	contentW := m.width - borderH
 
+	// Render sub-tab strip
+	subTabStrip := m.renderAgentsSubTabStrip(contentW)
+
+	// Reserve 1 line for the sub-tab strip
+	panelH := contentH - 1
+	if panelH < 1 {
+		panelH = 1
+	}
+
+	var body string
+	if m.agentsSubTab == 0 {
+		body = m.renderAgentActivity(contentW, panelH)
+	} else {
+		body = m.renderCopilotChat(contentW, panelH)
+	}
+
+	content := subTabStrip + "\n" + body
+	return borderStyle.Width(contentW).MaxHeight(contentH).Render(content)
+}
+
+// renderAgentsSubTabStrip renders the [ Activity ] [ Copilot ] tab selector.
+func (m *Model) renderAgentsSubTabStrip(contentW int) string {
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
+	inactiveStyle := dimStyle
+
+	activity := inactiveStyle.Render("[ Activity ]")
+	copilot := inactiveStyle.Render("[ Copilot ]")
+
+	if m.agentsSubTab == 0 {
+		activity = activeStyle.Render("[ Activity ]")
+	} else {
+		copilot = activeStyle.Render("[ Copilot ]")
+	}
+
+	return fmt.Sprintf("  %s  %s  %s", activity, dimStyle.Render("│"), copilot)
+}
+
+// renderAgentActivity renders the existing agent runs view.
+func (m *Model) renderAgentActivity(contentW, contentH int) string {
 	header := panelHeaderAgent.Render("Agent Activity")
 
 	var lines []string
@@ -640,7 +681,57 @@ func (m *Model) renderTabAgents() string {
 	}
 
 	content := header + "\n" + strings.Join(lines, "\n")
-	return borderStyle.Width(contentW).MaxHeight(bodyH).Render(truncateLines(content, contentH))
+	return truncateLines(content, contentH)
+}
+
+// renderCopilotChat renders the copilot chat history with scrolling.
+func (m *Model) renderCopilotChat(contentW, contentH int) string {
+	header := panelHeaderAgent.Render("Copilot Chat")
+
+	if len(m.chatMessages) == 0 {
+		emptyMsg := dimStyle.Render("  No messages yet — ask something below")
+		content := header + "\n" + emptyMsg
+		return truncateLines(content, contentH)
+	}
+
+	// Render all messages into lines
+	var allLines []string
+	for _, msg := range m.chatMessages {
+		if msg.Role == "user" {
+			// User message: accent colored prompt
+			userLine := inputStyle.Render("❯ ") + msg.Content
+			allLines = append(allLines, userLine)
+		} else {
+			// Assistant message: rendered as markdown
+			rendered := renderAgentMarkdown(msg.Content, contentW-2, 500)
+			renderedLines := strings.Split(rendered, "\n")
+			allLines = append(allLines, renderedLines...)
+		}
+		// Add separator between exchanges
+		allLines = append(allLines, dimStyle.Render(strings.Repeat("─", contentW-4)))
+	}
+
+	// Apply scrolling: newest at bottom, scroll up to see older messages
+	total := len(allLines)
+	visibleH := contentH - 1 // reserve 1 line for header
+
+	// Calculate visible window
+	end := total - m.chatScrollY
+	if end > total {
+		end = total
+	}
+	start := end - visibleH
+	if start < 0 {
+		start = 0
+		end = start + visibleH
+		if end > total {
+			end = total
+		}
+	}
+
+	visible := allLines[start:end]
+	content := header + "\n" + strings.Join(visible, "\n")
+	return truncateLines(content, contentH)
 }
 
 // renderMiddle dispatches to the appropriate breakpoint-specific layout for the

@@ -45,7 +45,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Cerebro ───────────────────────────────────────────────────────────────────
+  # ── Cerebro Engine ─────────────────────────────────────────────────────────
   cerebro:
     build:
       context: ..
@@ -64,11 +64,21 @@ services:
       # Override Redis/Postgres URLs to point to container service names.
       REDIS_URL: redis://redis:6379
       DATABASE_URL: postgres://cerebro:cerebro@postgres:5432/cerebro?sslmode=disable
-    ports:
-      # Prometheus metrics endpoint (only active with -tags metrics build).
-      - "9090:9090"
-    command: ["run", "--paper", "--config-dir", "/configs"]
+    expose:
+      - "8080"
+    command: ["run", "--demo", "--mode=web", "--config-dir", "/configs"]
 
+  # ── Nginx Reverse Proxy (Cloudflare / SSL Gateway) ─────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    networks: [cerebro]
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - cerebro
   # ── Goose migrations (one-shot) ───────────────────────────────────────────────
   migrate:
     image: ghcr.io/pressly/goose:latest

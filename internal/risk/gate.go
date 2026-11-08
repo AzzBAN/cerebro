@@ -43,6 +43,11 @@ func NewGate(cfg config.RiskConfig, cache port.Cache, cal *CalendarBlackout) *Ga
 		dailyResetDate: midnightUTC(),
 	}
 }
+// Cache returns the underlying cache instance wired into the gate.
+func (g *Gate) Cache() port.Cache {
+	return g.cache
+}
+
 
 // SetAllowedSymbols installs the executable-symbol allow-list. Signals on
 // symbols not in this set will be rejected with ErrSignalRejected. Pass
@@ -72,14 +77,21 @@ func (g *Gate) SetStartingEquity(equity decimal.Decimal) {
 	g.startingEquity = equity
 	slog.Info("risk gate: starting equity set", "equity", equity.StringFixed(2))
 }
+// CurrentDrawdownPct returns the current session drawdown percentage.
+func (g *Gate) CurrentDrawdownPct() float64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.sessionPnL.IsNegative() && g.startingEquity.IsPositive() {
+		return g.sessionPnL.Abs().Div(g.startingEquity).Mul(decimal.NewFromInt(100)).InexactFloat64()
+	}
+	return 0.0
+}
 
 // Check validates a signal against all active risk limits.
 // Returns nil if the signal may proceed, or a wrapped domain error if rejected.
 func (g *Gate) Check(ctx context.Context, sig domain.Signal, positions []domain.Position) error {
-	// 1. Daily PnL reset at midnight UTC — done under write lock *before*
-	//    taking the read lock to avoid the RLock→Lock promotion race.
-	g.maybeResetDailyPnL()
-
+	// 1. Daily PnL reset at midnight UTC (aware of simulated timestamps).
+	g.maybeResetDailyPnLAt(sig.GeneratedAt)
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -157,14 +169,21 @@ func (g *Gate) Check(ctx context.Context, sig domain.Signal, positions []domain.
 	if biasBytes != nil {
 		var bias domain.BiasResult
 		if jerr := json.Unmarshal(biasBytes, &bias); jerr == nil {
-			// Bias alignment check is done per-strategy by the strategy itself;
-			// the gate enforces a global signal-direction bias filter here only
-			// if configured. For now, log the bias for observability.
 			slog.Debug("bias read from cache",
 				"symbol", sig.Symbol,
 				"score", bias.Score,
 				"expires_at", bias.ExpiresAt,
 			)
+			if g.cfg.RequireBiasAlignment {
+				if bias.Score > 0 && sig.Side == domain.SideSell {
+					return fmt.Errorf("%w: signal %s opposes %s market bias (%+d)",
+						domain.ErrSignalRejected, sig.Side, bias.Score.String(), bias.Score)
+				}
+				if bias.Score < 0 && sig.Side == domain.SideBuy {
+					return fmt.Errorf("%w: signal %s opposes %s market bias (%d)",
+						domain.ErrSignalRejected, sig.Side, bias.Score.String(), bias.Score)
+				}
+			}
 		}
 	}
 
@@ -222,26 +241,23 @@ func (g *Gate) UpdatePnL(pnl decimal.Decimal) {
 	g.dailyPnL = g.dailyPnL.Add(pnl)
 }
 
-// maybeResetDailyPnL resets daily PnL at midnight UTC using a proper
-// double-check pattern under a write lock (avoiding the RLock→Lock race).
+// maybeResetDailyPnL resets daily PnL at midnight UTC.
 func (g *Gate) maybeResetDailyPnL() {
-	g.mu.RLock()
-	needsReset := time.Now().UTC().After(g.dailyResetDate)
-	g.mu.RUnlock()
-	if !needsReset {
-		return
-	}
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	// Double-check under write lock.
-	if time.Now().UTC().After(g.dailyResetDate) {
-		g.dailyPnL = decimal.Zero
-		g.dailyResetDate = midnightUTC()
-		slog.Info("risk gate: daily PnL reset at midnight UTC")
-	}
+	g.maybeResetDailyPnLAt(time.Now().UTC())
 }
 
+func (g *Gate) maybeResetDailyPnLAt(now time.Time) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.dailyResetDate.IsZero() || now.After(g.dailyResetDate) || now.Before(g.dailyResetDate.Add(-24*time.Hour)) {
+		g.dailyPnL = decimal.Zero
+		g.dailyResetDate = time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+		slog.Debug("risk gate: daily PnL reset at midnight UTC", "reset_date", g.dailyResetDate)
+	}
+}
 func midnightUTC() time.Time {
 	now := time.Now().UTC()
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)

@@ -14,15 +14,9 @@ const dedupTTL = 24 * time.Hour
 // Returns (true, nil) if this is a fresh submission, (false, nil) if already seen.
 func DeduplicateOrder(ctx context.Context, cache port.Cache, intentID string) (bool, error) {
 	key := fmt.Sprintf("order_dedup:%s", intentID)
-	exists, err := cache.Exists(ctx, key)
+	ok, err := cache.SetNX(ctx, key, []byte("1"), dedupTTL)
 	if err != nil {
-		return false, fmt.Errorf("dedup check: %w", err)
+		return false, fmt.Errorf("dedup setnx: %w", err)
 	}
-	if exists {
-		return false, nil
-	}
-	if err := cache.Set(ctx, key, []byte("1"), dedupTTL); err != nil {
-		return false, fmt.Errorf("dedup set: %w", err)
-	}
-	return true, nil
+	return ok, nil
 }

@@ -89,10 +89,21 @@ func (s *Server) consumeQuotes(ctx context.Context) {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/state", s.auth(http.HandlerFunc(s.handleState)))
 	mux.Handle("GET /api/trades", s.auth(http.HandlerFunc(s.handleTrades)))
+	mux.Handle("GET /api/intents", s.auth(http.HandlerFunc(s.handleIntents)))
+	mux.Handle("GET /api/history", s.auth(http.HandlerFunc(s.handleHistory)))
 	mux.Handle("POST /api/command", s.auth(http.HandlerFunc(s.handleCommand)))
+	mux.Handle("GET /api/strategies/raw", s.auth(http.HandlerFunc(s.handleStrategiesRaw)))
+	mux.Handle("POST /api/strategies", s.auth(http.HandlerFunc(s.handleUpdateStrategies)))
+	mux.Handle("GET /api/configs", s.auth(http.HandlerFunc(s.handleConfigList)))
+	mux.Handle("GET /api/configs/{name}", s.auth(http.HandlerFunc(s.handleConfigGet)))
+	mux.Handle("PUT /api/configs/{name}", s.auth(http.HandlerFunc(s.handleConfigPut)))
+	mux.Handle("GET /api/configs/{name}/form/schema", s.auth(http.HandlerFunc(s.handleConfigFormSchema)))
+	mux.Handle("GET /api/configs/{name}/form", s.auth(http.HandlerFunc(s.handleConfigFormRead)))
+	mux.Handle("PUT /api/configs/{name}/form", s.auth(http.HandlerFunc(s.handleConfigFormPut)))
 	mux.Handle("POST /api/proposals/{id}/confirm", s.auth(http.HandlerFunc(s.handleProposalAction)))
 	mux.Handle("POST /api/proposals/{id}/reject", s.auth(http.HandlerFunc(s.handleProposalAction)))
 	mux.Handle("GET /ws", s.auth(http.HandlerFunc(s.handleWS)))
+	mux.Handle("POST /api/backtest/run", s.auth(http.HandlerFunc(s.handleBacktestRun)))
 
 	if sub, ok := frontendFS(); ok {
 		mux.Handle("/", http.FileServer(http.FS(sub)))
@@ -108,11 +119,9 @@ func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Snapshot())
 }
 
-func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
-	if s.tradeStore == nil {
-		writeJSON(w, http.StatusOK, []any{})
-		return
-	}
+// parseWindow extracts optional from/to millis query params. Defaults to
+// the trailing 24h window so a fresh dashboard request always has data.
+func parseWindow(r *http.Request) (time.Time, time.Time) {
 	to := time.Now()
 	from := to.Add(-24 * time.Hour)
 	if v := r.URL.Query().Get("from"); v != "" {
@@ -125,30 +134,82 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 			to = time.UnixMilli(ms)
 		}
 	}
+	return from, to
+}
+
+func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
+	if s.tradeStore == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	from, to := parseWindow(r)
 	trades, err := s.tradeStore.TradesByWindow(r.Context(), from, to)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query trades failed"})
 		return
 	}
-	out := make([]map[string]any, 0, len(trades))
+	out := make([]TradeDTO, 0, len(trades))
 	for _, t := range trades {
-		row := map[string]any{
-			"id":        t.ID,
-			"symbol":    string(t.Symbol),
-			"side":      string(t.Side),
-			"quantity":  t.Quantity.String(),
-			"fillPrice": t.FillPrice.String(),
-			"fees":      t.Fees.String(),
-			"strategy":  string(t.Strategy),
-			"venue":     string(t.Venue),
-			"createdAt": t.CreatedAt.UnixMilli(),
-		}
-		if t.PnL != nil {
-			row["pnl"] = t.PnL.String()
-		}
-		out = append(out, row)
+		out = append(out, tradeToDTO(t))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleIntents lists every order intent (pending/filled/rejected/etc.)
+// inside the time window. The response uses the OrderIntentDTO shape so
+// the order-history view can render intent rows with full context.
+func (s *Server) handleIntents(w http.ResponseWriter, r *http.Request) {
+	if s.intentReader == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	from, to := parseWindow(r)
+	intents, err := s.intentReader.IntentsByWindow(r.Context(), from, to)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query intents failed"})
+		return
+	}
+	out := make([]OrderIntentDTO, 0, len(intents))
+	for _, i := range intents {
+		out = append(out, orderIntentToDTO(i))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleHistory returns both intents and closed trades for a single window
+// so the dashboard tab can render the order history in one round-trip.
+// The trades and intents are returned in two separate arrays (newest-first
+// for intents, oldest-first for trades) and the dashboard merges them.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	type historyResp struct {
+		Intents []OrderIntentDTO `json:"intents"`
+		Trades  []TradeDTO       `json:"trades"`
+	}
+	resp := historyResp{Intents: []OrderIntentDTO{}, Trades: []TradeDTO{}}
+	from, to := parseWindow(r)
+	if s.tradeStore != nil {
+		trades, err := s.tradeStore.TradesByWindow(r.Context(), from, to)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query trades failed"})
+			return
+		}
+		resp.Trades = make([]TradeDTO, 0, len(trades))
+		for _, t := range trades {
+			resp.Trades = append(resp.Trades, tradeToDTO(t))
+		}
+	}
+	if s.intentReader != nil {
+		intents, err := s.intentReader.IntentsByWindow(r.Context(), from, to)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query intents failed"})
+			return
+		}
+		resp.Intents = make([]OrderIntentDTO, 0, len(intents))
+		for _, i := range intents {
+			resp.Intents = append(resp.Intents, orderIntentToDTO(i))
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // commandRequest is the POST /api/command body.
@@ -168,6 +229,49 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	reply := s.dispatcher.Dispatch(r.Context(), webActorID, req.Command)
 	writeJSON(w, http.StatusOK, map[string]string{"reply": reply})
+}
+
+// handleStrategiesRaw returns the RAW (pre-aggressiveness-scaling) editable
+// strategy config used to pre-fill the dashboard edit form.
+func (s *Server) handleStrategiesRaw(w http.ResponseWriter, _ *http.Request) {
+	if s.editor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "strategy editor not configured"})
+		return
+	}
+	raw, err := s.editor.RawView()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, raw)
+}
+
+// handleUpdateStrategies validates and applies edited strategy config, then
+// hot-reloads the engine. On a validation failure the on-disk files and the
+// live engine are left unchanged and a 400 carries the validator message.
+func (s *Server) handleUpdateStrategies(w http.ResponseWriter, r *http.Request) {
+	if s.editor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "strategy editor not configured"})
+		return
+	}
+	var req EditRequestDTO
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Aggressiveness == "" && len(req.Strategies) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no edits provided"})
+		return
+	}
+	dto, err := s.editor.ApplyEdits(r.Context(), req)
+	if err != nil {
+		// Edit was rejected (validation/patch failure). Files + engine unchanged.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// Push the new config to all live clients so panels refresh without refetch.
+	s.broadcast("config", dto)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleProposalAction(w http.ResponseWriter, r *http.Request) {
@@ -198,6 +302,118 @@ func (s *Server) handleProposalAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleConfigList(w http.ResponseWriter, _ *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	names := s.configEditor.List()
+	writeJSON(w, http.StatusOK, map[string]any{"files": names})
+}
+
+func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing config file name"})
+		return
+	}
+	dto, err := s.configEditor.Read(name)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing config file name"})
+		return
+	}
+
+	var req ConfigFileSaveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	dto, err := s.configEditor.Save(r.Context(), name, req.Content)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.broadcast("config", dto)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleConfigFormSchema(w http.ResponseWriter, r *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing config file name"})
+		return
+	}
+	schema, err := s.configEditor.FormSchema(name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, schema)
+}
+
+func (s *Server) handleConfigFormRead(w http.ResponseWriter, r *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing config file name"})
+		return
+	}
+	values, err := s.configEditor.FormRead(name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, values)
+}
+
+func (s *Server) handleConfigFormPut(w http.ResponseWriter, r *http.Request) {
+	if s.configEditor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "config editor not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing config file name"})
+		return
+	}
+
+	var fields map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	dto, err := s.configEditor.FormWrite(r.Context(), name, fields)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.broadcast("config", dto)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // wsUpgrader is configured per-server so the Origin check honours the
 // configured allowlist.
 func (s *Server) wsUpgrader() websocket.Upgrader {
@@ -216,13 +432,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := &client{send: make(chan []byte, 256)}
-	s.addClient(c)
 
 	// Replay the full snapshot so the client renders immediately.
 	if payload, err := json.Marshal(envelope{Type: "snapshot", Data: s.Snapshot()}); err == nil {
 		c.send <- payload
 	}
 
+	s.addClient(c)
 	go s.writePump(conn, c)
 	s.readPump(conn, c)
 }

@@ -19,11 +19,11 @@ type MeanReversion struct {
 	symbols []domain.Symbol
 
 	// Per-symbol indicator state.
-	rsi      map[domain.Symbol]*indicators.RSI
+	rsi       map[domain.Symbol]*indicators.RSI
 	bollinger map[domain.Symbol]*indicators.Bollinger
-	trendEMA map[domain.Symbol]*indicators.EMA
-	atr      map[domain.Symbol]*indicators.ATR
-	warmup   map[domain.Symbol]int
+	trendEMA  map[domain.Symbol]*indicators.EMA
+	atr       map[domain.Symbol]*indicators.ATR
+	warmup    map[domain.Symbol]int
 }
 
 // NewMeanReversion creates a MeanReversion strategy from config.
@@ -33,13 +33,13 @@ func NewMeanReversion(cfg config.StrategyConfig) *MeanReversion {
 		syms[i] = domain.Symbol(m)
 	}
 	s := &MeanReversion{
-		cfg:      cfg,
-		symbols:  syms,
-		rsi:      make(map[domain.Symbol]*indicators.RSI),
+		cfg:       cfg,
+		symbols:   syms,
+		rsi:       make(map[domain.Symbol]*indicators.RSI),
 		bollinger: make(map[domain.Symbol]*indicators.Bollinger),
-		trendEMA: make(map[domain.Symbol]*indicators.EMA),
-		atr:      make(map[domain.Symbol]*indicators.ATR),
-		warmup:   make(map[domain.Symbol]int),
+		trendEMA:  make(map[domain.Symbol]*indicators.EMA),
+		atr:       make(map[domain.Symbol]*indicators.ATR),
+		warmup:    make(map[domain.Symbol]int),
 	}
 	for _, sym := range syms {
 		s.rsi[sym] = indicators.NewRSI(cfg.Indicators.RSI.Period)
@@ -51,7 +51,7 @@ func NewMeanReversion(cfg config.StrategyConfig) *MeanReversion {
 }
 
 func (m *MeanReversion) Name() domain.StrategyName { return m.cfg.Name }
-func (m *MeanReversion) Symbols() []domain.Symbol   { return m.symbols }
+func (m *MeanReversion) Symbols() []domain.Symbol  { return m.symbols }
 func (m *MeanReversion) Timeframes() []domain.Timeframe {
 	return []domain.Timeframe{m.cfg.PrimaryTimeframe}
 }
@@ -103,6 +103,7 @@ func (m *MeanReversion) OnCandle(_ context.Context, c domain.Candle) (domain.Sig
 	if rsi.IsOverbought(m.cfg.Indicators.RSI.Overbought) && bb.IsAboveUpper(c.Close) {
 		if m.cfg.RequireTrendAlignment {
 			if tv, ok := trend.Value(); ok && c.Close.GreaterThan(tv) {
+				// Price above long trend EMA (uptrend) — never short in uptrend.
 				return domain.Signal{}, false
 			}
 		}
@@ -116,6 +117,10 @@ func (m *MeanReversion) OnCandle(_ context.Context, c domain.Candle) (domain.Sig
 
 func (m *MeanReversion) newSignal(c domain.Candle, side domain.Side, reason string) domain.Signal {
 	id := uuid.New().String()
+	genAt := c.CloseTime
+	if genAt.IsZero() {
+		genAt = time.Now().UTC()
+	}
 	return domain.Signal{
 		ID:            id,
 		CorrelationID: id,
@@ -124,7 +129,7 @@ func (m *MeanReversion) newSignal(c domain.Candle, side domain.Side, reason stri
 		Side:          side,
 		Timeframe:     c.Timeframe,
 		Reason:        reason,
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   genAt,
 	}
 }
 

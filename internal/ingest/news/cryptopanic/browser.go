@@ -17,9 +17,11 @@ import (
 // posts via a JSON.parse override. This path is slower (~5s per scrape)
 // but immune to AES-key rotation and IV-formula changes.
 type Browser struct {
-	allocCtx context.Context
-	cancel   context.CancelFunc
-	timeout  time.Duration
+	allocCtx      context.Context
+	allocCancel   context.CancelFunc
+	browserCtx    context.Context
+	browserCancel context.CancelFunc
+	timeout       time.Duration
 
 	// scrapeMu serializes scrapes to avoid Chromium tab stampedes under the
 	// same allocator. Mirrors the pattern used by CoinglassScraper.
@@ -37,26 +39,43 @@ func NewBrowser(timeout time.Duration) *Browser {
 
 // Close releases the Chromium process, if any. Safe to call multiple times.
 func (b *Browser) Close() {
-	if b.cancel != nil {
-		b.cancel()
-		b.cancel = nil
+	b.scrapeMu.Lock()
+	defer b.scrapeMu.Unlock()
+	if b.browserCancel != nil {
+		b.browserCancel()
+		b.browserCancel = nil
+	}
+	if b.allocCancel != nil {
+		b.allocCancel()
+		b.allocCancel = nil
 	}
 }
 
-// ensureAllocator spawns the headless Chromium the first time we scrape.
-func (b *Browser) ensureAllocator() {
-	if b.allocCtx != nil {
-		return
+// ensureBrowser spawns the headless Chromium the first time we scrape,
+// or revives it if the process exited. Must be called while holding scrapeMu.
+func (b *Browser) ensureBrowser() error {
+	if b.browserCtx != nil && b.browserCtx.Err() == nil {
+		return nil
 	}
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.WindowSize(1366, 900),
-	)
-	b.allocCtx, b.cancel = chromedp.NewExecAllocator(context.Background(), opts...)
+	if b.allocCtx == nil || b.allocCtx.Err() != nil {
+		opts := append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.Flag("headless", "new"),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disable-blink-features", "AutomationControlled"),
+			chromedp.WindowSize(1366, 900),
+		)
+		b.allocCtx, b.allocCancel = chromedp.NewExecAllocator(context.Background(), opts...)
+	}
+	bCtx, bCancel := chromedp.NewContext(b.allocCtx)
+	if err := chromedp.Run(bCtx, chromedp.Navigate("about:blank")); err != nil {
+		bCancel()
+		return fmt.Errorf("cryptopanic browser: launch: %w", err)
+	}
+	b.browserCtx = bCtx
+	b.browserCancel = bCancel
+	return nil
 }
 
 // Scrape loads /news/ in a headless browser, captures the decrypted posts
@@ -66,26 +85,24 @@ func (b *Browser) ensureAllocator() {
 func (b *Browser) Scrape(ctx context.Context, asset string) ([]rawPost, error) {
 	b.scrapeMu.Lock()
 	defer b.scrapeMu.Unlock()
-	b.ensureAllocator()
+	if err := b.ensureBrowser(); err != nil {
+		return nil, err
+	}
 
 	targetURL := baseURL + "/news/"
 	if asset != "" {
 		targetURL = baseURL + "/news/" + asset + "/"
 	}
 
-	tabCtx, cancel := chromedp.NewContext(b.allocCtx)
-	defer cancel()
-
+	tabCtx, tabCancel := chromedp.NewContext(b.browserCtx)
 	scrapeCtx, cancelTimeout := context.WithTimeout(tabCtx, b.timeout)
-	defer cancelTimeout()
-
-	// Propagate caller cancellation.
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancelTimeout()
-		case <-scrapeCtx.Done():
-		}
+	stop := context.AfterFunc(ctx, func() {
+		cancelTimeout()
+	})
+	defer func() {
+		stop()
+		cancelTimeout()
+		tabCancel()
 	}()
 
 	hookJS := `

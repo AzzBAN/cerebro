@@ -14,14 +14,14 @@ import (
 
 // Binance hard limits (PRD §6.1).
 const (
-	WeightLimitPerMin    = 6000
-	OrderLimit10s        = 50
-	OrderLimitDay        = 160_000
-	AlertAtPct           = 0.80
-	WeightWindowTTL      = 70 * time.Second
-	Order10sWindowTTL    = 15 * time.Second
-	OrderDayWindowTTL    = 24 * time.Hour
-	AlertDedupTTL        = 60 * time.Second // one alert per minute maximum
+	WeightLimitPerMin = 6000
+	OrderLimit10s     = 50
+	OrderLimitDay     = 160_000
+	AlertAtPct        = 0.80
+	WeightWindowTTL   = 70 * time.Second
+	Order10sWindowTTL = 15 * time.Second
+	OrderDayWindowTTL = 24 * time.Hour
+	AlertDedupTTL     = 60 * time.Second // one alert per minute maximum
 )
 
 // RateLimiter enforces Binance rate limits using Redis-backed counters.

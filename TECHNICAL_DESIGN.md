@@ -28,7 +28,7 @@
 flowchart LR
   subgraph ingress [Ingress]
     WS[WebSocket feeds\nBinance Spot · Binance Futures\nCrypto + XAUUSDT Gold]
-    NAP[News & Calendar APIs\nCryptoPanic · FMP · FairEconomy]
+    NAP[News & Calendar APIs\nFMP · FairEconomy]
     SCR[Scrapers\nFinancialJuice · chromedp]
   end
 
@@ -216,7 +216,7 @@ cerebro/
 │   │
 │   ├── ingest/
 │   │   ├── news/
-│   │   │   └── cryptopanic.go
+│   │   │   └── financialjuice.go
 │   │   ├── calendar/
 │   │   │   └── faireconomy.go         # FairEconomy JSON → domain.EconomicEvent
 │   │   ├── scrape/
@@ -823,7 +823,7 @@ Every agent invocation:
 |-------|-----------|-----------------|
 | `fetch_latest_news` | `tools/news.go` | `ingest/news` |
 | `get_economic_events` | `tools/calendar.go` | `ingest/calendar` |
-| `get_social_sentiment` | `tools/sentiment.go` | `ingest/news/cryptopanic` |
+| `get_social_sentiment` | `tools/sentiment.go` | `ingest/news/financialjuice` |
 | `get_current_drawdown` | `tools/risk_tools.go` | `risk/gate` + `adapter/postgres` |
 | `calculate_position_size` | `tools/risk_tools.go` | `risk/sizing` |
 | `reject_signal` | `tools/signal_tools.go` | writes to `audit_events`, drops from pipeline |

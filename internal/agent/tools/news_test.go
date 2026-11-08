@@ -28,7 +28,17 @@ func (c *memCache) IncrBy(_ context.Context, _ string, _ int64, _ time.Duration)
 	return 0, nil
 }
 func (c *memCache) Keys(_ context.Context, _ string) ([]string, error) { return nil, nil }
-func (c *memCache) Exists(_ context.Context, k string) (bool, error)   { _, ok := c.data[k]; return ok, nil }
+func (c *memCache) Exists(_ context.Context, k string) (bool, error) {
+	_, ok := c.data[k]
+	return ok, nil
+}
+func (c *memCache) SetNX(_ context.Context, k string, v []byte, _ time.Duration) (bool, error) {
+	if _, ok := c.data[k]; ok {
+		return false, nil
+	}
+	c.data[k] = append([]byte(nil), v...)
+	return true, nil
+}
 
 // erroringFeed fails every call — lets us prove the cache path sidesteps
 // the live feed when data is already present.

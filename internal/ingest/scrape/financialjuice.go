@@ -208,7 +208,7 @@ func parseRetryAfter(header string, now time.Time) time.Duration {
 // RSS types for XML decoding.
 
 type rssFeed struct {
-	XMLName xml.Name `xml:"rss"`
+	XMLName xml.Name   `xml:"rss"`
 	Channel rssChannel `xml:"channel"`
 }
 

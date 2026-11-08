@@ -394,8 +394,8 @@ func formatUSD(v decimal.Decimal, quote string) string {
 }
 
 // ─── News panel (LG and up) ──────────────────────────────────────────────────
-// Repurposed from the previous Calendar placeholder; the combined news
-// runner (CryptoPanic + FinancialJuice) feeds this panel with sentiment-
+// Repurposed from the previous Calendar placeholder; the news
+// runner (FinancialJuice) feeds this panel with sentiment-
 // tagged headlines, deduped by ID and sorted newest-first. The Finnhub
 // economic calendar still runs behind the scenes and drives the risk
 // blackout — it is not surfaced here to keep the panel focused.
@@ -574,7 +574,7 @@ func newsMetaLine(item port.NewsItem, budget int) string {
 
 // newsSourceLabel returns a compact source string, preferring the upstream
 // publisher domain when present and falling back to the ingest source name
-// (e.g. "cryptopanic", "financialjuice"). The "www." prefix is stripped
+// (e.g. "financialjuice"). The "www." prefix is stripped
 // because it adds noise without information.
 func newsSourceLabel(domain, source string) string {
 	d := strings.TrimSpace(domain)

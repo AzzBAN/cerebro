@@ -135,14 +135,14 @@ func FromContext(ctx context.Context) *slog.Logger {
 
 // ANSI escape codes.
 const (
-	ansiReset  = "\033[0m"
-	ansiBold   = "\033[1m"
-	ansiGray   = "\033[90m"
-	ansiCyan   = "\033[36m"
-	ansiYellow = "\033[33m"
-	ansiRed    = "\033[31m"
+	ansiReset   = "\033[0m"
+	ansiBold    = "\033[1m"
+	ansiGray    = "\033[90m"
+	ansiCyan    = "\033[36m"
+	ansiYellow  = "\033[33m"
+	ansiRed     = "\033[31m"
 	ansiBoldRed = "\033[1;31m"
-	ansiGreen  = "\033[32m"
+	ansiGreen   = "\033[32m"
 )
 
 // levelTag maps a slog.Level to a short coloured tag.
@@ -322,18 +322,18 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 
 // HeartbeatFields holds the values needed to render a heartbeat summary.
 type HeartbeatFields struct {
-	TradingState         string
-	Halted               bool
-	OpenPositions        int
-	CandlesProduced      int64
-	CandlesStrategy      int64
-	CandlesFiller        int64
-	SignalsFired         int64
-	SignalsDeduped       int64
-	SignalsRiskRejected  int64
-	OrdersRouted         int64
-	OrderErrors          int64
-	Timestamp            time.Time
+	TradingState        string
+	Halted              bool
+	OpenPositions       int
+	CandlesProduced     int64
+	CandlesStrategy     int64
+	CandlesFiller       int64
+	SignalsFired        int64
+	SignalsDeduped      int64
+	SignalsRiskRejected int64
+	OrdersRouted        int64
+	OrderErrors         int64
+	Timestamp           time.Time
 }
 
 // FormatHeartbeat returns a compact multi-line heartbeat block.

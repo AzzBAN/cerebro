@@ -17,11 +17,11 @@ func TestCalendarBlackout_IsBlackedOut(t *testing.T) {
 	})
 
 	tests := []struct {
-		name       string
-		now        time.Time
-		beforeMin  int
-		afterMin   int
-		wantBlack  bool
+		name      string
+		now       time.Time
+		beforeMin int
+		afterMin  int
+		wantBlack bool
 	}{
 		{
 			name:      "inside before window",

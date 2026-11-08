@@ -60,6 +60,15 @@ type BiasPublisher interface {
 	SendBias(b domain.BiasResult)
 }
 
+// OpportunityPublisher is the optional sink for the ranked cross-symbol
+// opportunities produced by Phase 2. The web dashboard satisfies this via
+// SendOpportunities; the TUI does not implement it and is simply skipped by
+// the multiSink fan-out. Defined at the consumption site (same reasoning as
+// BiasPublisher) to keep the agent package free of UI-adapter imports.
+type OpportunityPublisher interface {
+	SendOpportunities(opps []domain.ScreeningOpportunity)
+}
+
 // ScreeningAgent runs on a configurable schedule (every 1–4 h) and writes
 // a BiasResult to Redis for each monitored symbol.
 // It NEVER runs on the hot signal path.
@@ -88,6 +97,15 @@ type ScreeningAgent struct {
 	// biasPub is an optional sink that receives every BiasResult after it has
 	// been cached. May be nil; methods must guard before calling.
 	biasPub BiasPublisher
+
+	// oppPub is an optional sink that receives the ranked opportunities after
+	// Phase 2 caches them. May be nil; methods must guard before calling.
+	oppPub OpportunityPublisher
+
+	// triggerCh is an optional channel that the copilot's trigger_screening
+	// tool sends to when the user requests an on-demand screening run.
+	// A non-empty string means "screen this symbol only"; empty means all.
+	triggerCh <-chan string
 }
 
 // NewScreeningAgent creates a ScreeningAgent.
@@ -143,26 +161,180 @@ func (s *ScreeningAgent) SetBiasPublisher(p BiasPublisher) {
 	s.biasPub = p
 }
 
+// SetOpportunityPublisher injects an optional sink that receives the ranked
+// opportunities after Phase 2 caches them, and again on startup hydration.
+// Pass nil to disable.
+//
+// Safe to call once during runtime composition; not safe to call after Run().
+func (s *ScreeningAgent) SetOpportunityPublisher(p OpportunityPublisher) {
+	s.oppPub = p
+}
+
+// SetTriggerChannel injects an optional channel that the copilot's
+// trigger_screening tool sends to when the user requests an on-demand
+// screening run. A non-empty string means "screen this symbol only";
+// empty means "screen all configured symbols". Pass nil to disable.
+//
+// Safe to call once during runtime composition; not safe after Run().
+func (s *ScreeningAgent) SetTriggerChannel(ch <-chan string) {
+	s.triggerCh = ch
+}
+
 // Run starts the scheduling loop. Blocks until ctx is cancelled.
+//
+// On startup we do NOT blindly run a full cycle. Instead startup() screens
+// only symbols whose cached bias is missing or older than one interval, and
+// returns the delay until the first scheduled cycle — aligned to the original
+// cadence so a restart mid-interval doesn't burn a full LLM screening cycle.
+// When the cache (Redis) still holds fresh biases, nothing is re-screened and
+// the agent simply waits for the next aligned tick.
 func (s *ScreeningAgent) Run(ctx context.Context) error {
 	interval := time.Duration(s.cfg.ScreeningIntervalMinutes) * time.Minute
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if interval <= 0 {
+		interval = time.Hour
+	}
 
 	slog.Info("screening agent started",
 		"interval_minutes", s.cfg.ScreeningIntervalMinutes,
 		"symbols", len(s.source.Symbols(ctx)))
 
-	// Run immediately on startup.
-	s.runCycle(ctx)
+	delay := s.startup(ctx, interval)
 
 	for {
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			slog.Info("screening agent stopping")
 			return nil
-		case <-ticker.C:
+		case symbol := <-s.triggerCh:
+			// On-demand trigger: run immediately for this symbol (or all if empty)
+			timer.Stop()
+			if symbol != "" {
+				slog.Info("screening triggered on-demand", "symbol", symbol)
+			} else {
+				slog.Info("screening triggered on-demand", "scope", "all_symbols")
+			}
+			// Run full cycle; TODO: implement per-symbol screening
 			s.runCycle(ctx)
+			// Resume normal cadence from now
+			delay = interval
+		case <-timer.C:
+			s.runCycle(ctx)
+			delay = interval
+		}
+	}
+}
+
+// startup decides what (if anything) to screen immediately after a restart and
+// returns the delay until the first scheduled full cycle.
+//
+//   - All symbols fresh (cached bias younger than one interval): skip screening
+//     entirely and align the first run to oldestCachedAt+interval.
+//   - Some symbols stale or missing: screen only those via Phase 1, then refresh
+//     the cross-symbol opportunities (Phase 2) and operator summary (Phase 3)
+//     from the now-updated cache, and align the first full run to the oldest
+//     still-fresh symbol's cadence (or one full interval if none remain fresh).
+func (s *ScreeningAgent) startup(ctx context.Context, interval time.Duration) time.Duration {
+	syms := s.source.Symbols(ctx)
+	now := time.Now().UTC()
+
+	// Repopulate live UI surfaces (TUI / web) from the persisted screening
+	// cache. Those panels hold their own in-memory state that is only filled
+	// during a screen; without this, a restart that skips screening (because
+	// the cache is still fresh) would leave the Bias / Signals and
+	// Opportunities panels blank even though the data survived in Redis.
+	s.hydrateUI(ctx)
+
+	stale, oldestFresh, haveFresh := stalePartition(syms, func(sym domain.Symbol) (domain.BiasResult, bool) {
+		return s.loadBias(ctx, sym)
+	}, now, interval)
+
+	alignedDelay := func() time.Duration {
+		if !haveFresh {
+			return interval
+		}
+		return max(time.Until(oldestFresh.Add(interval)), 0)
+	}
+
+	if len(stale) == 0 {
+		// Everything is still fresh — no LLM work on this restart.
+		delay := alignedDelay()
+		slog.Info("screening: cached biases still fresh on startup; skipping initial screen",
+			"symbols", len(syms), "next_run_in", delay.Round(time.Second))
+		return delay
+	}
+
+	slog.Info("screening: startup refresh of stale/missing symbols",
+		"stale", len(stale), "fresh", len(syms)-len(stale), "total", len(syms))
+
+	results := s.runForSymbols(ctx, stale)
+	s.runOpportunities(ctx)
+	summaryOk := s.runSummary(ctx)
+	s.sendCycleReport(ctx, results, summaryOk)
+
+	return alignedDelay()
+}
+
+// stalePartition splits the symbol set into those that need a screen (bias
+// missing, or CachedAt older than one interval) and reports the oldest CachedAt
+// among the fresh ones so the caller can align the next run to the original
+// cadence. Pure function — no I/O — so the freshness logic is unit-testable.
+func stalePartition(
+	syms []domain.Symbol,
+	biasOf func(domain.Symbol) (domain.BiasResult, bool),
+	now time.Time,
+	interval time.Duration,
+) (stale []domain.Symbol, oldestFresh time.Time, haveFresh bool) {
+	for _, sym := range syms {
+		b, ok := biasOf(sym)
+		if !ok || now.Sub(b.CachedAt) >= interval {
+			stale = append(stale, sym)
+			continue
+		}
+		if !haveFresh || b.CachedAt.Before(oldestFresh) {
+			oldestFresh = b.CachedAt
+			haveFresh = true
+		}
+	}
+	return stale, oldestFresh, haveFresh
+}
+
+// loadBias reads and decodes a single symbol's cached bias. Returns ok=false
+// when the key is absent or cannot be decoded (treated as "needs screening").
+func (s *ScreeningAgent) loadBias(ctx context.Context, sym domain.Symbol) (domain.BiasResult, bool) {
+	raw, err := s.cache.Get(ctx, fmt.Sprintf("bias:%s", sym))
+	if err != nil || raw == nil {
+		return domain.BiasResult{}, false
+	}
+	var b domain.BiasResult
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return domain.BiasResult{}, false
+	}
+	return b, true
+}
+
+// hydrateUI replays cached screening state into the optional UI sinks so live
+// surfaces (TUI / web) show the last screening result after a restart, even
+// when no fresh screen runs this cycle. Each replay is a no-op when its
+// publisher is unset or the cache holds nothing (e.g. in-memory cache after a
+// cold start).
+func (s *ScreeningAgent) hydrateUI(ctx context.Context) {
+	if s.biasPub != nil {
+		if biases := s.loadBiases(ctx); len(biases) > 0 {
+			for _, b := range biases {
+				s.biasPub.SendBias(b)
+			}
+			slog.Info("screening: hydrated UI from cached biases on startup",
+				"count", len(biases))
+		}
+	}
+
+	if s.oppPub != nil {
+		if opps := s.loadOpportunities(ctx); len(opps) > 0 {
+			s.oppPub.SendOpportunities(opps)
+			slog.Info("screening: hydrated UI from cached opportunities on startup",
+				"count", len(opps))
 		}
 	}
 }
@@ -271,12 +443,18 @@ func (s *ScreeningAgent) sendCycleReport(ctx context.Context, results []symbolSc
 }
 
 func (s *ScreeningAgent) runAll(ctx context.Context) []symbolScreenResult {
+	return s.runForSymbols(ctx, s.source.Symbols(ctx))
+}
+
+// runForSymbols screens the given symbols concurrently and returns one result
+// per symbol. Used both by the full cycle (all symbols) and by startup
+// (only the stale/missing subset).
+func (s *ScreeningAgent) runForSymbols(ctx context.Context, syms []domain.Symbol) []symbolScreenResult {
 	var (
 		mu      sync.Mutex
 		results []symbolScreenResult
 	)
 	g, gctx := errgroup.WithContext(ctx)
-	syms := s.source.Symbols(ctx)
 	for _, sym := range syms {
 		g.Go(func() error {
 			bias, err := s.runForSymbol(gctx, sym)
@@ -471,27 +649,6 @@ func (s *ScreeningAgent) cacheBias(ctx context.Context, sym domain.Symbol, biasS
 	return nil
 }
 
-// injectPerformanceContext prepends a performance summary to the user message.
-//
-// DEPRECATED: prefer injectPerformanceContextSystem when the caller can
-// place the context in the system prompt — moving it there lets Anthropic's
-// prompt cache hit the ~10%-of-list price across sibling calls in the same
-// cycle. This helper remains for one-off flows where a cacheable system
-// prefix is not available.
-func injectPerformanceContext(ctx context.Context, trades port.TradeStore, lookbackDays int, userMsg string) string {
-	from := time.Now().UTC().AddDate(0, 0, -lookbackDays)
-	to := time.Now().UTC()
-
-	recentTrades, err := trades.TradesByWindow(ctx, from, to)
-	if err != nil || len(recentTrades) == 0 {
-		return userMsg
-	}
-
-	perf := tools.AggregatePerformance(recentTrades)
-	context := tools.FormatPerformanceContext(perf)
-	return context + "\n\n" + userMsg
-}
-
 // injectPerformanceContextSystem appends the performance summary to the
 // system prompt. The system prompt is cacheable (Anthropic 5-min ephemeral
 // cache) whereas the user message is not; sharing the same system prefix
@@ -593,6 +750,11 @@ func (s *ScreeningAgent) runOpportunities(ctx context.Context) {
 
 	slog.Info("screening: opportunities updated",
 		"count", len(opportunities), "expires_at", now.Add(s.biasTTL))
+
+	// Push to the optional UI sink (web dashboard Opportunities panel).
+	if s.oppPub != nil {
+		s.oppPub.SendOpportunities(opportunities)
+	}
 }
 
 func (s *ScreeningAgent) collectBiasContext(ctx context.Context) string {
@@ -821,13 +983,13 @@ type opportunitiesOutput struct {
 }
 
 type opportunityEntry struct {
-	Symbol       string               `json:"symbol"`
-	Venue        string               `json:"venue"`
-	Side         string               `json:"side"`
-	Confidence   float64              `json:"confidence"`
-	Reasoning    string               `json:"reasoning"`
-	Correlations []correlationEntry   `json:"correlations"`
-	Avoided      bool                 `json:"avoided"`
+	Symbol       string             `json:"symbol"`
+	Venue        string             `json:"venue"`
+	Side         string             `json:"side"`
+	Confidence   float64            `json:"confidence"`
+	Reasoning    string             `json:"reasoning"`
+	Correlations []correlationEntry `json:"correlations"`
+	Avoided      bool               `json:"avoided"`
 }
 
 type correlationEntry struct {
