@@ -167,11 +167,11 @@ func (h *FreeHeuristicLLM) Complete(
 	if h.mode == "smart" {
 		if idx := strings.Index(userMessage, "Current open positions: "); idx != -1 {
 			rem := userMessage[idx+len("Current open positions: "):]
-			if len(rem) > 0 && rem[0] >= '1' && rem[0] <= '9' {
+			if len(rem) > 0 && rem[0] >= '5' && rem[0] <= '9' {
 				if rejectTool, ok := tools["reject_signal"]; ok {
-					input, _ := json.Marshal(map[string]any{"reason": "Position already open for symbol; risk limit reached"})
+					input, _ := json.Marshal(map[string]any{"reason": "Maximum concurrent positions reached (5 positions active)"})
 					_, _ = rejectTool.Handler(ctx, input)
-					return "Signal rejected: position already open for symbol.", nil
+					return "Signal rejected: maximum concurrent positions reached (5 active).", nil
 				}
 			}
 		}
