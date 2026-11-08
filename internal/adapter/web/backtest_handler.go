@@ -159,8 +159,8 @@ func (s *Server) handleBacktestRun(w http.ResponseWriter, r *http.Request) {
 	riskCfg := config.RiskConfig{
 		MaxDrawdownPct:            25.0,
 		MaxDailyLossPct:           10.0,
-		MaxOpenPositions:          1,
-		MaxOpenPositionsPerSymbol: 1,
+		MaxOpenPositions:          5,
+		MaxOpenPositionsPerSymbol: 5,
 	}
 	gate := risk.NewGate(riskCfg, backtest.NewMemCache(), risk.NewCalendarBlackout())
 	gate.SetStartingEquity(decimal.NewFromInt(10_000))
