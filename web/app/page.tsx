@@ -40,7 +40,7 @@ export default function Page() {
   if (!authed) return <TokenGate onSet={() => setAuthed(true)} />;
 
   return (
-    <div className="flex h-screen flex-col bg-bg text-fg">
+    <div className="flex h-screen h-[100dvh] max-h-screen flex-col overflow-hidden bg-bg text-fg">
       <Header />
       <TabBar active={tab} onChange={setTab} />
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden p-1">

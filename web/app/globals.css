@@ -8,6 +8,7 @@
 
 html,
 body {
+  height: 100%;
   background: #1c1c1c;
   color: #d4d4d4;
   font-feature-settings: "tnum" 1; /* tabular numerals for aligned columns */

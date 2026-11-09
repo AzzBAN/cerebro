@@ -143,8 +143,8 @@ export function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) =
 export function StatusBar() {
   const heartbeat = useStore((s) => s.heartbeat);
   return (
-    <footer className="flex h-6 shrink-0 items-center border-t border-border bg-bg-alt px-3 text-2xs text-fg-dim">
-      {heartbeat || "awaiting heartbeat…"}
+    <footer className="flex h-6 shrink-0 items-center overflow-hidden border-t border-border bg-bg-alt px-3 font-mono text-2xs text-fg-dim">
+      <span className="truncate">{heartbeat || "awaiting heartbeat…"}</span>
     </footer>
   );
 }

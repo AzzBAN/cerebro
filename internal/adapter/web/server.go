@@ -155,6 +155,44 @@ func (s *Server) SetDispatcher(d Dispatcher) {
 func (s *Server) SetTradeStore(t TradeReader) {
 	s.tradeStore = t
 	s.intentReader = intentReaderOf(t)
+	if t == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	now := time.Now()
+	trades, err := t.TradesByWindow(ctx, now.Add(-7*24*time.Hour), now)
+	if err == nil && len(trades) > 0 {
+		s.mu.Lock()
+		if len(s.recentTrades) == 0 {
+			dtos := make([]TradeDTO, 0, len(trades))
+			for _, tr := range trades {
+				dtos = append(dtos, tradeToDTO(tr))
+			}
+			if len(dtos) > s.maxHistoryRows {
+				dtos = dtos[len(dtos)-s.maxHistoryRows:]
+			}
+			s.recentTrades = dtos
+		}
+		s.mu.Unlock()
+	}
+	if s.intentReader != nil {
+		intents, err := s.intentReader.IntentsByWindow(ctx, now.Add(-7*24*time.Hour), now)
+		if err == nil && len(intents) > 0 {
+			s.mu.Lock()
+			if len(s.recentIntents) == 0 {
+				dtos := make([]OrderIntentDTO, 0, len(intents))
+				for _, in := range intents {
+					dtos = append(dtos, orderIntentToDTO(in))
+				}
+				if len(dtos) > s.maxHistoryRows {
+					dtos = dtos[len(dtos)-s.maxHistoryRows:]
+				}
+				s.recentIntents = dtos
+			}
+			s.mu.Unlock()
+		}
+	}
 }
 
 // SendTrade implements port.TradeSink: each fill is appended to the

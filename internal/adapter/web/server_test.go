@@ -222,3 +222,50 @@ func TestSendAccount(t *testing.T) {
 		t.Errorf("account = %+v, want MarginMode Cross and TotalEquity 10000.5", snap.Account)
 	}
 }
+
+type stubTradeHistoryStore struct {
+	trades  []domain.Trade
+	intents []domain.OrderIntent
+}
+
+func (s *stubTradeHistoryStore) TradesByWindow(_ context.Context, _, _ time.Time) ([]domain.Trade, error) {
+	return s.trades, nil
+}
+
+func (s *stubTradeHistoryStore) IntentsByWindow(_ context.Context, _, _ time.Time) ([]domain.OrderIntent, error) {
+	return s.intents, nil
+}
+
+func TestSetTradeStoreHydratesRecentTrades(t *testing.T) {
+	s := newTestServer("", nil)
+	store := &stubTradeHistoryStore{
+		trades: []domain.Trade{
+			{
+				ID:        "t-1",
+				Symbol:    "BTC/USDT-PERP",
+				Side:      domain.SideSell,
+				Quantity:  decimal.RequireFromString("0.5"),
+				FillPrice: decimal.RequireFromString("74200"),
+				CreatedAt: time.Now(),
+			},
+		},
+		intents: []domain.OrderIntent{
+			{
+				ID:        "i-1",
+				Symbol:    "BTC/USDT-PERP",
+				Side:      domain.SideSell,
+				Quantity:  decimal.RequireFromString("0.5"),
+				CreatedAt: time.Now(),
+			},
+		},
+	}
+
+	s.SetTradeStore(store)
+	snap := s.Snapshot()
+	if len(snap.RecentTrades) != 1 || snap.RecentTrades[0].ID != "t-1" {
+		t.Fatalf("expected 1 recent trade hydrated, got %+v", snap.RecentTrades)
+	}
+	if len(snap.RecentIntents) != 1 || snap.RecentIntents[0].ID != "i-1" {
+		t.Fatalf("expected 1 recent intent hydrated, got %+v", snap.RecentIntents)
+	}
+}
