@@ -88,6 +88,7 @@ func (s *Server) consumeQuotes(ctx context.Context) {
 // by the bearer-token middleware.
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/state", s.auth(http.HandlerFunc(s.handleState)))
+	mux.Handle("GET /api/account", s.auth(http.HandlerFunc(s.handleAccount)))
 	mux.Handle("GET /api/trades", s.auth(http.HandlerFunc(s.handleTrades)))
 	mux.Handle("GET /api/intents", s.auth(http.HandlerFunc(s.handleIntents)))
 	mux.Handle("GET /api/history", s.auth(http.HandlerFunc(s.handleHistory)))
@@ -117,6 +118,17 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Snapshot())
+}
+
+func (s *Server) handleAccount(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	acc := s.account
+	s.mu.RUnlock()
+	if acc == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, acc)
 }
 
 // parseWindow extracts optional from/to millis query params. Defaults to

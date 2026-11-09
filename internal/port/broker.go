@@ -7,13 +7,16 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// AccountBalance holds balance information for a single venue.
+// AccountBalance holds balance and margin information for a single venue.
 type AccountBalance struct {
-	Venue      domain.Venue
-	TotalUSDT  decimal.Decimal
-	FreeUSDT   decimal.Decimal
-	LockedUSDT decimal.Decimal
-	Assets     []AssetBalance
+	Venue             domain.Venue
+	TotalUSDT         decimal.Decimal
+	FreeUSDT          decimal.Decimal
+	LockedUSDT        decimal.Decimal
+	InitialMargin     decimal.Decimal
+	MaintenanceMargin decimal.Decimal
+	MarginBalance     decimal.Decimal
+	Assets            []AssetBalance
 }
 
 // AssetBalance holds balance for a non-USDT asset.

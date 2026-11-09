@@ -9,6 +9,7 @@ import { ConfigFilesView } from "@/components/configfiles";
 import { History } from "@/components/History";
 import { RecentTrades } from "@/components/RecentTrades";
 import { BacktestView } from "@/components/BacktestView";
+import { TradingAccount } from "@/components/TradingAccount";
 import { useStore } from "@/lib/store";
 import { getState, getToken, setToken } from "@/lib/api";
 import { connectWS } from "@/lib/ws";
@@ -64,7 +65,7 @@ export default function Page() {
 /** DashboardView: Professional 2-column trading terminal layout. */
 function DashboardView() {
   return (
-    <div className="grid h-full grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)] gap-1">
+    <div className="grid h-full grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] gap-1">
       {/* Left Column: Risk, Market Data & Execution */}
       <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,1.3fr)_minmax(0,0.8fr)] gap-1">
         <Positions />
@@ -72,17 +73,20 @@ function DashboardView() {
         <RecentTrades />
       </div>
 
-      {/* Right Column: Intelligence, Macro & System Telemetry */}
-      <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,0.9fr)_minmax(0,1.2fr)] gap-1">
-        <div className="grid min-h-0 grid-cols-2 gap-1">
-          <BiasSignals />
-          <Opportunities />
+      {/* Right Column: Trading Account, Intelligence & Telemetry */}
+      <div className="flex min-h-0 flex-col gap-1 overflow-hidden">
+        <TradingAccount />
+        <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.1fr)] gap-1">
+          <div className="grid min-h-0 grid-cols-2 gap-1">
+            <BiasSignals />
+            <Opportunities />
+          </div>
+          <div className="grid min-h-0 grid-cols-2 gap-1">
+            <Macro />
+            <News />
+          </div>
+          <SystemLog />
         </div>
-        <div className="grid min-h-0 grid-cols-2 gap-1">
-          <Macro />
-          <News />
-        </div>
-        <SystemLog />
       </div>
     </div>
   );

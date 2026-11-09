@@ -979,26 +979,35 @@ func runHeartbeat(
 ) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	syncPositionsAndAccount := func() []domain.Position {
+		positions := collectPositions(ctx, brokers)
+		for i := range positions {
+			if q, ok := hub.LatestQuote(positions[i].Symbol); ok {
+				if !q.Last.IsZero() {
+					positions[i].CurrentPrice = q.Last
+				} else if !q.Mid.IsZero() {
+					positions[i].CurrentPrice = q.Mid
+				}
+			}
+		}
+		if len(uiSink) > 0 {
+			uiSink.SendPositions(positions)
+			acc := collectAccount(ctx, brokers, positions, gate.StartingEquity())
+			uiSink.SendAccount(acc)
+		}
+		return positions
+	}
+
+	// Immediate initial push on boot so web clients see positions & balance immediately.
+	syncPositionsAndAccount()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			positions := collectPositions(ctx, brokers)
-
-			// Enrich CurrentPrice from live market quotes so the TUI and
-			// downstream consumers see real-time prices instead of the
-			// stale bootstrap snapshot.
-			for i := range positions {
-				if q, ok := hub.LatestQuote(positions[i].Symbol); ok {
-					if !q.Last.IsZero() {
-						positions[i].CurrentPrice = q.Last
-					} else if !q.Mid.IsZero() {
-						positions[i].CurrentPrice = q.Mid
-					}
-				}
-			}
-
+			positions := syncPositionsAndAccount()
 			spotCount := countPositionsByVenue(positions, domain.VenueBinanceSpot)
 			futuresCount := countPositionsByVenue(positions, domain.VenueBinanceFutures)
 
@@ -1047,6 +1056,74 @@ func runHeartbeat(
 				fmt.Fprint(os.Stderr, block)
 			}
 		}
+	}
+}
+
+// collectAccount gathers real balances from active brokers and derives unified
+// margin metrics (Initial Margin, Maintenance Margin, Margin Balance, Available Balance).
+func collectAccount(ctx context.Context, brokers map[domain.Venue]port.Broker, positions []domain.Position, defaultEquity decimal.Decimal) uistate.AccountSnapshot {
+	totalEquity := decimal.Zero
+	freeUSDT := decimal.Zero
+	initialMargin := decimal.Zero
+	maintenanceMargin := decimal.Zero
+	venueName := domain.Venue("paper")
+	marginMode := "Cross"
+
+	for v, b := range brokers {
+		venueName = v
+		bal, err := b.Balance(ctx)
+		if err == nil {
+			totalEquity = totalEquity.Add(bal.TotalUSDT)
+			freeUSDT = freeUSDT.Add(bal.FreeUSDT)
+			if bal.InitialMargin.IsPositive() {
+				initialMargin = initialMargin.Add(bal.InitialMargin)
+			}
+			if bal.MaintenanceMargin.IsPositive() {
+				maintenanceMargin = maintenanceMargin.Add(bal.MaintenanceMargin)
+			}
+			if bal.MarginBalance.IsPositive() {
+				totalEquity = bal.MarginBalance
+			}
+		}
+	}
+
+	if totalEquity.IsZero() && defaultEquity.IsPositive() {
+		totalEquity = defaultEquity
+	}
+
+	// If broker did not report margin breakdown directly (e.g. spot or paper),
+	// derive from open positions:
+	if initialMargin.IsZero() && len(positions) > 0 {
+		for _, p := range positions {
+			initialMargin = initialMargin.Add(p.EffectiveMargin())
+			notional := p.CurrentPrice.Mul(p.Quantity).Abs()
+			maintenanceMargin = maintenanceMargin.Add(notional.Mul(decimal.NewFromFloat(0.005)))
+		}
+	}
+
+	totalUPnL := decimal.Zero
+	for _, p := range positions {
+		totalUPnL = totalUPnL.Add(p.UnrealizedPnL())
+	}
+
+	marginBalance := totalEquity
+	if !totalUPnL.IsZero() {
+		marginBalance = marginBalance.Add(totalUPnL)
+	}
+	availableBalance := marginBalance.Sub(initialMargin)
+	if availableBalance.IsNegative() {
+		availableBalance = decimal.Zero
+	}
+
+	return uistate.AccountSnapshot{
+		Venue:             venueName,
+		MarginMode:        marginMode,
+		TotalEquity:       totalEquity,
+		AvailableBalance:  availableBalance,
+		InitialMargin:     initialMargin,
+		MaintenanceMargin: maintenanceMargin,
+		MarginBalance:     marginBalance,
+		UpdatedAt:         time.Now(),
 	}
 }
 

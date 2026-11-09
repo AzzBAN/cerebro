@@ -162,3 +162,45 @@ The shape language is "Soft-Square." While 0px radius is too aggressive, a 4px (
 - **Input Fields:** Integrated into panels with 1px borders. Focused states use a 1px `Hyper-Cyan` border—no outer glow.
 - **Chips/Badges:** Small, rectangular badges with `data-sm` text. Backgrounds are low-opacity versions of the status color (e.g., 10% Cyan for "Buy").
 - **Order Book:** Utilizes the monospace font for all price/size columns with "Soft-Amber" for ask and "Hyper-Cyan" for bid, using horizontal bar-graphs in the background to show depth.
+
+## Bybit-Style Terminal Layout Architecture
+
+Designed in FigCraft (`designs/bybit-terminal.figcraft`, preview: `designs/bybit-terminal.png`, SVG: `designs/bybit-terminal.svg`), this layout aligns Cerebro with high-frequency institutional exchange terminals while preserving the Obsidian Precision design tokens:
+
+1. **Top Header & Ticker Bar (48px)**:
+   - Active Contract: Symbol (`BTCUSDT Perpetual`), Mark Price (`75,018.80` bull green), 24h Pct (`-1.08%`).
+   - Metrics: Index Price, 24h High/Low, 24h Turnover (USDT), Open Interest, Funding Rate / Countdown timer (`-0.0052% / 04:18:28`).
+   - Controls: Connection status (`● LIVE`) and Emergency Flatten.
+
+2. **Left Sidebar: Market Watch (250px)**:
+   - Search input for fast symbol filtration.
+   - Tabs: `Favorites`, `Crypto`, `TradFi`, `Derivatives`.
+   - Ticker list with Symbol, Last Price, and 24h% change.
+
+3. **Center Main: Candlestick Chart (Top, 572px)**:
+   - Timeframe bar (`1s`, `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1D`, `1W`).
+   - Candlesticks with EMA 9/21 indicators and volume histogram.
+
+4. **Middle-Right: Order Book & Recent Trades (340px)**:
+   - Precision selector (`0.1`).
+   - Asks (red) with cumulative depth bars.
+   - Spread bar with active Mark Price.
+   - Bids (green) with cumulative depth bars.
+   - Depth pressure ratio gauge (`B 59%` vs `41% S`).
+
+5. **Far-Right: Execution, Unified Trading Account & Contract Details (340px)**:
+   - **Trade Execution**: Cross/Isolated selector, Leverage dial (up to 75x/100x), Limit/Market, % slider, Long & Short dual action buttons.
+   - **Unified Trading Account (View #1)**:
+     - **Margin Mode**: `Cross Margin ›` (toggleable to Isolated).
+     - **Initial Margin**: Visual gauge meter + percentage (`0.00%`) + USD allocation.
+     - **Maintenance Margin**: Visual gauge meter + percentage (`0.00%`) + USD requirement.
+     - **Margin Balance**: Total equity in USDT (`550.3596 USDT`).
+     - **Available Balance**: Usable trading capital in USDT (`550.3596 USDT`).
+   - **Contract Details**: Expiration (`Perpetual`), Index Price, Mark Price, Open Interest, 24H Turnover, 24H Volume.
+
+6. **Bottom Docked Panel (Below Chart & Order Book, 420px)**:
+   - Multi-tab dock: `Positions`, `Open Orders`, `Order History`, `Trade History`, `Assets`, `Borrowings`, `P&L Analysis`, `Agent Telemetry & Logs`.
+   - Position row: Contract, Qty/Value, Entry Price, Mark Price, Liquidation Price, IM/MM Margin, Unrealized PnL (ROI%), TP/SL, Quick Close buttons.
+
+7. **Bottom Marquee (40px)**:
+   - Running ticker tape of major pairs with 24h percentage movements.

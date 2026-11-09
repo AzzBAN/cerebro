@@ -77,6 +77,13 @@ func (g *Gate) SetStartingEquity(equity decimal.Decimal) {
 	g.startingEquity = equity
 	slog.Info("risk gate: starting equity set", "equity", equity.StringFixed(2))
 }
+
+// StartingEquity returns the initial starting equity set at session start.
+func (g *Gate) StartingEquity() decimal.Decimal {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.startingEquity
+}
 // CurrentDrawdownPct returns the current session drawdown percentage.
 func (g *Gate) CurrentDrawdownPct() float64 {
 	g.mu.RLock()

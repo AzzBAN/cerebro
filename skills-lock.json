@@ -1,10 +1,22 @@
 {
   "version": 1,
   "skills": {
+    "figcraft": {
+      "source": "midasmatterhorn/artcraft-skills",
+      "sourceType": "github",
+      "skillPath": "figcraft/SKILL.md",
+      "computedHash": "7fe0911d2bdab9c79e99780c1dd60da882f19f2cd7ab7e4b261fd4bf8fadedcc"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",
       "computedHash": "9e1c8b3103f92fa8092568a44fe64858de7c5c9dc65ce4bea8f168080e889cfd"
+    },
+    "frontend-design": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/frontend-design/SKILL.md",
+      "computedHash": "89496d5dd00f4810205f351759594fc2742bf8eea85a2f2b2d1de59f4bd91576"
     },
     "golang-patterns": {
       "source": "affaan-m/everything-claude-code",
@@ -15,6 +27,12 @@
       "source": "affaan-m/everything-claude-code",
       "sourceType": "github",
       "computedHash": "db6e910031d9c289f91697cf2397b8a3f717c6fdeae7a115e811a32544d99e11"
+    },
+    "web-design-guidelines": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/web-design-guidelines/SKILL.md",
+      "computedHash": "a6a44d5498f7e8f68289902f3dedfc6f38ae0cee1e96527c80724cf27f727c2a"
     }
   }
 }

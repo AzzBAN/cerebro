@@ -47,3 +47,8 @@ logs/*.log
 .mcp.json
 # Backtest reports
 *_report.json
+
+# Local/VPS docker-compose overrides
+docker-compose.override.yaml
+deploy/docker-compose.override.yaml
+deploy/nginx/vps.conf

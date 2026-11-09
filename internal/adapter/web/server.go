@@ -78,6 +78,7 @@ type Server struct {
 	budget             BudgetDTO
 	budgetSet          bool
 	heartbeat          string
+	account        *AccountDTO
 	configDTO          *ConfigDTO
 	// recent intents + trades cache the order-history panel. The slice
 	// is bounded by MaxHistoryRows so a long-running engine never blows
@@ -304,6 +305,15 @@ func (s *Server) SendBudget(b uistate.BudgetSnapshot) {
 	s.broadcast("budget", dto)
 }
 
+// SendAccount updates the unified trading account snapshot and broadcasts it.
+func (s *Server) SendAccount(a uistate.AccountSnapshot) {
+	dto := accountToDTO(a)
+	s.mu.Lock()
+	s.account = &dto
+	s.mu.Unlock()
+	s.broadcast("account", dto)
+}
+
 // SendHeartbeat records the status-bar heartbeat line.
 func (s *Server) SendHeartbeat(line string) {
 	s.mu.Lock()
@@ -372,6 +382,7 @@ type snapshot struct {
 	Config        *ConfigDTO       `json:"config"`
 	RecentIntents []OrderIntentDTO `json:"recentIntents"`
 	RecentTrades  []TradeDTO       `json:"recentTrades"`
+	Account       *AccountDTO      `json:"account"`
 }
 
 // Snapshot returns a deep-ish copy of the current state for /api/state and the
@@ -416,6 +427,10 @@ func (s *Server) Snapshot() snapshot {
 	if s.configDTO != nil {
 		c := *s.configDTO
 		snap.Config = &c
+	}
+	if s.account != nil {
+		a := *s.account
+		snap.Account = &a
 	}
 	return snap
 }

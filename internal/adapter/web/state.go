@@ -220,6 +220,31 @@ func budgetToDTO(s uistate.BudgetSnapshot) BudgetDTO {
 	}
 }
 
+// AccountDTO is the JSON transport for unified trading account balance and margin metrics.
+type AccountDTO struct {
+	Venue             string `json:"venue"`
+	MarginMode        string `json:"marginMode"`
+	TotalEquity       string `json:"totalEquity"`
+	AvailableBalance  string `json:"availableBalance"`
+	InitialMargin     string `json:"initialMargin"`
+	MaintenanceMargin string `json:"maintenanceMargin"`
+	MarginBalance     string `json:"marginBalance"`
+	UpdatedAt         int64  `json:"updatedAt"` // unix millis
+}
+
+func accountToDTO(a uistate.AccountSnapshot) AccountDTO {
+	return AccountDTO{
+		Venue:             string(a.Venue),
+		MarginMode:        a.MarginMode,
+		TotalEquity:       a.TotalEquity.String(),
+		AvailableBalance:  a.AvailableBalance.String(),
+		InitialMargin:     a.InitialMargin.String(),
+		MaintenanceMargin: a.MaintenanceMargin.String(),
+		MarginBalance:     a.MarginBalance.String(),
+		UpdatedAt:         a.UpdatedAt.UnixMilli(),
+	}
+}
+
 // ProposalDTO is one pending agent SL/TP adjustment awaiting operator action.
 type ProposalDTO struct {
 	ID           string `json:"id"`

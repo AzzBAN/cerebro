@@ -217,6 +217,17 @@ export interface ConfigFormSchema {
   sections: ConfigFormSection[];
 }
 
+export interface Account {
+  venue: string;
+  marginMode: string;
+  totalEquity: string;
+  availableBalance: string;
+  initialMargin: string;
+  maintenanceMargin: string;
+  marginBalance: string;
+  updatedAt: number;
+}
+
 export interface Snapshot {
   quotes: Quote[];
   positions: Position[];
@@ -232,6 +243,7 @@ export interface Snapshot {
   config: Config | null;
   recentIntents: OrderIntent[];
   recentTrades: Trade[];
+  account?: Account | null;
 }
 
 // OrderIntent is the JSON DTO for one row in the order-history intent log.

@@ -198,3 +198,27 @@ func TestSendMacroAndBudget(t *testing.T) {
 		t.Errorf("budget = %+v, want 48200 tokens", snap.Budget)
 	}
 }
+
+func TestSendAccount(t *testing.T) {
+	s := newTestServer("", nil)
+	if snap := s.Snapshot(); snap.Account != nil {
+		t.Fatal("account should be nil before any send")
+	}
+	s.SendAccount(uistate.AccountSnapshot{
+		Venue:             domain.VenueBinanceFutures,
+		MarginMode:        "Cross",
+		TotalEquity:       decimal.RequireFromString("10000.50"),
+		AvailableBalance:  decimal.RequireFromString("8500.25"),
+		InitialMargin:     decimal.RequireFromString("1500.25"),
+		MaintenanceMargin: decimal.RequireFromString("75.00"),
+		MarginBalance:     decimal.RequireFromString("10000.50"),
+		UpdatedAt:         time.Now(),
+	})
+	snap := s.Snapshot()
+	if snap.Account == nil {
+		t.Fatal("snap.Account is nil")
+	}
+	if snap.Account.MarginMode != "Cross" || snap.Account.TotalEquity != "10000.5" {
+		t.Errorf("account = %+v, want MarginMode Cross and TotalEquity 10000.5", snap.Account)
+	}
+}

@@ -62,6 +62,21 @@ func (m multiSink) SendOpportunities(opps []domain.ScreeningOpportunity) {
 	}
 }
 
+// accountSink is an optional capability a UI surface may implement to receive
+// account balance and margin status.
+type accountSink interface {
+	SendAccount(a uistate.AccountSnapshot)
+}
+
+// SendAccount forwards account snapshots to every member implementing accountSink.
+func (m multiSink) SendAccount(a uistate.AccountSnapshot) {
+	for _, s := range m {
+		if as, ok := s.(accountSink); ok {
+			as.SendAccount(a)
+		}
+	}
+}
+
 func (m multiSink) SendMacro(s uistate.MacroSnapshot) {
 	for _, sink := range m {
 		sink.SendMacro(s)

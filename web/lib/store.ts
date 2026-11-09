@@ -3,6 +3,7 @@
 
 import { create } from "zustand";
 import type {
+  Account,
   AgentRun,
   Bias,
   Budget,
@@ -44,6 +45,7 @@ interface State {
   heartbeat: string;
   config: Config | null;
   chatMsgs: ChatMsg[];
+  account: Account | null;
   // recentIntents and recentTrades back the order-history panel. They are
   // seeded from the initial snapshot and grow via WebSocket "trade" frames
   // (and "intent" frames when the engine starts emitting them). The slice
@@ -77,6 +79,7 @@ export const useStore = create<State>((set) => ({
   chatMsgs: [],
   recentIntents: [],
   recentTrades: [],
+  account: null,
 
   setConnected: (up) => set({ connected: up }),
 
@@ -116,6 +119,7 @@ export const useStore = create<State>((set) => ({
         config: s.config ?? null,
         recentIntents: s.recentIntents ?? [],
         recentTrades: s.recentTrades ?? [],
+        account: s.account ?? null,
       };
     }),
 
@@ -178,6 +182,8 @@ export const useStore = create<State>((set) => ({
           if (next.length > MAX_HISTORY) next.splice(0, next.length - MAX_HISTORY);
           return { recentIntents: next };
         }
+        case "account":
+          return { account: data as Account };
         default:
           return {};
       }
@@ -217,5 +223,6 @@ function reduceSnapshot(s: Snapshot): Partial<State> {
     config: s.config ?? null,
     recentIntents: s.recentIntents ?? [],
     recentTrades: s.recentTrades ?? [],
+    account: s.account ?? null,
   };
 }

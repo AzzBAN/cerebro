@@ -14,6 +14,7 @@ import (
 	"github.com/azhar/cerebro/internal/domain"
 	"github.com/azhar/cerebro/internal/port"
 	"github.com/azhar/cerebro/internal/positionproposal"
+	"github.com/shopspring/decimal"
 )
 
 // AgentStep mirrors agent.AgentStep / the ReAct loop phase of a running agent.
@@ -81,6 +82,18 @@ type BudgetSnapshot struct {
 	At            time.Time
 }
 
+
+// AccountSnapshot holds live unified account balance and margin status.
+type AccountSnapshot struct {
+	Venue             domain.Venue
+	MarginMode        string // "Cross" or "Isolated"
+	TotalEquity       decimal.Decimal
+	AvailableBalance  decimal.Decimal
+	InitialMargin     decimal.Decimal
+	MaintenanceMargin decimal.Decimal
+	MarginBalance     decimal.Decimal
+	UpdatedAt         time.Time
+}
 // Sink is the event surface every live UI implements. The composition root
 // fans out each engine event to all registered sinks (TUI, web, …).
 //

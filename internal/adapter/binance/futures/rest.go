@@ -592,16 +592,22 @@ func (b *FuturesBroker) Balance(ctx context.Context) (port.AccountBalance, error
 
 	total, _ := decimal.NewFromString(account.TotalWalletBalance)
 	free, _ := decimal.NewFromString(account.AvailableBalance)
+	im, _ := decimal.NewFromString(account.TotalInitialMargin)
+	mm, _ := decimal.NewFromString(account.TotalMaintMargin)
+	mb, _ := decimal.NewFromString(account.TotalMarginBalance)
 	locked := total.Sub(free)
 	if locked.IsNegative() {
 		locked = decimal.Zero
 	}
 
 	return port.AccountBalance{
-		Venue:      domain.VenueBinanceFutures,
-		TotalUSDT:  total,
-		FreeUSDT:   free,
-		LockedUSDT: locked,
+		Venue:             domain.VenueBinanceFutures,
+		TotalUSDT:         total,
+		FreeUSDT:          free,
+		LockedUSDT:        locked,
+		InitialMargin:     im,
+		MaintenanceMargin: mm,
+		MarginBalance:     mb,
 	}, nil
 }
 
